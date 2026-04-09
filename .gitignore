@@ -1,0 +1,17 @@
+.DS_Store
+**/.env
+**/.venv/
+**/__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Nested upstream clone (has its own .git); install vnstock via pip in fastapi project
+/vnstock/
