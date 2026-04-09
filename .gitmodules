@@ -1,0 +1,3 @@
+[submodule "vnstock"]
+	path = vnstock
+	url = https://github.com/thinh-vu/vnstock.git

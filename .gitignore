@@ -13,5 +13,4 @@
 dist/
 build/
 
-# Nested upstream clone (has its own .git); install vnstock via pip in fastapi project
-/vnstock/
+# vnstock will be tracked as a git submodule (not ignored)
