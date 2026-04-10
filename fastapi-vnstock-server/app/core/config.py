@@ -7,10 +7,17 @@ class AppSettings(BaseSettings):
     app_port: int = 8000
     app_reload: bool = True
     vnstock_api_key: str = ""
+    claude_token: str = ""
+    claude_model: str = "claude-sonnet-4-6"
+    claude_fallback_model: str = "claude-3-5-haiku-latest"
+    claude_max_tokens: int = 1024
+    claude_max_retries: int = 3
     dnse_username: str = ""
     dnse_password: str = ""
     #: Gợi ý sub-account mặc định (ví dụ tiền tố TK); FE đọc qua GET /dnse/defaults.
     dnse_default_sub_account: str = ""
+    redis_url: str = "redis://127.0.0.1:6379/0"
+    ai_cache_ttl_seconds: int = 86400
 
     model_config = SettingsConfigDict(
         env_file=".env",

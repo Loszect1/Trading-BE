@@ -1,0 +1,121 @@
+from __future__ import annotations
+
+import random
+import time
+from typing import Optional
+
+from anthropic import Anthropic
+from anthropic import APIError
+from anthropic import APIStatusError
+
+from app.core.config import settings
+
+
+class ClaudeService:
+    def __init__(self) -> None:
+        self._client = Anthropic(api_key=settings.claude_token or None)
+
+    def generate_text(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        model: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+        temperature: float = 0.2,
+    ) -> str:
+        token = (settings.claude_token or "").strip()
+        if not token:
+            raise ValueError("Missing CLAUDE_TOKEN in environment.")
+
+        if not prompt.strip():
+            raise ValueError("Prompt must not be empty.")
+
+        requested_model = (model or "").strip()
+        invalid_model_values = {"", "string", "none", "null", "undefined"}
+        selected_model = (
+            settings.claude_model.strip()
+            if requested_model.lower() in invalid_model_values
+            else requested_model
+        )
+        if not selected_model:
+            raise ValueError("Missing Claude model. Set CLAUDE_MODEL or pass a valid model.")
+        fallback_model = (settings.claude_fallback_model or "").strip()
+        selected_max_tokens = max_tokens or settings.claude_max_tokens
+        selected_temperature = max(0.0, min(1.0, temperature))
+        max_retries = max(0, int(settings.claude_max_retries))
+
+        model_candidates = [selected_model]
+        if fallback_model and fallback_model != selected_model:
+            model_candidates.append(fallback_model)
+
+        last_error: Exception | None = None
+        primary_error: Exception | None = None
+        response = None
+        for model_index, model_name in enumerate(model_candidates):
+            request_kwargs = {
+                "model": model_name,
+                "max_tokens": selected_max_tokens,
+                "temperature": selected_temperature,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            if system_prompt and system_prompt.strip():
+                request_kwargs["system"] = [
+                    {"type": "text", "text": system_prompt.strip()}
+                ]
+
+            for attempt in range(max_retries + 1):
+                try:
+                    response = self._client.messages.create(**request_kwargs)
+                    break
+                except APIStatusError as exc:
+                    last_error = exc
+                    if model_index == 0:
+                        primary_error = exc
+                    # If fallback model does not exist for this account/project, skip it.
+                    if exc.status_code == 404 and model_index > 0:
+                        break
+                    if exc.status_code in (429, 529) and attempt < max_retries:
+                        # Exponential backoff + jitter to reduce synchronized retry spikes.
+                        delay = (1.1 * (2 ** attempt)) + random.uniform(0.0, 0.45)
+                        time.sleep(delay)
+                        continue
+                    # If primary model overloaded, allow switching to fallback model.
+                    if exc.status_code in (429, 529):
+                        break
+                    raise RuntimeError(
+                        f"Claude API status error ({exc.status_code}): {exc.message}"
+                    ) from exc
+                except APIError as exc:
+                    last_error = exc
+                    if attempt < max_retries:
+                        delay = (1.1 * (2 ** attempt)) + random.uniform(0.0, 0.45)
+                        time.sleep(delay)
+                        continue
+                    raise RuntimeError(f"Claude API error: {str(exc)}") from exc
+                except Exception as exc:
+                    last_error = exc
+                    raise RuntimeError(f"Unexpected Claude service error: {str(exc)}") from exc
+            if response is not None:
+                break
+
+        if response is None:
+            if isinstance(last_error, APIStatusError) and last_error.status_code == 404 and primary_error is not None:
+                last_error = primary_error
+            if isinstance(last_error, APIStatusError):
+                raise RuntimeError(
+                    f"Claude API status error ({last_error.status_code}): {last_error.message}"
+                ) from last_error
+            if isinstance(last_error, APIError):
+                raise RuntimeError(f"Claude API error: {str(last_error)}") from last_error
+            raise RuntimeError(f"Claude API failed after retries: {last_error}")
+
+        text_parts = []
+        for item in response.content:
+            block_text = getattr(item, "text", None)
+            if block_text:
+                text_parts.append(block_text)
+
+        answer = "\n".join(text_parts).strip()
+        if not answer:
+            raise RuntimeError("Claude returned an empty response.")
+        return answer

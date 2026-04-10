@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
+from app.routers.ai import router as ai_router
 from app.routers.dnse_trade import router as dnse_trade_router
 from app.routers.health import router as health_router
 from app.routers.market import router as market_router
@@ -21,6 +22,7 @@ app.add_middleware(
 )
 
 app.include_router(health_router)
+app.include_router(ai_router)
 app.include_router(market_router)
 app.include_router(vnstock_api_router)
 app.include_router(dnse_trade_router)
