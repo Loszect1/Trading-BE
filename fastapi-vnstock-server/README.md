@@ -26,6 +26,7 @@ docker compose --env-file .env.docker up -d redis
 Environment:
 - `REDIS_URL` default: `redis://127.0.0.1:6379/0`
 - `AI_CACHE_TTL_SECONDS` default: `86400` (1 day)
+- `LISTING_EXCHANGE_INDUSTRY_REDIS_TTL_SECONDS` default: `31536000` (~365 days): Redis cache for `POST /vnstock-api/listing/symbols-by-exchange` and `symbols-by-industries` (sàn + ngành)
 
 ## API
 

@@ -5,10 +5,13 @@ from typing import Any, Dict
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from app.core.config import settings
+from app.services.redis_cache import RedisCacheService
 from app.services.vnstock_api_service import VNStockApiService
 
 router = APIRouter(prefix="/vnstock-api", tags=["vnstock-api"])
 vnstock_api_service = VNStockApiService()
+redis_cache_service = RedisCacheService()
 
 
 class QuoteRequest(BaseModel):
@@ -41,6 +44,14 @@ class ListingRequest(BaseModel):
     random_agent: bool = False
     show_log: bool = False
     method_kwargs: Dict[str, Any] = Field(default_factory=dict)
+    #: Bỏ qua Redis cho symbols-by-exchange / symbols-by-industries, gọi lại nguồn dữ liệu.
+    force_refresh: bool = False
+
+
+def _listing_kwargs_for_vnstock(payload: ListingRequest) -> Dict[str, Any]:
+    data = payload.model_dump()
+    data.pop("force_refresh", None)
+    return data
 
 
 class TradingRequest(BaseModel):
@@ -56,6 +67,19 @@ def _run_safe(callback):
         return {"success": True, "data": callback()}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+def _listing_exchange_industry_cache_key(method: str, payload: ListingRequest) -> str:
+    """Khóa Redis cho listing sàn / ngành (payload.method_kwargs ảnh hưởng kết quả)."""
+    source = (payload.source or "KBS").strip().upper()
+    if method == "symbols_by_industries":
+        lang = (payload.method_kwargs or {}).get("lang", "vi")
+        lang_str = lang if isinstance(lang, str) else str(lang)
+        return f"listing:{method}:{source}:lang={lang_str}"
+    if method == "symbols_by_exchange":
+        get_all = (payload.method_kwargs or {}).get("get_all", False)
+        return f"listing:{method}:{source}:get_all={bool(get_all)}"
+    raise AssertionError(f"unexpected listing cache method: {method}")
 
 
 # Quote APIs
@@ -163,63 +187,89 @@ def financial_ratio(payload: FinancialRequest) -> dict:
 @router.post("/listing/all-symbols")
 def listing_all_symbols(payload: ListingRequest) -> dict:
     return _run_safe(
-        lambda: vnstock_api_service.call_listing("all_symbols", **payload.model_dump())
+        lambda: vnstock_api_service.call_listing("all_symbols", **_listing_kwargs_for_vnstock(payload))
     )
 
 
 @router.post("/listing/symbols-by-industries")
 def listing_symbols_by_industries(payload: ListingRequest) -> dict:
-    return _run_safe(
-        lambda: vnstock_api_service.call_listing("symbols_by_industries", **payload.model_dump())
+    cache_key = _listing_exchange_industry_cache_key("symbols_by_industries", payload)
+    if not payload.force_refresh:
+        cached = redis_cache_service.get_json(cache_key)
+        if cached is not None:
+            return cached
+    result = _run_safe(
+        lambda: vnstock_api_service.call_listing(
+            "symbols_by_industries", **_listing_kwargs_for_vnstock(payload)
+        )
     )
+    redis_cache_service.set_json(
+        cache_key,
+        result,
+        max(1, int(settings.listing_exchange_industry_redis_ttl_seconds)),
+    )
+    return result
 
 
 @router.post("/listing/symbols-by-exchange")
 def listing_symbols_by_exchange(payload: ListingRequest) -> dict:
-    return _run_safe(
-        lambda: vnstock_api_service.call_listing("symbols_by_exchange", **payload.model_dump())
+    cache_key = _listing_exchange_industry_cache_key("symbols_by_exchange", payload)
+    if not payload.force_refresh:
+        cached = redis_cache_service.get_json(cache_key)
+        if cached is not None:
+            return cached
+    result = _run_safe(
+        lambda: vnstock_api_service.call_listing(
+            "symbols_by_exchange", **_listing_kwargs_for_vnstock(payload)
+        )
     )
+    redis_cache_service.set_json(
+        cache_key,
+        result,
+        max(1, int(settings.listing_exchange_industry_redis_ttl_seconds)),
+    )
+    return result
 
 
 @router.post("/listing/industries-icb")
 def listing_industries_icb(payload: ListingRequest) -> dict:
     return _run_safe(
-        lambda: vnstock_api_service.call_listing("industries_icb", **payload.model_dump())
+        lambda: vnstock_api_service.call_listing("industries_icb", **_listing_kwargs_for_vnstock(payload))
     )
 
 
 @router.post("/listing/symbols-by-group")
 def listing_symbols_by_group(payload: ListingRequest) -> dict:
     return _run_safe(
-        lambda: vnstock_api_service.call_listing("symbols_by_group", **payload.model_dump())
+        lambda: vnstock_api_service.call_listing("symbols_by_group", **_listing_kwargs_for_vnstock(payload))
     )
 
 
 @router.post("/listing/all-future-indices")
 def listing_all_future_indices(payload: ListingRequest) -> dict:
     return _run_safe(
-        lambda: vnstock_api_service.call_listing("all_future_indices", **payload.model_dump())
+        lambda: vnstock_api_service.call_listing("all_future_indices", **_listing_kwargs_for_vnstock(payload))
     )
 
 
 @router.post("/listing/all-government-bonds")
 def listing_all_government_bonds(payload: ListingRequest) -> dict:
     return _run_safe(
-        lambda: vnstock_api_service.call_listing("all_government_bonds", **payload.model_dump())
+        lambda: vnstock_api_service.call_listing("all_government_bonds", **_listing_kwargs_for_vnstock(payload))
     )
 
 
 @router.post("/listing/all-covered-warrant")
 def listing_all_covered_warrant(payload: ListingRequest) -> dict:
     return _run_safe(
-        lambda: vnstock_api_service.call_listing("all_covered_warrant", **payload.model_dump())
+        lambda: vnstock_api_service.call_listing("all_covered_warrant", **_listing_kwargs_for_vnstock(payload))
     )
 
 
 @router.post("/listing/all-bonds")
 def listing_all_bonds(payload: ListingRequest) -> dict:
     return _run_safe(
-        lambda: vnstock_api_service.call_listing("all_bonds", **payload.model_dump())
+        lambda: vnstock_api_service.call_listing("all_bonds", **_listing_kwargs_for_vnstock(payload))
     )
 
 

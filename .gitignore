@@ -14,3 +14,6 @@ dist/
 build/
 
 # vnstock will be tracked as a git submodule (not ignored)
+
+# graphify generated output
+graphify-out/

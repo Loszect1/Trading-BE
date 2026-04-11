@@ -18,6 +18,8 @@ class AppSettings(BaseSettings):
     dnse_default_sub_account: str = ""
     redis_url: str = "redis://127.0.0.1:6379/0"
     ai_cache_ttl_seconds: int = 86400
+    #: TTL Redis cho danh sách mã theo sàn / theo ngành (listing), mặc định ~1 năm.
+    listing_exchange_industry_redis_ttl_seconds: int = 31_536_000
 
     model_config = SettingsConfigDict(
         env_file=".env",
