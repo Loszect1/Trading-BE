@@ -6,6 +6,7 @@ from app.routers.ai import router as ai_router
 from app.routers.dnse_trade import router as dnse_trade_router
 from app.routers.health import router as health_router
 from app.routers.market import router as market_router
+from app.routers.news import router as news_router
 from app.routers.vnstock_api import router as vnstock_api_router
 
 app = FastAPI(title=settings.app_name)
@@ -24,6 +25,7 @@ app.add_middleware(
 app.include_router(health_router)
 app.include_router(ai_router)
 app.include_router(market_router)
+app.include_router(news_router)
 app.include_router(vnstock_api_router)
 app.include_router(dnse_trade_router)
 

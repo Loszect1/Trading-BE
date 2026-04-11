@@ -5,3 +5,4 @@ pydantic-settings
 vnstock
 anthropic
 redis
+httpx

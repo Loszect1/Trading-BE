@@ -20,6 +20,20 @@ class AppSettings(BaseSettings):
     ai_cache_ttl_seconds: int = 86400
     #: TTL Redis cho danh sách mã theo sàn / theo ngành (listing), mặc định ~1 năm.
     listing_exchange_industry_redis_ttl_seconds: int = 31_536_000
+    #: TTL cache cho GET /news (tổng hợp RSS).
+    news_cache_ttl_seconds: int = 300
+    #: Khóa API Firecrawl (Bearer) cho GET /news/firecrawl/* — đặt FIRECRAWL_API_KEY trong .env.
+    firecrawl_api_key: str = ""
+    #: Timeout gửi xuống Firecrawl Search (ms), trong khoảng API cho phép.
+    firecrawl_search_timeout_ms: int = 90_000
+    #: Số tin tối đa lấy từ Firecrawl (tin trong ngày) khi gọi GET /news.
+    news_firecrawl_today_max: int = 20
+    #: Mỗi feed RSS lỗi: tối đa số bài Firecrawl Search thay thế (site:domain, tbs=qdr:d).
+    news_firecrawl_fallback_per_feed: int = 5
+    #: Tổng giới hạn bài Firecrawl fallback mỗi request /news (tránh tốn credit).
+    news_firecrawl_fallback_max_total: int = 30
+    #: Số worker song song khi gọi Firecrawl cho nhiều feed lỗi.
+    news_firecrawl_fallback_max_workers: int = 4
 
     model_config = SettingsConfigDict(
         env_file=".env",
