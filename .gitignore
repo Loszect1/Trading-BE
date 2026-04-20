@@ -17,3 +17,7 @@ build/
 
 # graphify generated output
 graphify-out/
+.graphify*
+
+# local coverage artifacts
+fastapi-vnstock-server/.coverage
