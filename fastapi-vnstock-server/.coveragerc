@@ -1,0 +1,15 @@
+[run]
+source = app
+branch = false
+# Routers are measured (thin TestClient tests in tests/unit/test_routers_thin.py).
+omit =
+    app/main.py
+    */app/main.py
+
+[report]
+precision = 2
+skip_empty = true
+exclude_lines =
+    pragma: no cover
+    if TYPE_CHECKING:
+    if typing.TYPE_CHECKING:

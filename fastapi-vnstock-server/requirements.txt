@@ -6,3 +6,4 @@ vnstock
 anthropic
 redis
 httpx
+psycopg[binary]

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import random
 import time
 from typing import Optional
@@ -9,11 +11,23 @@ from anthropic import APIError
 from anthropic import APIStatusError
 
 from app.core.config import settings
+from app.services.redis_cache import RedisCacheService
 
 
 class ClaudeService:
     def __init__(self) -> None:
         self._client = Anthropic(api_key=settings.claude_token or None)
+        self._cache = RedisCacheService()
+        self._failure_count = 0
+        self._blocked_until_epoch = 0.0
+        self._metrics: dict[str, int] = {
+            "cache_hit": 0,
+            "cache_miss": 0,
+            "request_success": 0,
+            "request_failure": 0,
+            "cooldown_trigger": 0,
+            "cooldown_reject": 0,
+        }
 
     def generate_text(
         self,
@@ -119,3 +133,84 @@ class ClaudeService:
         if not answer:
             raise RuntimeError("Claude returned an empty response.")
         return answer
+
+    def generate_text_with_resilience(
+        self,
+        *,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        model: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+        temperature: float = 0.2,
+        cache_namespace: str,
+        cache_ttl_seconds: int,
+    ) -> str:
+        now = time.time()
+        if now < self._blocked_until_epoch:
+            self._metrics["cooldown_reject"] += 1
+            raise RuntimeError("Claude service temporarily blocked by failure cooldown.")
+
+        cache_key = self._build_cache_key(
+            namespace=cache_namespace,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        cached = self._cache.get_json(cache_key)
+        if cached and isinstance(cached.get("text"), str) and cached["text"].strip():
+            self._metrics["cache_hit"] += 1
+            return str(cached["text"])
+        self._metrics["cache_miss"] += 1
+
+        try:
+            text = self.generate_text(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            self._failure_count = 0
+            self._blocked_until_epoch = 0.0
+            self._metrics["request_success"] += 1
+            self._cache.set_json(cache_key, {"text": text}, ttl_seconds=max(1, int(cache_ttl_seconds)))
+            return text
+        except Exception:
+            self._failure_count += 1
+            self._metrics["request_failure"] += 1
+            if self._failure_count >= 2:
+                self._blocked_until_epoch = time.time() + float(settings.ai_claude_failure_cooldown_seconds)
+                self._metrics["cooldown_trigger"] += 1
+            raise
+
+    @staticmethod
+    def _build_cache_key(
+        *,
+        namespace: str,
+        prompt: str,
+        system_prompt: Optional[str],
+        model: Optional[str],
+        max_tokens: Optional[int],
+        temperature: float,
+    ) -> str:
+        payload = {
+            "prompt": prompt,
+            "system_prompt": system_prompt or "",
+            "model": model or "",
+            "max_tokens": max_tokens or settings.claude_max_tokens,
+            "temperature": round(float(temperature), 4),
+            "pipeline": "claude_resilience_v1",
+        }
+        digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+        return f"ai:claude:{namespace}:{digest}"
+
+    def get_runtime_metrics(self) -> dict[str, int | float]:
+        now = time.time()
+        remain = max(0.0, self._blocked_until_epoch - now)
+        return {
+            **self._metrics,
+            "failure_count": int(self._failure_count),
+            "cooldown_remaining_seconds": round(remain, 3),
+        }

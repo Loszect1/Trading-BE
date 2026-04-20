@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import math
+import threading
+import time
+from hashlib import sha256
 from typing import Any, Dict, List, Optional, Union
 
 import pandas as pd
@@ -14,6 +20,7 @@ from vnstock.api.quote import Quote
 from vnstock.api.trading import Trading
 
 from app.core.config import settings
+from app.services.redis_cache import RedisCacheService
 
 JSONValue = Union[Dict[str, Any], List[Any], str, int, float, bool, None]
 
@@ -28,13 +35,67 @@ _TRADING_METHODS_VIA_VCI_SNAPSHOT = frozenset(
 class VNStockApiService:
     def __init__(self) -> None:
         self._api_key_registered = False
+        self._cache = RedisCacheService()
+        self._throttle_lock = threading.Lock()
+        self._request_window_started = time.monotonic()
+        self._request_count_in_window = 0
+
+    def _throttle_before_call(self) -> None:
+        """
+        Process-local throttle to keep outbound vnstock requests under configured RPM.
+        This smoothes burst traffic and reduces hard upstream rate-limit kills.
+        """
+        max_per_minute = max(1, int(settings.vnstock_max_requests_per_minute))
+        while True:
+            sleep_seconds = 0.0
+            with self._throttle_lock:
+                now = time.monotonic()
+                elapsed = now - self._request_window_started
+                if elapsed >= 60.0:
+                    self._request_window_started = now
+                    self._request_count_in_window = 0
+                    elapsed = 0.0
+                if self._request_count_in_window < max_per_minute:
+                    self._request_count_in_window += 1
+                    return
+                sleep_seconds = max(0.05, 60.0 - elapsed)
+            time.sleep(sleep_seconds)
+
+    @staticmethod
+    def _build_financial_cache_key(
+        *,
+        method_name: str,
+        source: str,
+        symbol: str,
+        period: str,
+        get_all: bool,
+        method_kwargs: Dict[str, Any],
+    ) -> str:
+        payload = {
+            "method_name": method_name,
+            "source": (source or "").strip().upper(),
+            "symbol": (symbol or "").strip().upper(),
+            "period": (period or "").strip().lower(),
+            "get_all": bool(get_all),
+            "method_kwargs": method_kwargs,
+        }
+        digest = sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True, default=str).encode("utf-8")).hexdigest()
+        return f"vnstock:financial:{digest}"
 
     def _ensure_api_key(self) -> None:
         if self._api_key_registered:
             return
-        if settings.vnstock_api_key:
-            register_user(api_key=settings.vnstock_api_key)
-            self._api_key_registered = True
+        api_key = (settings.vnstock_api_key or "").strip()
+        if not api_key:
+            raise RuntimeError("VNSTOCK_API_KEY is missing. Set VNSTOCK_API_KEY in BE/.env to enable vnstock calls.")
+
+        # vnstock/vnai may print unicode markers (e.g. check/cross) which can crash on Windows
+        # consoles when stdout encoding is not UTF-8. Silence stdout/stderr and only surface
+        # a clean Python exception upstream.
+        sink = io.StringIO()
+        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+            register_user(api_key=api_key)
+        self._api_key_registered = True
 
     @staticmethod
     def _serialize_result(result: Any) -> JSONValue:
@@ -67,21 +128,26 @@ class VNStockApiService:
         method_kwargs: Dict[str, Any] | None = None,
     ) -> JSONValue:
         self._ensure_api_key()
+        self._throttle_before_call()
         call_kwargs = self._normalize_quote_kwargs(method_name, method_kwargs or {})
         errors: List[str] = []
 
         for candidate_source in self._quote_source_order(source):
             try:
-                quote = Quote(
-                    source=candidate_source,
-                    symbol=symbol,
-                    random_agent=random_agent,
-                    show_log=show_log,
-                )
-                method = getattr(quote, method_name)
-                result = method(**call_kwargs)
+                # Some vnstock internals still print non-ASCII markers; silence to avoid
+                # Windows cp1252 UnicodeEncodeError bubbling up as source failure.
+                sink = io.StringIO()
+                with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                    quote = Quote(
+                        source=candidate_source,
+                        symbol=symbol,
+                        random_agent=random_agent,
+                        show_log=show_log,
+                    )
+                    method = getattr(quote, method_name)
+                    result = method(**call_kwargs)
                 return self._serialize_result(result)
-            except Exception as exc:
+            except BaseException as exc:
                 errors.append(f"{candidate_source}: {self._stringify_exception(exc)}")
 
         raise RuntimeError(
@@ -151,6 +217,7 @@ class VNStockApiService:
         method_kwargs: Dict[str, Any] | None = None,
     ) -> JSONValue:
         self._ensure_api_key()
+        self._throttle_before_call()
         company = Company(source=source, symbol=symbol, random_agent=random_agent, show_log=show_log)
         method = getattr(company, method_name)
         result = method(**(method_kwargs or {}))
@@ -168,6 +235,18 @@ class VNStockApiService:
     ) -> JSONValue:
         self._ensure_api_key()
         call_kwargs = method_kwargs or {}
+        cache_key = self._build_financial_cache_key(
+            method_name=method_name,
+            source=source,
+            symbol=symbol,
+            period=period,
+            get_all=get_all,
+            method_kwargs=call_kwargs,
+        )
+        cached = self._cache.get_json(cache_key)
+        if isinstance(cached, dict) and "value" in cached:
+            return cached["value"]  # type: ignore[return-value]
+        self._throttle_before_call()
         errors: List[str] = []
 
         for candidate_source in self._financial_source_order(source):
@@ -181,7 +260,13 @@ class VNStockApiService:
                 )
                 method = getattr(financial, method_name)
                 result = method(**call_kwargs)
-                return self._serialize_result(result)
+                serialized = self._serialize_result(result)
+                self._cache.set_json(
+                    cache_key,
+                    {"value": serialized},
+                    ttl_seconds=max(1, int(settings.financial_cache_ttl_seconds)),
+                )
+                return serialized
             except Exception as exc:
                 errors.append(f"{candidate_source}: {str(exc)}")
 
@@ -206,6 +291,7 @@ class VNStockApiService:
         method_kwargs: Dict[str, Any] | None = None,
     ) -> JSONValue:
         self._ensure_api_key()
+        self._throttle_before_call()
         listing = Listing(source=source, random_agent=random_agent, show_log=show_log)
         method = getattr(listing, method_name)
         result = method(**(method_kwargs or {}))
@@ -423,6 +509,7 @@ class VNStockApiService:
         method_kwargs: Dict[str, Any] | None = None,
     ) -> JSONValue:
         self._ensure_api_key()
+        self._throttle_before_call()
         if method_name in _TRADING_METHODS_VIA_VCI_SNAPSHOT:
             result = self._call_trading_via_vci_snapshot(
                 method_name,

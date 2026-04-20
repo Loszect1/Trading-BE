@@ -1,0 +1,77 @@
+{
+  "format_version": "sanitized_trade_log_v1",
+  "events": [
+    {
+      "kind": "meta",
+      "symbol": "TSTSAN",
+      "account_mode": "DEMO"
+    },
+    {
+      "kind": "clock",
+      "ts": "2026-01-05T10:00:00Z",
+      "trace_id": "replay-sanitized-1"
+    },
+    {
+      "kind": "place_order",
+      "payload": {
+        "account_mode": "DEMO",
+        "symbol": "TSTSAN",
+        "side": "BUY",
+        "quantity": 25,
+        "price": 9000.0,
+        "idempotency_key": "replay-tstsan-buy",
+        "auto_process": true
+      },
+      "expect": { "status": "FILLED" }
+    },
+    {
+      "kind": "check_settlement",
+      "quantity": 25,
+      "expect": { "pass": false, "available_qty": 0 }
+    },
+    {
+      "kind": "place_order",
+      "payload": {
+        "account_mode": "DEMO",
+        "symbol": "TSTSAN",
+        "side": "SELL",
+        "quantity": 25,
+        "price": 9100.0,
+        "idempotency_key": "replay-tstsan-sell-blocked",
+        "auto_process": true
+      },
+      "expect": { "status": "REJECTED", "reason": "settlement_guard_failed" }
+    },
+    {
+      "kind": "clock",
+      "ts": "2026-01-06T10:00:00Z"
+    },
+    {
+      "kind": "check_settlement",
+      "quantity": 1,
+      "expect": { "pass": false, "available_qty": 0 }
+    },
+    {
+      "kind": "clock",
+      "ts": "2026-01-12T10:00:00Z"
+    },
+    {
+      "kind": "check_settlement",
+      "quantity": 25,
+      "expect": { "pass": true, "available_qty": 25 }
+    },
+    {
+      "kind": "place_order",
+      "payload": {
+        "account_mode": "DEMO",
+        "symbol": "TSTSAN",
+        "side": "SELL",
+        "quantity": 25,
+        "price": 9100.0,
+        "idempotency_key": "replay-tstsan-sell-ok",
+        "auto_process": true
+      },
+      "expect": { "status": "FILLED" }
+    }
+  ]
+}

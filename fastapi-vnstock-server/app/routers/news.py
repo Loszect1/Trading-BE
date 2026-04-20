@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from hashlib import sha256
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query
+from psycopg import connect
+from psycopg.rows import dict_row
 
 from app.core.config import settings
 from app.core.firecrawl_discovery import FIRECRAWL_DISCOVERY_QUERIES, DiscoveryPreset
@@ -22,12 +25,15 @@ from app.services.firecrawl_search_service import (
 )
 from app.services.news_aggregator_service import NewsAggregatorService
 from app.services.redis_cache import RedisCacheService
+from app.services.signal_engine_service import ensure_market_symbol_tables, persist_symbol_news_rows
+from app.services.vnstock_api_service import VNStockApiService
 
 router = APIRouter(prefix="/news", tags=["news"])
 
 _news_service = NewsAggregatorService()
 _redis_cache = RedisCacheService()
 _firecrawl_service = FirecrawlSearchService()
+_vnstock_api = VNStockApiService()
 
 NEWS_SOURCES_BY_ID: dict[str, NewsFeedSource] = {src.id: src for src in NEWS_FEED_SOURCES}
 
@@ -402,6 +408,209 @@ def list_news_sources() -> dict[str, Any]:
         "sources_pending_integration": list(NEWS_SOURCES_PENDING_INTEGRATION),
         "hints": dict(NEWS_API_HINTS),
     }
+
+
+@router.get("/symbol/{symbol}")
+def list_symbol_news_from_db(
+    symbol: str,
+    limit: int = Query(30, ge=1, le=200, description="Số tin tối đa trả về."),
+    offset: int = Query(0, ge=0, le=5000, description="Offset phân trang."),
+) -> dict[str, Any]:
+    """
+    Trả về tin theo mã từ DB (market_symbol_news), không gọi upstream API.
+    """
+    normalized_symbol = symbol.strip().upper()
+    if not normalized_symbol:
+        raise HTTPException(status_code=400, detail="Symbol is required.")
+
+    ensure_market_symbol_tables()
+    rows, total = _fetch_symbol_news_rows(normalized_symbol, int(limit), int(offset))
+
+    fallback_refreshed = False
+    latest_published_at, latest_updated_at = _latest_news_timestamps(rows)
+    needs_refresh = total <= 0 or (
+        _is_older_than_one_day(latest_published_at) and _is_older_than_one_day(latest_updated_at)
+    )
+
+    if needs_refresh:
+        exchange = _resolve_symbol_exchange(normalized_symbol) or "UNKNOWN"
+        fallback_items = _fetch_company_news_from_vnstock(normalized_symbol)
+        if fallback_items:
+            try:
+                persist_symbol_news_rows(
+                    symbol=normalized_symbol,
+                    exchange=exchange,
+                    news_items=fallback_items,
+                    max_items=max(30, int(limit)),
+                )
+                fallback_refreshed = True
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to persist fallback symbol news: {exc}",
+                ) from exc
+            rows, total = _fetch_symbol_news_rows(normalized_symbol, int(limit), int(offset))
+
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        source_id = str(row.get("source_id") or "").strip()
+        category = str(row.get("category") or "").strip()
+        items.append(
+            {
+                "symbol": row.get("symbol"),
+                "exchange": row.get("exchange"),
+                "title": row.get("title"),
+                "summary": row.get("summary"),
+                "url": row.get("url"),
+                "published_at": row.get("published_at").isoformat()
+                if row.get("published_at") is not None
+                else None,
+                "updatedAt": row.get("updated_at").isoformat() if row.get("updated_at") is not None else None,
+                "source": source_id or None,
+                "source_id": source_id or None,
+                "category": category or None,
+                "first_seen_at": row.get("first_seen_at").isoformat()
+                if row.get("first_seen_at") is not None
+                else None,
+                "last_seen_at": row.get("last_seen_at").isoformat()
+                if row.get("last_seen_at") is not None
+                else None,
+            }
+        )
+
+    return {
+        "symbol": normalized_symbol,
+        "count": len(items),
+        "total": total,
+        "limit": int(limit),
+        "offset": int(offset),
+        "items": items,
+        "source": "market_symbol_news",
+        "fallback_refreshed": fallback_refreshed,
+        "refresh_reason": "empty_or_stale_and_not_refreshed_over_1d" if needs_refresh else None,
+    }
+
+
+def _fetch_symbol_news_rows(symbol: str, limit: int, offset: int) -> tuple[list[dict[str, Any]], int]:
+    with connect(settings.database_url, row_factory=dict_row) as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT
+                    symbol,
+                    exchange,
+                    source_id,
+                    category,
+                    title,
+                    summary,
+                    url,
+                    published_at,
+                    updated_at,
+                    first_seen_at,
+                    last_seen_at
+                FROM market_symbol_news
+                WHERE symbol = %(symbol)s
+                ORDER BY published_at DESC NULLS LAST, updated_at DESC
+                LIMIT %(limit)s
+                OFFSET %(offset)s
+                """,
+                {"symbol": symbol, "limit": int(limit), "offset": int(offset)},
+            )
+            rows = cur.fetchall()
+            cur.execute(
+                """
+                SELECT COUNT(*)::BIGINT AS total
+                FROM market_symbol_news
+                WHERE symbol = %(symbol)s
+                """,
+                {"symbol": symbol},
+            )
+            total_row = cur.fetchone() or {}
+    total = int(total_row.get("total") or 0)
+    return list(rows), total
+
+
+def _resolve_symbol_exchange(symbol: str) -> str | None:
+    with connect(settings.database_url, row_factory=dict_row) as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT exchange
+                FROM market_symbols
+                WHERE symbol = %(symbol)s
+                LIMIT 1
+                """,
+                {"symbol": symbol},
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    exchange = str(row.get("exchange") or "").strip().upper()
+    return exchange or None
+
+
+def _latest_news_timestamps(rows: list[dict[str, Any]]) -> tuple[datetime | None, datetime | None]:
+    latest_published: datetime | None = None
+    latest_updated_of_latest_published: datetime | None = None
+    for row in rows:
+        published_at = row.get("published_at")
+        if not isinstance(published_at, datetime):
+            continue
+        dt_published = published_at if published_at.tzinfo is not None else published_at.replace(tzinfo=timezone.utc)
+        updated_at = row.get("updated_at")
+        dt_updated: datetime | None = None
+        if isinstance(updated_at, datetime):
+            dt_updated = updated_at if updated_at.tzinfo is not None else updated_at.replace(tzinfo=timezone.utc)
+        if latest_published is None or dt_published > latest_published:
+            latest_published = dt_published
+            latest_updated_of_latest_published = dt_updated
+    return latest_published, latest_updated_of_latest_published
+
+
+def _is_older_than_one_day(value: datetime | None) -> bool:
+    if value is None:
+        return True
+    now_utc = datetime.now(timezone.utc)
+    return (now_utc - value.astimezone(timezone.utc)) > timedelta(days=1)
+
+
+def _fetch_company_news_from_vnstock(symbol: str) -> list[dict[str, Any]]:
+    try:
+        raw = _vnstock_api.call_company("news", symbol=symbol, source="VCI", show_log=False)
+    except Exception:
+        return []
+    if not isinstance(raw, list):
+        return []
+
+    out: list[dict[str, Any]] = []
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        title = str(row.get("title") or row.get("headline") or row.get("news_title") or "").strip()
+        if not title:
+            continue
+        published_at = row.get("published_at") or row.get("publishDate") or row.get("date") or row.get("created_at")
+        source_id = row.get("source") or row.get("publisher") or row.get("news_source")
+        url = (
+            row.get("news_source_link")
+            or row.get("newsSourceLink")
+            or row.get("url")
+            or row.get("link")
+            or row.get("href")
+            or row.get("news_url")
+            or row.get("article_url")
+        )
+        out.append(
+            {
+                "title": title,
+                "summary": str(row.get("summary") or row.get("content") or row.get("news_short_content") or "").strip(),
+                "published_at": str(published_at).strip() if published_at is not None else None,
+                "source_id": str(source_id).strip() if source_id is not None else "vnstock_company_news",
+                "category": "company_news",
+                "url": str(url).strip() if url is not None else None,
+            }
+        )
+    return out
 
 
 def _require_firecrawl() -> None:

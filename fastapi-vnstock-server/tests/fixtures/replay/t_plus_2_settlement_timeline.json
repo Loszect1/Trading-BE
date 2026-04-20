@@ -1,0 +1,72 @@
+{
+  "description": "Captured-style replay: BUY fill, blocked SELL before T+2 roll, successful SELL after calendar advances.",
+  "symbol": "TSTFIX",
+  "steps": [
+    {
+      "op": "set_clock",
+      "iso_utc": "2026-01-05T10:00:00Z"
+    },
+    {
+      "op": "place_order",
+      "expect": { "status": "FILLED" },
+      "payload": {
+        "account_mode": "DEMO",
+        "symbol": "TSTFIX",
+        "side": "BUY",
+        "quantity": 25,
+        "price": 9000.0,
+        "idempotency_key": "replay-tstfix-buy",
+        "auto_process": true
+      }
+    },
+    {
+      "op": "check_settlement",
+      "quantity": 25,
+      "expect": { "pass": false, "available_qty": 0 }
+    },
+    {
+      "op": "place_order",
+      "expect": { "status": "REJECTED", "reason": "settlement_guard_failed" },
+      "payload": {
+        "account_mode": "DEMO",
+        "symbol": "TSTFIX",
+        "side": "SELL",
+        "quantity": 25,
+        "price": 9100.0,
+        "idempotency_key": "replay-tstfix-sell-blocked",
+        "auto_process": true
+      }
+    },
+    {
+      "op": "set_clock",
+      "iso_utc": "2026-01-06T10:00:00Z"
+    },
+    {
+      "op": "check_settlement",
+      "quantity": 1,
+      "expect": { "pass": false, "available_qty": 0 }
+    },
+    {
+      "op": "set_clock",
+      "iso_utc": "2026-01-12T10:00:00Z"
+    },
+    {
+      "op": "check_settlement",
+      "quantity": 25,
+      "expect": { "pass": true, "available_qty": 25 }
+    },
+    {
+      "op": "place_order",
+      "expect": { "status": "FILLED" },
+      "payload": {
+        "account_mode": "DEMO",
+        "symbol": "TSTFIX",
+        "side": "SELL",
+        "quantity": 25,
+        "price": 9100.0,
+        "idempotency_key": "replay-tstfix-sell-ok",
+        "auto_process": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{"format_version": "raw_production_trade_log_v1", "role": "header", "default_symbol": "TSTCAPX", "account_mode": "DEMO"}
+{"record_type": "clock", "ts": "2026-01-05T10:00:00Z"}
+{"record_type": "place_order", "order": {"account_mode": "DEMO", "symbol": "TSTCAPX", "side": "BUY", "quantity": 2, "price": 1000.0, "idempotency_key": "replay-tstcapx-new-cancel", "auto_process": false}, "expect": {"status": "NEW"}}
+{"record_type": "cancel_order", "account_mode": "DEMO", "idempotency_key": "replay-tstcapx-new-cancel", "reason": "replay_user_cancel", "expect": {"cancelled": true, "order_status": "CANCELLED"}}
+{"record_type": "place_order", "order": {"account_mode": "DEMO", "symbol": "TSTCAPX", "side": "BUY", "quantity": 1, "price": 2000.0, "idempotency_key": "replay-tstcapx-fill", "auto_process": true}, "expect": {"status": "FILLED"}}
+{"record_type": "reconcile_order", "account_mode": "DEMO", "idempotency_key": "replay-tstcapx-fill", "expect": {"reconciled": false, "reason_contains": "not_eligible"}}
+{"record_type": "cancel_order", "account_mode": "DEMO", "idempotency_key": "replay-tstcapx-fill", "reason": "too_late", "expect": {"cancelled": false, "reason": "cannot_cancel_filled"}}
+{"record_type": "risk_event", "account_mode": "DEMO", "event_type": "REPLAY_RAW_FIXTURE", "symbol": "TSTCAPX", "payload": {"note": "replay fixture"}, "expect": {"event_type": "REPLAY_RAW_FIXTURE", "verify_listed": true}}
+{"record_type": "broker_snapshot", "account_mode": "DEMO", "expect": {"contains_keys": ["portfolio", "orders_by_status", "generated_at"], "account_mode": "DEMO", "min_risk_events_last_7_days": 1}}

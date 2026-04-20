@@ -1,0 +1,10 @@
+{"format_version": "raw_production_trade_log_v1", "role": "header", "default_symbol": "TSTRAW", "account_mode": "DEMO", "dnse_access_token": "live-secret-token", "request_cookie": "session=supersecret"}
+{"record_type": "clock", "ts": "2026-01-05T10:00:00Z", "trace_id": "replay-raw-1", "authorization": "Bearer ultra-secret"}
+{"record_type": "place_order", "request_headers": {"Authorization": "Bearer nested-secret"}, "order": {"account_mode": "DEMO", "symbol": "TSTRAW", "side": "BUY", "quantity": 25, "price": 9000.0, "idempotency_key": "replay-tstraw-buy", "auto_process": true}, "expect": {"status": "FILLED"}}
+{"record_type": "check_settlement", "quantity": 25, "expect": {"pass": false, "available_qty": 0}}
+{"record_type": "place_order", "order": {"account_mode": "DEMO", "symbol": "TSTRAW", "side": "SELL", "quantity": 25, "price": 9100.0, "idempotency_key": "replay-tstraw-sell-blocked", "auto_process": true}, "expect": {"status": "REJECTED", "reason": "settlement_guard_failed"}}
+{"record_type": "clock", "ts": "2026-01-06T10:00:00Z"}
+{"record_type": "check_settlement", "quantity": 1, "expect": {"pass": false, "available_qty": 0}}
+{"record_type": "clock", "ts": "2026-01-12T10:00:00Z"}
+{"record_type": "check_settlement", "quantity": 25, "expect": {"pass": true, "available_qty": 25}}
+{"record_type": "place_order", "order": {"account_mode": "DEMO", "symbol": "TSTRAW", "side": "SELL", "quantity": 25, "price": 9100.0, "idempotency_key": "replay-tstraw-sell-ok", "auto_process": true}, "expect": {"status": "FILLED"}}

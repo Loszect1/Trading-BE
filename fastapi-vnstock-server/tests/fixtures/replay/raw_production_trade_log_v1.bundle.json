@@ -1,0 +1,32 @@
+{
+  "format_version": "raw_production_trade_log_v1",
+  "description": "Same raw schema as NDJSON, wrapped for single-file tooling.",
+  "records": [
+    {
+      "format_version": "raw_production_trade_log_v1",
+      "role": "header",
+      "default_symbol": "TSTUB",
+      "account_mode": "DEMO",
+      "api_key": "should-be-redacted"
+    },
+    { "record_type": "clock", "ts": "2026-01-05T10:00:00Z" },
+    {
+      "record_type": "place_order",
+      "order": {
+        "account_mode": "DEMO",
+        "symbol": "TSTUB",
+        "side": "BUY",
+        "quantity": 10,
+        "price": 10000.0,
+        "idempotency_key": "replay-tstub-bundle-buy",
+        "auto_process": true
+      },
+      "expect": { "status": "FILLED" }
+    },
+    {
+      "record_type": "check_settlement",
+      "quantity": 10,
+      "expect": { "pass": false, "available_qty": 0 }
+    }
+  ]
+}

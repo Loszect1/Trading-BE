@@ -1,0 +1,9 @@
+{"format_version": "raw_production_trade_log_v2", "role": "header", "default_symbol": "TSTCAP2", "account_mode": "DEMO", "deploy_schema": "2026-04-preview", "schema_minor": 2}
+{"event": "clock", "ts": "2026-01-05T10:00:00Z"}
+{"event": "place_order", "order": {"account_mode": "DEMO", "symbol": "TSTCAP2", "side": "BUY", "quantity": 2, "price": 1000.0, "idempotency_key": "replay-tstcap2-new-cancel", "auto_process": false}, "expect": {"status": "NEW"}}
+{"event": "order.cancel", "account_mode": "DEMO", "idempotency_key": "replay-tstcap2-new-cancel", "reason": "replay_user_cancel", "expect": {"cancelled": true, "order_status": "CANCELLED"}}
+{"event": "place_order", "order": {"account_mode": "DEMO", "symbol": "TSTCAP2", "side": "BUY", "quantity": 1, "price": 2000.0, "idempotency_key": "replay-tstcap2-fill", "auto_process": true}, "expect": {"status": "FILLED"}}
+{"event": "order.reconcile", "account_mode": "DEMO", "idempotency_key": "replay-tstcap2-fill", "expect": {"reconciled": false, "reason_contains": "not_eligible"}}
+{"event": "cancel_order", "account_mode": "DEMO", "idempotency_key": "replay-tstcap2-fill", "reason": "too_late", "expect": {"cancelled": false, "reason": "cannot_cancel_filled"}}
+{"event": "risk.log", "account_mode": "DEMO", "event_type": "REPLAY_RAW_FIXTURE_V2", "symbol": "TSTCAP2", "payload": {"note": "v2 alias"}, "expect": {"event_type": "REPLAY_RAW_FIXTURE_V2", "verify_listed": true}}
+{"event": "monitoring.snapshot", "account_mode": "DEMO", "expect": {"contains_keys": ["portfolio", "orders_by_status", "generated_at"], "account_mode": "DEMO", "min_risk_events_last_7_days": 1}}
