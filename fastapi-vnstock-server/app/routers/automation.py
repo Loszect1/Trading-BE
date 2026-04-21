@@ -38,6 +38,7 @@ from app.services.technical_automation_service import (
 )
 from app.services.redis_cache import RedisCacheService
 from app.services.mail_signal_scheduler_service import (
+    get_latest_mail_signals,
     get_latest_mail_signal_entry_run,
     get_today_mail_signals,
 )
@@ -267,6 +268,19 @@ def get_mail_signals_today() -> dict[str, Any]:
     except Exception as exc:
         logger.exception("automation.mail_signals_today_failed")
         raise HTTPException(status_code=500, detail=f"Failed to read today mail signals: {exc}") from exc
+
+
+@router.get("/mail-signals/latest")
+def get_mail_signals_latest() -> dict[str, Any]:
+    """
+    Read latest mail->Claude analyzed picks from Redis key signals:mail:daily:YYYY-MM-DD.
+    """
+    try:
+        row = get_latest_mail_signals()
+        return {"success": True, "data": row}
+    except Exception as exc:
+        logger.exception("automation.mail_signals_latest_failed")
+        raise HTTPException(status_code=500, detail=f"Failed to read latest mail signals: {exc}") from exc
 
 
 @router.get("/mail-signals/entry-run/latest")
