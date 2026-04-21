@@ -31,6 +31,10 @@ def _sched_status_dict(enabled: bool = True, account_mode: str = "DEMO") -> dict
         "poll_seconds": 60,
         "interval_minutes": 15,
         "timezone": "Asia/Ho_Chi_Minh",
+        "on_grid": False,
+        "now_local": datetime(2026, 4, 1, 9, 0, tzinfo=timezone.utc),
+        "next_grid_run_at": None,
+        "active_demo_session_id": None,
     }
 
 
@@ -180,7 +184,7 @@ class TestAutomationRouterThin:
             lambda **kwargs: payload,
         )
         client = _automation_client()
-        r = client.post("/automation/short-term/run-cycle", json={})
+        r = client.post("/automation/short-term/run-cycle", json={"async_for_heavy": False})
         assert r.status_code == 200
         assert r.json()["run_status"] == "COMPLETED"
 
@@ -188,7 +192,7 @@ class TestAutomationRouterThin:
             raise HTTPException(status_code=429, detail="rate limited")
 
         monkeypatch.setattr("app.routers.automation.run_short_term_production_cycle", _raise_http)
-        r_http = client.post("/automation/short-term/run-cycle", json={})
+        r_http = client.post("/automation/short-term/run-cycle", json={"async_for_heavy": False})
         assert r_http.status_code == 429
         assert r_http.json()["detail"] == "rate limited"
 
@@ -196,7 +200,7 @@ class TestAutomationRouterThin:
             "app.routers.automation.run_short_term_production_cycle",
             lambda **kwargs: (_ for _ in ()).throw(ValueError("broken cycle")),
         )
-        r500 = client.post("/automation/short-term/run-cycle", json={})
+        r500 = client.post("/automation/short-term/run-cycle", json={"async_for_heavy": False})
         assert r500.status_code == 500
         assert "broken cycle" in r500.json()["detail"]
 
@@ -234,6 +238,70 @@ class TestAutomationRouterThin:
         )
         r3 = client.get("/automation/short-term/last-run")
         assert r3.status_code == 500
+
+    def test_technical_run_cycle_and_history_endpoints(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        run_payload = {
+            "success": True,
+            "run_id": "00000000-0000-0000-0000-000000000099",
+            "run_status": "COMPLETED",
+            "scanned": 5,
+            "written": 5,
+            "errors": 0,
+            "detail": {"strategy_type": "TECHNICAL"},
+        }
+        monkeypatch.setattr("app.routers.automation.run_technical_scan_cycle", lambda **kwargs: run_payload)
+        client = _automation_client()
+        r = client.post("/automation/technical/run-cycle", json={})
+        assert r.status_code == 200
+        assert r.json()["run_status"] == "COMPLETED"
+        assert r.json()["written"] == 5
+
+        monkeypatch.setattr(
+            "app.routers.automation.run_technical_scan_cycle",
+            lambda **kwargs: (_ for _ in ()).throw(RuntimeError("technical cycle broken")),
+        )
+        r500 = client.post("/automation/technical/run-cycle", json={})
+        assert r500.status_code == 500
+        assert "technical cycle broken" in r500.json()["detail"]
+
+        monkeypatch.setattr("app.routers.automation.get_last_technical_scan_run", lambda: None)
+        r_last_none = client.get("/automation/technical/last-run")
+        assert r_last_none.status_code == 200
+        assert r_last_none.json()["data"] is None
+
+        technical_row = {
+            "id": "00000000-0000-0000-0000-000000000002",
+            "started_at": datetime(2026, 4, 1, 9, 0, tzinfo=timezone.utc),
+            "finished_at": datetime(2026, 4, 1, 9, 1, tzinfo=timezone.utc),
+            "run_status": "COMPLETED",
+            "scanned": 8,
+            "written": 8,
+            "errors": 0,
+            "detail": {"strategy_type": "TECHNICAL"},
+        }
+        monkeypatch.setattr("app.routers.automation.get_last_technical_scan_run", lambda: technical_row)
+        r_last = client.get("/automation/technical/last-run")
+        assert r_last.status_code == 200
+        assert r_last.json()["data"]["run_status"] == "COMPLETED"
+
+        monkeypatch.setattr("app.routers.automation.list_recent_technical_scan_runs", lambda limit=20: [technical_row])
+        r_runs = client.get("/automation/technical/runs", params={"limit": 10})
+        assert r_runs.status_code == 200
+        assert len(r_runs.json()["data"]) == 1
+
+        monkeypatch.setattr(
+            "app.routers.automation.get_last_technical_scan_run",
+            lambda: (_ for _ in ()).throw(RuntimeError("technical last run fail")),
+        )
+        r_last_500 = client.get("/automation/technical/last-run")
+        assert r_last_500.status_code == 500
+
+        monkeypatch.setattr(
+            "app.routers.automation.list_recent_technical_scan_runs",
+            lambda limit=20: (_ for _ in ()).throw(RuntimeError("technical runs fail")),
+        )
+        r_runs_500 = client.get("/automation/technical/runs")
+        assert r_runs_500.status_code == 500
 
     def test_scheduler_status_and_toggle(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
