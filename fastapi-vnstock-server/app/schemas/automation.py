@@ -57,6 +57,32 @@ class ShortTermAutomationRunRow(BaseModel):
     detail: dict[str, Any]
 
 
+class TechnicalCycleRunRequest(BaseModel):
+    limit_symbols: int = Field(default=0, ge=0)
+    exchange_scope: Literal["ALL", "HOSE", "HNX", "UPCOM"] = "ALL"
+
+
+class TechnicalCycleRunResponse(BaseModel):
+    success: bool
+    run_id: Optional[str] = None
+    run_status: str
+    scanned: int = 0
+    written: int = 0
+    errors: int = 0
+    detail: dict[str, Any] = Field(default_factory=dict)
+
+
+class TechnicalAutomationRunRow(BaseModel):
+    id: str
+    started_at: datetime
+    finished_at: datetime
+    run_status: str
+    scanned: int
+    written: int
+    errors: int
+    detail: dict[str, Any]
+
+
 class SchedulerToggleRequest(BaseModel):
     account_mode: Literal["REAL", "DEMO"] = "DEMO"
     enabled: bool
