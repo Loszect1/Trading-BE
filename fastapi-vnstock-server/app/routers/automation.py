@@ -37,7 +37,10 @@ from app.services.technical_automation_service import (
     run_technical_scan_cycle,
 )
 from app.services.redis_cache import RedisCacheService
-from app.services.mail_signal_scheduler_service import get_today_mail_signals
+from app.services.mail_signal_scheduler_service import (
+    get_latest_mail_signal_entry_run,
+    get_today_mail_signals,
+)
 
 logger = logging.getLogger(__name__)
 _redis_cache = RedisCacheService()
@@ -264,3 +267,16 @@ def get_mail_signals_today() -> dict[str, Any]:
     except Exception as exc:
         logger.exception("automation.mail_signals_today_failed")
         raise HTTPException(status_code=500, detail=f"Failed to read today mail signals: {exc}") from exc
+
+
+@router.get("/mail-signals/entry-run/latest")
+def get_mail_signals_entry_run_latest() -> dict[str, Any]:
+    """
+    Read latest entry scheduler run log from Redis (includes executed orders list).
+    """
+    try:
+        row = get_latest_mail_signal_entry_run()
+        return {"success": True, "data": row}
+    except Exception as exc:
+        logger.exception("automation.mail_signals_entry_run_latest_failed")
+        raise HTTPException(status_code=500, detail=f"Failed to read latest mail entry run: {exc}") from exc

@@ -192,6 +192,25 @@ def get_today_mail_signals() -> dict[str, Any] | None:
     return _redis.get_json(_daily_key())
 
 
+def get_latest_mail_signal_entry_run() -> dict[str, Any] | None:
+    keys = _redis.scan_keys("signals:mail:entry-run:*", limit=2000)
+    if not keys:
+        return None
+    dated: list[tuple[str, str]] = []
+    for key in keys:
+        token = key.rsplit(":", 1)[-1].strip()
+        if len(token) == 10 and token[4] == "-" and token[7] == "-":
+            dated.append((token, key))
+    if not dated:
+        return None
+    dated.sort(key=lambda row: row[0], reverse=True)
+    latest_key = dated[0][1]
+    payload = _redis.get_json(latest_key)
+    if payload is None:
+        return None
+    return {"redis_key": latest_key, **payload}
+
+
 def _extract_latest_price(symbol: str) -> float | None:
     try:
         rows = _vnstock.call_quote(
