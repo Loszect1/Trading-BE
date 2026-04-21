@@ -161,6 +161,9 @@ class AppSettings(BaseSettings):
     #: Post-close refresh schedule (VN local time), default 16:00 Monday-Friday.
     automation_short_term_post_close_refresh_hour: int = Field(default=16, ge=0, le=23)
     automation_short_term_post_close_refresh_minute: int = Field(default=0, ge=0, le=59)
+    #: Optional comma-separated local hours for post-close refresh, e.g. "12,16".
+    #: When provided, this overrides `automation_short_term_post_close_refresh_hour`.
+    automation_short_term_post_close_refresh_hours_csv: str = ""
     #: Retention window (days) for market_symbol_daily_volume writes.
     market_symbol_daily_volume_retention_days: int = Field(default=30, ge=5, le=120)
     #: Optional CSV list of VN market holidays: YYYY-MM-DD,YYYY-MM-DD

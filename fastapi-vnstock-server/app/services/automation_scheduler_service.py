@@ -33,7 +33,7 @@ _SHORT_TERM_SCHEDULER_EXCHANGE_SCOPES: tuple[str, ...] = ("HOSE", "HNX", "UPCOM"
 _loop_tasks: dict[AccountMode, asyncio.Task | None] = {mode: None for mode in _ACCOUNT_MODES}
 _cache_warm_task: asyncio.Task | None = None
 _last_cache_warm_local_date: date | None = None
-_last_post_close_refresh_local_date: date | None = None
+_post_close_refresh_run_markers: set[str] = set()
 _runtime_enabled: dict[AccountMode, bool] = {
     mode: bool(settings.automation_short_term_scheduler_enabled) for mode in _ACCOUNT_MODES
 }
@@ -116,6 +116,44 @@ def _scheduler_grid_snapshot() -> dict[str, Any]:
         "now_local": now_local,
         "next_grid_run_at": next_grid_run_at,
     }
+
+
+def _resolve_post_close_refresh_hours() -> tuple[int, ...]:
+    raw = str(settings.automation_short_term_post_close_refresh_hours_csv or "").strip()
+    if raw == "":
+        return (int(settings.automation_short_term_post_close_refresh_hour),)
+
+    parsed_hours: list[int] = []
+    for token in raw.split(","):
+        value = token.strip()
+        if value == "":
+            continue
+        try:
+            hour = int(value)
+        except ValueError:
+            logger.warning(
+                "short_term_post_close_refresh_hours_csv_invalid_token",
+                extra={"token": value, "raw": raw},
+            )
+            continue
+        if 0 <= hour <= 23:
+            parsed_hours.append(hour)
+        else:
+            logger.warning(
+                "short_term_post_close_refresh_hours_csv_out_of_range",
+                extra={"token": value, "raw": raw},
+            )
+
+    if not parsed_hours:
+        fallback_hour = int(settings.automation_short_term_post_close_refresh_hour)
+        logger.warning(
+            "short_term_post_close_refresh_hours_csv_empty_after_parse_use_fallback",
+            extra={"fallback_hour": fallback_hour, "raw": raw},
+        )
+        return (fallback_hour,)
+
+    # Deduplicate and keep deterministic execution order.
+    return tuple(sorted(set(parsed_hours)))
 
 
 def _ensure_automation_scheduler_state_table() -> None:
@@ -414,12 +452,12 @@ async def _scheduler_loop(account_mode: AccountMode) -> None:
 
 
 async def _cache_warm_loop() -> None:
-    global _last_cache_warm_local_date, _last_post_close_refresh_local_date
+    global _last_cache_warm_local_date
     poll_seconds = 30
     tz = ZoneInfo(settings.short_term_scan_timezone)
     warm_hour = int(settings.automation_short_term_cache_warm_hour)
     warm_minute = int(settings.automation_short_term_cache_warm_minute)
-    post_close_hour = int(settings.automation_short_term_post_close_refresh_hour)
+    post_close_hours = _resolve_post_close_refresh_hours()
     post_close_minute = int(settings.automation_short_term_post_close_refresh_minute)
     logger.info(
         "short_term_cache_warm_scheduler_started",
@@ -427,7 +465,7 @@ async def _cache_warm_loop() -> None:
             "timezone": settings.short_term_scan_timezone,
             "warm_hour": warm_hour,
             "warm_minute": warm_minute,
-            "post_close_hour": post_close_hour,
+            "post_close_hours": list(post_close_hours),
             "post_close_minute": post_close_minute,
             "poll_seconds": poll_seconds,
         },
@@ -458,13 +496,20 @@ async def _cache_warm_loop() -> None:
                     extra={"stats": stats},
                 )
 
+            # Keep only today's markers to avoid in-memory growth over long uptime.
+            today_prefix = f"{today.isoformat()}-"
+            stale_markers = [marker for marker in _post_close_refresh_run_markers if not marker.startswith(today_prefix)]
+            for marker in stale_markers:
+                _post_close_refresh_run_markers.discard(marker)
+
+            current_slot_marker = f"{today.isoformat()}-{now_local.hour:02d}:{now_local.minute:02d}"
             should_refresh_post_close = (
                 bool(settings.automation_short_term_post_close_refresh_enabled)
                 and is_weekday
                 and not is_holiday
-                and now_local.hour == post_close_hour
+                and now_local.hour in post_close_hours
                 and now_local.minute == post_close_minute
-                and _last_post_close_refresh_local_date != today
+                and current_slot_marker not in _post_close_refresh_run_markers
             )
             if should_refresh_post_close:
                 volume_stats = await asyncio.to_thread(
@@ -482,10 +527,11 @@ async def _cache_warm_loop() -> None:
                     max_symbols=0,
                     per_symbol_news_limit=20,
                 )
-                _last_post_close_refresh_local_date = today
+                _post_close_refresh_run_markers.add(current_slot_marker)
                 logger.warning(
                     "short_term_post_close_refresh_completed",
                     extra={
+                        "slot_marker": current_slot_marker,
                         "volume_stats": volume_stats,
                         "redis_stats": redis_stats,
                         "news_stats": news_stats,
