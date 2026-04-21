@@ -24,4 +24,3 @@ fastapi-vnstock-server/.coverage
 
 # local sensitive/runtime folders in API workspace
 fastapi-vnstock-server/credentials/
-fastapi-vnstock-server/tests/
