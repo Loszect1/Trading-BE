@@ -116,6 +116,9 @@ Environment:
   - Redis cache key is based on symbol + interval + lookback_days + model + max_tokens + temperature
   - Response includes `cached: true|false`
 - Market history: `GET /market/history?symbol=VCI&start=2024-01-01&end=2024-01-31&interval=1D`
+- Gmail fetch + download to local disk: `POST /gmail/fetch-download`
+  - Uses OAuth desktop flow with readonly scope (`gmail.readonly`).
+  - First call may open browser consent and create token cache file.
 - Full vnstock api gateway: `POST /vnstock-api/*`
   - Quote: `/vnstock-api/quote/{history|intraday|price-depth}`
   - Company: `/vnstock-api/company/{overview|shareholders|officers|subsidiaries|affiliate|news|events}`

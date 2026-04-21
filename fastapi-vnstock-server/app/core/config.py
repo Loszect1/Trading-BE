@@ -172,6 +172,38 @@ class AppSettings(BaseSettings):
     vn_market_holidays_builtin_enabled: bool = True
     #: Optional path to local JSON file: array of YYYY-MM-DD or {"dates": [...]} — no network I/O.
     vn_market_holidays_json_path: str = ""
+    #: Gmail OAuth desktop client secret JSON path (from Google Cloud Console).
+    gmail_oauth_client_secret_file: str = "credentials/gmail_client_secret.json"
+    #: Gmail OAuth token cache path (auto-created after first consent flow).
+    gmail_oauth_token_file: str = "credentials/gmail_token.json"
+    #: Default local directory for downloaded Gmail .eml/attachments.
+    gmail_download_dir: str = "downloads/gmail"
+    #: Enable weekday mail->Claude signal scheduler.
+    mail_signal_scheduler_enabled: bool = False
+    #: Mail signal scheduler timezone and run time (Mon-Fri).
+    mail_signal_scheduler_timezone: str = "Asia/Ho_Chi_Minh"
+    mail_signal_scheduler_hour: int = Field(default=19, ge=0, le=23)
+    mail_signal_scheduler_minute: int = Field(default=30, ge=0, le=59)
+    #: Base Gmail query used for daily signal ingestion.
+    mail_signal_gmail_query: str = "Tín hiệu Cạn Cung"
+    #: Max today-matched emails scanned for one scheduler run.
+    mail_signal_gmail_max_results: int = Field(default=20, ge=1, le=100)
+    #: Redis key TTL for persisted Claude signal picks.
+    mail_signal_redis_ttl_seconds: int = Field(default=604800, ge=300, le=2_592_000)
+    #: Enable 15-minute auto-entry execution from previous-day mail signals.
+    mail_signal_entry_scheduler_enabled: bool = False
+    #: Account mode used by mail-signal entry execution.
+    mail_signal_entry_account_mode: Literal["REAL", "DEMO"] = "DEMO"
+    #: NAV and risk config used for risk-sized quantity when entry is hit.
+    mail_signal_entry_nav: float = Field(default=100_000_000.0, gt=0.0, le=10_000_000_000.0)
+    mail_signal_entry_risk_per_trade: float = Field(default=0.01, gt=0.0, le=0.05)
+    #: Safety cap to avoid oversized entries.
+    mail_signal_entry_max_quantity: int = Field(default=100_000, ge=1, le=10_000_000)
+    #: Total cash pool for strategy allocation.
+    strategy_total_cash_vnd: float = Field(default=100_000_000.0, gt=0.0, le=100_000_000_000.0)
+    #: Allocation percentages from total cash pool.
+    strategy_alloc_short_term_pct: float = Field(default=0.2, ge=0.0, le=1.0)
+    strategy_alloc_mail_signal_pct: float = Field(default=0.2, ge=0.0, le=1.0)
 
     model_config = SettingsConfigDict(
         env_file=".env",

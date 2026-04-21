@@ -12,6 +12,7 @@ from psycopg.rows import dict_row
 
 from app.core.config import get_vn_market_holiday_dates, settings
 from app.services.alert_dispatcher_service import dispatch_alert_to_channels
+from app.services.demo_trading_service import get_demo_session_cash_balance
 from app.services.short_term_automation_service import run_short_term_production_cycle
 from app.services.short_term_scan_schedule import (
     is_instant_on_short_term_scan_grid,
@@ -38,6 +39,22 @@ _runtime_enabled: dict[AccountMode, bool] = {
     mode: bool(settings.automation_short_term_scheduler_enabled) for mode in _ACCOUNT_MODES
 }
 _active_demo_session_id: str | None = None
+
+
+def _short_term_allocated_nav() -> float:
+    total = float(settings.strategy_total_cash_vnd)
+    pct = float(settings.strategy_alloc_short_term_pct)
+    nav = total * pct
+    return max(1_000_000.0, nav)
+
+
+def _short_term_allocated_nav_for_mode(account_mode: AccountMode, demo_session_id: str | None) -> float:
+    if str(account_mode).upper() == "DEMO":
+        cash = get_demo_session_cash_balance(demo_session_id)
+        if cash is not None and cash > 0:
+            alloc = cash * float(settings.strategy_alloc_short_term_pct)
+            return max(1_000_000.0, alloc)
+    return _short_term_allocated_nav()
 
 
 def _format_scheduler_batch_telegram_message(
@@ -315,7 +332,7 @@ def _run_short_term_scheduler_on_grid_batch(
                 limit_symbols=0,
                 exchange_scope=scope,
                 account_mode=account_mode,
-                nav=100_000_000.0,
+                nav=_short_term_allocated_nav_for_mode(account_mode, demo_session_id),
                 risk_per_trade=0.01,
                 max_daily_new_orders=10,
                 enforce_vn_scan_schedule=True,

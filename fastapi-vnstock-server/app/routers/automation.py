@@ -13,6 +13,9 @@ from app.schemas.automation import (
     ShortTermAutomationRunRow,
     ShortTermCycleRunRequest,
     ShortTermCycleRunResponse,
+    TechnicalAutomationRunRow,
+    TechnicalCycleRunRequest,
+    TechnicalCycleRunResponse,
 )
 from app.services.automation_scheduler_service import (
     get_active_scheduler_demo_session_id,
@@ -28,7 +31,13 @@ from app.services.short_term_automation_service import (
     list_recent_short_term_automation_runs,
     run_short_term_production_cycle,
 )
+from app.services.technical_automation_service import (
+    get_last_technical_scan_run,
+    list_recent_technical_scan_runs,
+    run_technical_scan_cycle,
+)
 from app.services.redis_cache import RedisCacheService
+from app.services.mail_signal_scheduler_service import get_today_mail_signals
 
 logger = logging.getLogger(__name__)
 _redis_cache = RedisCacheService()
@@ -120,6 +129,50 @@ def get_short_term_runs(
         raise HTTPException(status_code=500, detail=f"Failed to read automation runs: {exc}") from exc
 
 
+@router.post("/technical/run-cycle", response_model=TechnicalCycleRunResponse)
+def post_technical_run_cycle(body: TechnicalCycleRunRequest = TechnicalCycleRunRequest()) -> TechnicalCycleRunResponse:
+    """
+    Run one technical-analysis scan cycle and persist summary for operations tracking.
+    """
+    try:
+        raw: dict[str, Any] = run_technical_scan_cycle(
+            limit_symbols=body.limit_symbols,
+            exchange_scope=body.exchange_scope,
+        )
+        return TechnicalCycleRunResponse.model_validate(raw)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("automation.technical_run_cycle_failed")
+        raise HTTPException(status_code=500, detail=f"Technical automation cycle error: {exc}") from exc
+
+
+@router.get("/technical/last-run")
+def get_technical_last_run() -> dict[str, Any]:
+    """Most recent persisted technical scan summary."""
+    try:
+        row = get_last_technical_scan_run()
+        if row is None:
+            return {"success": True, "data": None}
+        data = TechnicalAutomationRunRow.model_validate(row).model_dump(mode="json")
+        return {"success": True, "data": data}
+    except Exception as exc:
+        logger.exception("automation.technical_last_run_failed")
+        raise HTTPException(status_code=500, detail=f"Failed to read last technical run: {exc}") from exc
+
+
+@router.get("/technical/runs")
+def get_technical_runs(limit: int = Query(default=20, ge=1, le=200)) -> dict[str, Any]:
+    """Recent persisted technical scan runs for operations visibility."""
+    try:
+        rows = list_recent_technical_scan_runs(limit=limit)
+        data = [TechnicalAutomationRunRow.model_validate(row).model_dump(mode="json") for row in rows]
+        return {"success": True, "data": data, "limit": limit}
+    except Exception as exc:
+        logger.exception("automation.technical_runs_failed")
+        raise HTTPException(status_code=500, detail=f"Failed to read technical runs: {exc}") from exc
+
+
 @router.get("/short-term/cache-stats")
 def get_short_term_cache_stats() -> dict[str, Any]:
     """
@@ -198,3 +251,16 @@ def get_scheduler_state_rows() -> dict[str, Any]:
     except Exception as exc:
         logger.exception("automation.scheduler_state_rows_failed")
         raise HTTPException(status_code=500, detail=f"Failed to read scheduler state rows: {exc}") from exc
+
+
+@router.get("/mail-signals/today")
+def get_mail_signals_today() -> dict[str, Any]:
+    """
+    Read today's mail->Claude analyzed picks from Redis key signals:mail:daily:YYYY-MM-DD.
+    """
+    try:
+        row = get_today_mail_signals()
+        return {"success": True, "data": row}
+    except Exception as exc:
+        logger.exception("automation.mail_signals_today_failed")
+        raise HTTPException(status_code=500, detail=f"Failed to read today mail signals: {exc}") from exc

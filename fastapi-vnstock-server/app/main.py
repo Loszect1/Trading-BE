@@ -10,6 +10,7 @@ from app.routers.experience import router as experience_router
 from app.routers.health import router as health_router
 from app.routers.monitoring import router as monitoring_router
 from app.routers.market import router as market_router
+from app.routers.gmail import router as gmail_router
 from app.routers.news import router as news_router
 from app.routers.scanner import router as scanner_router
 from app.routers.signal_engine import router as signal_engine_router
@@ -22,6 +23,10 @@ from app.services.automation_scheduler_service import (
 from app.services.dnse_trading_token_scheduler import (
     start_dnse_trading_token_refresh_scheduler,
     stop_dnse_trading_token_refresh_scheduler,
+)
+from app.services.mail_signal_scheduler_service import (
+    start_mail_signal_scheduler,
+    stop_mail_signal_scheduler,
 )
 
 app = FastAPI(title=settings.app_name)
@@ -40,6 +45,7 @@ app.add_middleware(
 app.include_router(health_router)
 app.include_router(ai_router)
 app.include_router(market_router)
+app.include_router(gmail_router)
 app.include_router(news_router)
 app.include_router(vnstock_api_router)
 app.include_router(dnse_trade_router)
@@ -56,10 +62,12 @@ app.include_router(signal_engine_router)
 async def on_startup() -> None:
     await start_automation_scheduler()
     await start_dnse_trading_token_refresh_scheduler()
+    await start_mail_signal_scheduler()
 
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
+    await stop_mail_signal_scheduler()
     await stop_dnse_trading_token_refresh_scheduler()
     await stop_automation_scheduler()
 

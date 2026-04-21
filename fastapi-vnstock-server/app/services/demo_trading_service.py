@@ -670,3 +670,49 @@ def get_demo_session_overview(session_id: str) -> dict[str, Any]:
         "created_at": session_row["created_at"],
         "updated_at": session_row["updated_at"],
     }
+
+
+def get_active_scheduler_demo_session_id_from_db() -> str | None:
+    """
+    Read current scheduler DEMO session from automation_scheduler_demo_context.
+    Returns None when table/row is missing or value is blank.
+    """
+    try:
+        with connect(settings.database_url, row_factory=dict_row) as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT demo_session_id
+                    FROM automation_scheduler_demo_context
+                    WHERE id = 1
+                    """
+                )
+                row = cur.fetchone() or {}
+        raw = row.get("demo_session_id")
+        if not raw:
+            return None
+        sid = str(raw).strip()
+        return sid or None
+    except Exception:
+        return None
+
+
+def get_demo_session_cash_balance(session_id: str | None) -> float | None:
+    """
+    Resolve DEMO cash balance for a specific session id.
+    Returns None when session id is missing or lookup fails.
+    """
+    sid = normalize_demo_session_id(session_id)
+    if not sid:
+        return None
+    try:
+        snap = get_demo_account_snapshot(sid, mark_prices={})
+    except Exception:
+        return None
+    try:
+        cash = float(snap.get("cash_balance") or 0.0)
+    except Exception:
+        return None
+    if cash <= 0:
+        return None
+    return cash
