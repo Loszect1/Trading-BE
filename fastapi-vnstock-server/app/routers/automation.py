@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import logging
+from typing import cast
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query
+from psycopg import connect
+from psycopg.rows import dict_row
 
+from app.core.config import settings
 from app.schemas.automation import (
     SchedulerDemoSessionRequest,
     SchedulerStateRow,
@@ -203,6 +207,80 @@ def get_short_term_cache_stats() -> dict[str, Any]:
     except Exception as exc:
         logger.exception("automation.short_term_cache_stats_failed")
         raise HTTPException(status_code=500, detail=f"Failed to read short-term cache stats: {exc}") from exc
+
+
+@router.get("/short-term/cache-eligible")
+def get_short_term_cache_eligible(
+    limit: int = Query(default=300, ge=1, le=5000),
+    exchange_scope: Literal["ALL", "HOSE", "HNX", "UPCOM"] = Query(default="ALL"),
+) -> dict[str, Any]:
+    """
+    Read Redis liquidity cache rows where both gate flags are true:
+    - eligible_liquidity == true
+    - eligible_spike == true
+    """
+    def _is_true_flag(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value == 1
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            return normalized in {"1", "true", "yes", "y", "on"}
+        return False
+
+    try:
+        keys = _redis_cache.scan_keys("scan:liquidity:*", limit=500_000)
+        items: list[dict[str, Any]] = []
+        for key in keys:
+            parts = str(key).split(":", 3)
+            if len(parts) != 4:
+                continue
+            _, domain, raw_exchange, raw_symbol = parts
+            if domain != "liquidity":
+                continue
+            exchange = str(raw_exchange).strip().upper()
+            symbol = str(raw_symbol).strip().upper()
+            if not symbol:
+                continue
+            if exchange_scope != "ALL" and exchange != exchange_scope:
+                continue
+            payload = _redis_cache.get_json(str(key))
+            if not isinstance(payload, dict):
+                continue
+            if not _is_true_flag(payload.get("eligible_liquidity", False)):
+                continue
+            if not _is_true_flag(payload.get("eligible_spike", False)):
+                continue
+            items.append(
+                {
+                    "symbol": symbol,
+                    "exchange": exchange,
+                    "baseline_vol": payload.get("baseline_vol"),
+                    "latest_vol": payload.get("latest_vol"),
+                    "spike_ratio": payload.get("spike_ratio"),
+                    "eligible_liquidity": True,
+                    "eligible_spike": True,
+                    "redis_key": str(key),
+                }
+            )
+
+        items.sort(key=lambda row: (str(row.get("exchange", "")), str(row.get("symbol", ""))))
+        total = len(items)
+        limited = cast(list[dict[str, Any]], items[:limit])
+        return {
+            "success": True,
+            "data": limited,
+            "meta": {
+                "exchange_scope": exchange_scope,
+                "limit": limit,
+                "total_matched": total,
+                "returned": len(limited),
+            },
+        }
+    except Exception as exc:
+        logger.exception("automation.short_term_cache_eligible_failed")
+        raise HTTPException(status_code=500, detail=f"Failed to read short-term cache eligible rows: {exc}") from exc
 
 
 @router.get("/scheduler/status", response_model=SchedulerStatusResponse)
