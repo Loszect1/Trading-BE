@@ -17,6 +17,7 @@ from app.schemas.auto_trading import (
 )
 from app.services.demo_trading_service import (
     create_demo_session,
+    delete_demo_session,
     execute_demo_trade,
     get_demo_account_snapshot,
     get_demo_session_overview,
@@ -90,6 +91,23 @@ def get_demo_sessions(
     except Exception as exc:
         logger.exception("auto_trading.list_demo_sessions_failed")
         raise HTTPException(status_code=500, detail="Failed to list demo sessions") from exc
+
+
+@router.delete("/demo/session-current")
+def delete_current_demo_session(
+    x_demo_session_id: Annotated[Optional[str], Header(alias="X-Demo-Session-Id")] = None,
+) -> dict[str, Any]:
+    session_id = _resolve_demo_session_id(x_demo_session_id)
+    try:
+        deleted = delete_demo_session(session_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Demo session not found")
+        return {"success": True, "data": {"deleted_session_id": session_id}}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("auto_trading.delete_demo_session_failed", extra={"session_id": session_id})
+        raise HTTPException(status_code=500, detail="Failed to delete demo session") from exc
 
 
 @router.post("/demo/trades")

@@ -1,0 +1,12 @@
+.venv
+.pytest_cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.coverage
+tests
+graphify-out
+downloads
+*.log
+*.sqlite3

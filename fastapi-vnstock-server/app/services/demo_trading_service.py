@@ -177,6 +177,110 @@ def list_demo_sessions(*, limit: int = 50, offset: int = 0) -> dict[str, Any]:
     }
 
 
+def delete_demo_session(session_id: str) -> bool:
+    """
+    Delete one demo session and all related rows across DB tables that reference this
+    demo session id explicitly or through known JSON metadata.
+    Core demo tables (sessions/positions/lots/trades) are removed via FK cascade.
+    Returns True when a session row was deleted, otherwise False.
+    """
+    ensure_demo_trading_tables()
+    with connect(settings.database_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS automation_scheduler_demo_context (
+                    id SMALLINT PRIMARY KEY CHECK (id = 1),
+                    demo_session_id VARCHAR(128) NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            # Clear scheduler context if it points to the session being deleted.
+            cur.execute(
+                """
+                UPDATE automation_scheduler_demo_context
+                SET demo_session_id = NULL, updated_at = NOW()
+                WHERE id = 1 AND demo_session_id = %(session_id)s
+                """,
+                {"session_id": session_id},
+            )
+
+            # Generic cleanup for any table that has an explicit demo_session_id column.
+            cur.execute(
+                """
+                SELECT table_schema, table_name
+                FROM information_schema.columns
+                WHERE column_name = 'demo_session_id'
+                  AND table_schema NOT IN ('pg_catalog', 'information_schema')
+                """,
+            )
+            ref_tables = cur.fetchall() or []
+            for table_schema, table_name in ref_tables:
+                if not table_schema or not table_name:
+                    continue
+                safe_schema = str(table_schema).replace('"', '""')
+                safe_table = str(table_name).replace('"', '""')
+                cur.execute(
+                    f'DELETE FROM "{safe_schema}"."{safe_table}" WHERE demo_session_id = %(session_id)s',
+                    {"session_id": session_id},
+                )
+
+            # Related rows where session id is stored in JSON payloads.
+            cur.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'short_term_automation_runs'
+                )
+                """,
+            )
+            has_short_term_runs = bool((cur.fetchone() or [False])[0])
+            if has_short_term_runs:
+                cur.execute(
+                    """
+                    DELETE FROM short_term_automation_runs
+                    WHERE detail->>'demo_session_id' = %(session_id)s
+                    """,
+                    {"session_id": session_id},
+                )
+            cur.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'experience'
+                )
+                """,
+            )
+            has_experience = bool((cur.fetchone() or [False])[0])
+            if has_experience:
+                cur.execute(
+                    """
+                    DELETE FROM experience
+                    WHERE account_mode = 'DEMO'
+                      AND (
+                        market_context->>'demo_session_id' = %(session_id)s
+                        OR trade_id LIKE %(trade_prefix)s
+                      )
+                    """,
+                    {"session_id": session_id, "trade_prefix": f"demo-{session_id}-%"},
+                )
+
+            # Delete root session row last; cascades demo_positions/open_lots/trades.
+            cur.execute(
+                """
+                DELETE FROM demo_sessions
+                WHERE session_id = %(session_id)s
+                """,
+                {"session_id": session_id},
+            )
+            deleted = int(cur.rowcount or 0) > 0
+        conn.commit()
+    return deleted
+
+
 def _ensure_demo_session_exists(conn: Any, session_id: str) -> None:
     with conn.cursor() as cur:
         cur.execute(
