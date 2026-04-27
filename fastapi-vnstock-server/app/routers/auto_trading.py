@@ -11,6 +11,8 @@ from app.schemas.auto_trading import (
     DemoAccountResponseData,
     DemoSessionOverviewData,
     DemoPositionSnapshot,
+    DemoStrategyCashTransferData,
+    DemoStrategyCashTransferRequest,
     DemoTradeRequest,
     DemoTradeResponseData,
     ExperienceAnalysisStatus,
@@ -21,6 +23,7 @@ from app.services.demo_trading_service import (
     execute_demo_trade,
     get_demo_account_snapshot,
     get_demo_session_overview,
+    transfer_demo_strategy_cash_from_unallocated,
     list_demo_sessions,
     normalize_demo_session_id,
 )
@@ -210,3 +213,34 @@ def get_demo_overview(
     except Exception as exc:
         logger.exception("auto_trading.demo_overview_failed", extra={"session_id": session_id})
         raise HTTPException(status_code=500, detail="Failed to read demo overview") from exc
+
+
+@router.post("/demo/strategy-cash/transfer")
+def post_demo_strategy_cash_transfer(
+    body: DemoStrategyCashTransferRequest,
+    x_demo_session_id: Annotated[Optional[str], Header(alias="X-Demo-Session-Id")] = None,
+) -> dict[str, Any]:
+    session_id = _resolve_demo_session_id(x_demo_session_id)
+    try:
+        row = transfer_demo_strategy_cash_from_unallocated(
+            session_id=session_id,
+            to_strategy=body.to_strategy,
+            amount_vnd=body.amount_vnd,
+            from_strategy=body.from_strategy,
+        )
+        data = DemoStrategyCashTransferData.model_validate(row)
+        return {"success": True, "data": data.model_dump(mode="json")}
+    except ValueError as exc:
+        code = str(exc)
+        if code == "INSUFFICIENT_UNALLOCATED_CASH":
+            raise HTTPException(status_code=400, detail="Source strategy cash is not enough") from exc
+        if code in {"INVALID_TRANSFER_AMOUNT", "INVALID_TARGET_STRATEGY"}:
+            raise HTTPException(status_code=400, detail="Invalid transfer payload") from exc
+        if code in {"INVALID_SOURCE_STRATEGY", "INVALID_TRANSFER_SAME_STRATEGY"}:
+            raise HTTPException(status_code=400, detail="Invalid transfer direction") from exc
+        raise HTTPException(status_code=400, detail="Transfer rejected") from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("auto_trading.demo_strategy_cash_transfer_failed", extra={"session_id": session_id})
+        raise HTTPException(status_code=500, detail="Failed to transfer strategy cash") from exc

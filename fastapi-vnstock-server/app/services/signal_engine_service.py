@@ -874,14 +874,17 @@ def _short_term_entry_gate(
     min_spike_ratio: float | None = None,
     min_momentum_5d_pct: float = 1.0,
     max_distance_from_ema20_pct: float = 8.0,
+    rsi_min: float = 52.0,
+    rsi_max: float = 75.0,
+    macd_min_line: float = 0.0,
 ) -> tuple[bool, dict[str, Any]]:
     """
     Production-safe BUY gate to reduce false positives:
     - trend + liquidity/spike already filtered upstream
     - add breakout confirmation, momentum confirmation, and avoid overly stretched entries.
     """
-    if len(closes) < 25 or len(volumes) < 25 or ema20_proxy <= 0 or last_close <= 0:
-        return False, {"reason": "insufficient_bars_or_invalid_price"}
+    if len(closes) < 55 or len(volumes) < 55 or ema20_proxy <= 0 or last_close <= 0:
+        return False, {"reason": "insufficient_bars_or_invalid_price_for_full_technical_confirm"}
 
     min_spike = float(min_spike_ratio) if min_spike_ratio is not None else float(settings.short_term_scan_min_volume_spike_ratio)
     breakout_lookback = 20
@@ -889,36 +892,86 @@ def _short_term_entry_gate(
     prev_high = max(prev_window) if prev_window else last_close
     breakout_ok = bool(last_close >= prev_high * 0.995)
 
+    ema50_proxy = mean(closes[-50:])
+    ema_alignment_ok = bool(last_close > ema20_proxy > ema50_proxy)
+
     momentum_5d = 0.0
     if len(closes) >= 6 and closes[-6] > 0:
         momentum_5d = ((last_close / closes[-6]) - 1.0) * 100.0
     momentum_ok = bool(momentum_5d >= float(min_momentum_5d_pct))
+
+    # RSI(14) using simple average gain/loss for deterministic gating.
+    deltas = [float(closes[i] - closes[i - 1]) for i in range(1, len(closes))]
+    recent_deltas = deltas[-14:]
+    gains = [d for d in recent_deltas if d > 0]
+    losses = [abs(d) for d in recent_deltas if d < 0]
+    avg_gain = (sum(gains) / 14.0) if recent_deltas else 0.0
+    avg_loss = (sum(losses) / 14.0) if recent_deltas else 0.0
+    if avg_loss <= 0:
+        rsi14 = 100.0 if avg_gain > 0 else 50.0
+    else:
+        rs = avg_gain / avg_loss
+        rsi14 = 100.0 - (100.0 / (1.0 + rs))
+    rsi_ok = bool(float(rsi_min) <= rsi14 <= float(rsi_max))
+
+    def _ema_series(values: list[float], period: int) -> list[float]:
+        out: list[float] = []
+        if not values:
+            return out
+        alpha = 2.0 / (float(period) + 1.0)
+        ema = float(values[0])
+        out.append(ema)
+        for v in values[1:]:
+            ema = alpha * float(v) + (1.0 - alpha) * ema
+            out.append(ema)
+        return out
+
+    ema12 = _ema_series([float(v) for v in closes], 12)
+    ema26 = _ema_series([float(v) for v in closes], 26)
+    macd_line_series = [a - b for a, b in zip(ema12, ema26)]
+    macd_signal_series = _ema_series(macd_line_series, 9)
+    macd_line = float(macd_line_series[-1]) if macd_line_series else 0.0
+    macd_signal = float(macd_signal_series[-1]) if macd_signal_series else 0.0
+    macd_ok = bool(macd_line >= macd_signal and macd_line >= float(macd_min_line))
 
     distance_pct = ((last_close / ema20_proxy) - 1.0) * 100.0 if ema20_proxy > 0 else 0.0
     not_overstretched = bool(distance_pct <= float(max_distance_from_ema20_pct))
 
     pass_gate = bool(
         spike >= min_spike
-        and last_close > ema20_proxy
+        and ema_alignment_ok
         and breakout_ok
         and momentum_ok
+        and rsi_ok
+        and macd_ok
         and not_overstretched
     )
     return pass_gate, {
         "min_spike_ratio": round(min_spike, 4),
         "spike_ratio": round(float(spike), 4),
+        "ema20_proxy": round(float(ema20_proxy), 4),
+        "ema50_proxy": round(float(ema50_proxy), 4),
+        "ema_alignment_ok": ema_alignment_ok,
         "prev_20d_high": round(float(prev_high), 4),
         "breakout_ok": breakout_ok,
         "momentum_5d_pct": round(float(momentum_5d), 4),
         "min_momentum_5d_pct": round(float(min_momentum_5d_pct), 4),
         "momentum_ok": momentum_ok,
+        "rsi14": round(float(rsi14), 4),
+        "rsi_min": round(float(rsi_min), 4),
+        "rsi_max": round(float(rsi_max), 4),
+        "rsi_ok": rsi_ok,
+        "macd_line": round(float(macd_line), 6),
+        "macd_signal": round(float(macd_signal), 6),
+        "macd_min_line": round(float(macd_min_line), 6),
+        "macd_ok": macd_ok,
         "distance_from_ema20_pct": round(float(distance_pct), 4),
         "max_distance_from_ema20_pct": round(float(max_distance_from_ema20_pct), 4),
         "not_overstretched": not_overstretched,
     }
 
 
-def _entry_gate_thresholds_from_experience(exp_meta: dict[str, Any] | None) -> dict[str, Any]:
+def _entry_gate_thresholds_from_experience(exp_meta: dict[str, Any] | None, *, market_regime: str = "neutral") -> dict[str, Any]:
     """
     Tighten entry gate when recent experience indicates frequent losses/stoploss.
     """
@@ -931,6 +984,18 @@ def _entry_gate_thresholds_from_experience(exp_meta: dict[str, Any] | None) -> d
     }
     if not isinstance(exp_meta, dict) or not bool(exp_meta.get("applied")):
         return thresholds
+    claude_adaptation = exp_meta.get("claude_market_adaptation")
+    if isinstance(claude_adaptation, dict):
+        regime_row = claude_adaptation.get(str(market_regime).lower())
+        if isinstance(regime_row, dict):
+            try:
+                thresholds["min_spike_ratio"] = max(base_spike, float(regime_row.get("min_spike_ratio")))
+                thresholds["min_momentum_5d_pct"] = max(0.0, float(regime_row.get("min_momentum_5d_pct")))
+                thresholds["max_distance_from_ema20_pct"] = max(2.0, float(regime_row.get("max_distance_from_ema20_pct")))
+                thresholds["experience_tightening_level"] = f"claude_{str(market_regime).lower()}"
+                return thresholds
+            except (TypeError, ValueError):
+                pass
     stoploss_ratio = float(exp_meta.get("stoploss_ratio") or 0.0)
     win_ratio = float(exp_meta.get("win_ratio") or 0.0)
     avg_loss_pct = float(exp_meta.get("avg_loss_percent_abs") or 0.0)
@@ -1029,6 +1094,22 @@ def _dynamic_short_term_buy_composite_floor(*, benchmark_closes: list[float] | N
     if trend_ratio <= -0.01:
         return 62.0
     return floor
+
+
+def _technical_thresholds_from_market_regime(benchmark_closes: list[float] | None) -> dict[str, float | str]:
+    closes = [float(v) for v in (benchmark_closes or []) if float(v) > 0]
+    if len(closes) < 20:
+        return {"regime": "neutral", "rsi_min": 52.0, "rsi_max": 75.0, "macd_min_line": 0.0}
+    last = closes[-1]
+    ema20 = mean(closes[-20:])
+    if ema20 <= 0:
+        return {"regime": "neutral", "rsi_min": 52.0, "rsi_max": 75.0, "macd_min_line": 0.0}
+    trend_ratio = (last / ema20) - 1.0
+    if trend_ratio >= 0.01:
+        return {"regime": "risk_on", "rsi_min": 50.0, "rsi_max": 80.0, "macd_min_line": -0.02}
+    if trend_ratio <= -0.01:
+        return {"regime": "risk_off", "rsi_min": 55.0, "rsi_max": 70.0, "macd_min_line": 0.05}
+    return {"regime": "neutral", "rsi_min": 52.0, "rsi_max": 75.0, "macd_min_line": 0.0}
 
 
 def _liquidity_cache_key(symbol: str, exchange: str) -> str:
@@ -1179,7 +1260,7 @@ def _experience_confidence_adjustment(symbol: str, action: str) -> tuple[float, 
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT pnl_percent, mistake_tags
+                    SELECT pnl_percent, mistake_tags, market_context
                     FROM experience
                     WHERE symbol = %(symbol)s
                       AND strategy_type = 'SHORT_TERM'
@@ -1219,6 +1300,12 @@ def _experience_confidence_adjustment(symbol: str, action: str) -> tuple[float, 
     if win_ratio >= 0.6:
         adjustment += min(6.0, 2.0 + win_ratio * 6.0)
     adjustment = max(-15.0, min(8.0, adjustment))
+    latest_ctx = samples[0].get("market_context") if samples else None
+    claude_adaptation = (
+        latest_ctx.get("claude_market_adaptation")
+        if isinstance(latest_ctx, dict) and isinstance(latest_ctx.get("claude_market_adaptation"), dict)
+        else None
+    )
     return adjustment, {
         "applied": True,
         "samples": n,
@@ -1229,6 +1316,7 @@ def _experience_confidence_adjustment(symbol: str, action: str) -> tuple[float, 
         "win_ratio": round(win_ratio, 4),
         "avg_loss_percent_abs": round(avg_loss_percent_abs, 4),
         "confidence_adjustment": adjustment,
+        "claude_market_adaptation": claude_adaptation,
     }
 
 
@@ -1245,6 +1333,8 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
     skipped_entry_gate = 0
     skipped_experience_cooldown = 0
     skipped_dynamic_buy_floor = 0
+    experience_threshold_source_claude = 0
+    experience_threshold_source_heuristic = 0
     scan_started_at = time.perf_counter()
     step_stats: dict[str, dict[str, float | int]] = {}
 
@@ -1262,6 +1352,8 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
     )
     _track_step("fetch_symbol_daily_closes_benchmark", bench_t0)
     dynamic_buy_floor = _dynamic_short_term_buy_composite_floor(benchmark_closes=bench_closes)
+    technical_thresholds = _technical_thresholds_from_market_regime(bench_closes)
+    market_regime = str(technical_thresholds.get("regime") or "neutral")
 
     normalized_scope = _normalize_exchange_scope(exchange_scope)
     universe_t0 = time.perf_counter()
@@ -1321,7 +1413,11 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
             exp_adj, exp_meta = _experience_confidence_adjustment(symbol=symbol, action="BUY")
         except Exception:
             pass
-        gate_thresholds = _entry_gate_thresholds_from_experience(exp_meta)
+        gate_thresholds = _entry_gate_thresholds_from_experience(exp_meta, market_regime=market_regime)
+        if str(gate_thresholds.get("experience_tightening_level") or "").startswith("claude_"):
+            experience_threshold_source_claude += 1
+        else:
+            experience_threshold_source_heuristic += 1
         action = "HOLD"
         confidence = 45.0
         reason = "Short-term conditions not strong enough."
@@ -1334,6 +1430,9 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
             min_spike_ratio=float(gate_thresholds["min_spike_ratio"]),
             min_momentum_5d_pct=float(gate_thresholds["min_momentum_5d_pct"]),
             max_distance_from_ema20_pct=float(gate_thresholds["max_distance_from_ema20_pct"]),
+            rsi_min=float(technical_thresholds["rsi_min"]),
+            rsi_max=float(technical_thresholds["rsi_max"]),
+            macd_min_line=float(technical_thresholds["macd_min_line"]),
         )
         if gate_pass:
             action = "BUY"
@@ -1379,6 +1478,7 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
         )
         metadata["entry_gate"] = gate_meta
         metadata["experience_entry_tightening"] = gate_thresholds
+        metadata["market_regime_technical_thresholds"] = technical_thresholds
         cooldown_active, cooldown_meta = _experience_buy_cooldown(symbol=symbol, action=action)
         metadata["experience_buy_cooldown"] = cooldown_meta
         if action == "BUY" and cooldown_active:
@@ -1459,6 +1559,8 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
             "skipped_experience_cooldown": skipped_experience_cooldown,
             "skipped_dynamic_buy_floor": skipped_dynamic_buy_floor,
             "dynamic_buy_composite_floor": dynamic_buy_floor,
+            "experience_threshold_source_claude": experience_threshold_source_claude,
+            "experience_threshold_source_heuristic": experience_threshold_source_heuristic,
             "steps": step_rows,
         },
     )
@@ -1472,6 +1574,8 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
         "skipped_experience_cooldown": skipped_experience_cooldown,
         "skipped_dynamic_buy_floor": skipped_dynamic_buy_floor,
         "dynamic_buy_composite_floor": dynamic_buy_floor,
+        "experience_threshold_source_claude": experience_threshold_source_claude,
+        "experience_threshold_source_heuristic": experience_threshold_source_heuristic,
         "exchange_scope": normalized_scope,
     }
 
@@ -1492,6 +1596,8 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
     skipped_entry_gate = 0
     skipped_experience_cooldown = 0
     skipped_dynamic_buy_floor = 0
+    experience_threshold_source_claude = 0
+    experience_threshold_source_heuristic = 0
     scan_started_at = time.perf_counter()
     step_stats: dict[str, dict[str, float | int]] = {}
 
@@ -1525,6 +1631,8 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
     )
     _track_step("fetch_symbol_daily_closes_benchmark", bench_t0)
     dynamic_buy_floor = _dynamic_short_term_buy_composite_floor(benchmark_closes=bench_closes)
+    technical_thresholds = _technical_thresholds_from_market_regime(bench_closes)
+    market_regime = str(technical_thresholds.get("regime") or "neutral")
 
     if not symbol_batch:
         raise RuntimeError(
@@ -1581,7 +1689,11 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
             exp_adj, exp_meta = _experience_confidence_adjustment(symbol=symbol, action="BUY")
         except Exception:
             pass
-        gate_thresholds = _entry_gate_thresholds_from_experience(exp_meta)
+        gate_thresholds = _entry_gate_thresholds_from_experience(exp_meta, market_regime=market_regime)
+        if str(gate_thresholds.get("experience_tightening_level") or "").startswith("claude_"):
+            experience_threshold_source_claude += 1
+        else:
+            experience_threshold_source_heuristic += 1
         action = "HOLD"
         confidence = 45.0
         reason = "Short-term conditions not strong enough."
@@ -1594,6 +1706,9 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
             min_spike_ratio=float(gate_thresholds["min_spike_ratio"]),
             min_momentum_5d_pct=float(gate_thresholds["min_momentum_5d_pct"]),
             max_distance_from_ema20_pct=float(gate_thresholds["max_distance_from_ema20_pct"]),
+            rsi_min=float(technical_thresholds["rsi_min"]),
+            rsi_max=float(technical_thresholds["rsi_max"]),
+            macd_min_line=float(technical_thresholds["macd_min_line"]),
         )
         if gate_pass:
             action = "BUY"
@@ -1632,6 +1747,7 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
         )
         metadata["entry_gate"] = gate_meta
         metadata["experience_entry_tightening"] = gate_thresholds
+        metadata["market_regime_technical_thresholds"] = technical_thresholds
         cooldown_active, cooldown_meta = _experience_buy_cooldown(symbol=symbol, action=action)
         metadata["experience_buy_cooldown"] = cooldown_meta
         if action == "BUY" and cooldown_active:
@@ -1698,6 +1814,8 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
             "skipped_experience_cooldown": skipped_experience_cooldown,
             "skipped_dynamic_buy_floor": skipped_dynamic_buy_floor,
             "dynamic_buy_composite_floor": dynamic_buy_floor,
+            "experience_threshold_source_claude": experience_threshold_source_claude,
+            "experience_threshold_source_heuristic": experience_threshold_source_heuristic,
             "steps": step_rows,
         },
     )
@@ -1711,6 +1829,8 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
         "skipped_experience_cooldown": skipped_experience_cooldown,
         "skipped_dynamic_buy_floor": skipped_dynamic_buy_floor,
         "dynamic_buy_composite_floor": dynamic_buy_floor,
+        "experience_threshold_source_claude": experience_threshold_source_claude,
+        "experience_threshold_source_heuristic": experience_threshold_source_heuristic,
         "scan_mode": "fallback_light",
         "exchange_scope": normalized_scope,
         "listing_target_symbols": listing_target_symbols if listing_target_symbols is not None else scanned,

@@ -99,7 +99,7 @@ def _extract_json_object(raw_text: str) -> dict[str, Any] | None:
     return None
 
 
-def _analyze_experience_with_claude(record: ExperienceRecord) -> tuple[str, list[str], str, float]:
+def _analyze_experience_with_claude(record: ExperienceRecord) -> tuple[str, list[str], str, float, dict[str, Any]]:
     if not settings.ai_claude_experience_enabled:
         raise RuntimeError("claude_experience_disabled")
 
@@ -110,7 +110,12 @@ def _analyze_experience_with_claude(record: ExperienceRecord) -> tuple[str, list
         '  "root_cause": "string",\n'
         '  "mistake_tags": ["string"],\n'
         '  "improvement_action": "string",\n'
-        '  "confidence_after_review": number\n'
+        '  "confidence_after_review": number,\n'
+        '  "market_adaptation_by_regime": {\n'
+        '    "risk_on": {"min_spike_ratio": number, "min_momentum_5d_pct": number, "max_distance_from_ema20_pct": number},\n'
+        '    "neutral": {"min_spike_ratio": number, "min_momentum_5d_pct": number, "max_distance_from_ema20_pct": number},\n'
+        '    "risk_off": {"min_spike_ratio": number, "min_momentum_5d_pct": number, "max_distance_from_ema20_pct": number}\n'
+        "  }\n"
         "}\n"
         "Input trade:\n"
         f"- trade_id: {record.trade_id}\n"
@@ -146,7 +151,25 @@ def _analyze_experience_with_claude(record: ExperienceRecord) -> tuple[str, list
         improvement_action = "Raf soat lai dieu kien vao lenh va tang bo loc xac nhan setup."
     confidence = float(parsed.get("confidence_after_review") or record.confidence_after_review)
     confidence = max(0.0, min(100.0, confidence))
-    return root_cause, tags, improvement_action, confidence
+    raw_adapt = parsed.get("market_adaptation_by_regime")
+    adaptation: dict[str, Any] = {}
+    if isinstance(raw_adapt, dict):
+        for regime_key in ("risk_on", "neutral", "risk_off"):
+            regime_row = raw_adapt.get(regime_key)
+            if not isinstance(regime_row, dict):
+                continue
+            try:
+                min_spike = float(regime_row.get("min_spike_ratio"))
+                min_mom = float(regime_row.get("min_momentum_5d_pct"))
+                max_dist = float(regime_row.get("max_distance_from_ema20_pct"))
+            except (TypeError, ValueError):
+                continue
+            adaptation[regime_key] = {
+                "min_spike_ratio": max(1.0, min(4.0, min_spike)),
+                "min_momentum_5d_pct": max(0.0, min(5.0, min_mom)),
+                "max_distance_from_ema20_pct": max(2.0, min(15.0, max_dist)),
+            }
+    return root_cause, tags, improvement_action, confidence, adaptation
 
 
 def _merge_experience_context(
@@ -275,11 +298,17 @@ def create_experience_from_trade(payload: dict[str, Any]) -> dict[str, Any]:
 
     root_cause, tags, improvement_action = _guess_root_cause(record)
     confidence_after_review = record.confidence_after_review
+    claude_market_adaptation: dict[str, Any] = {}
     try:
-        root_cause, tags, improvement_action, confidence_after_review = _analyze_experience_with_claude(record)
+        root_cause, tags, improvement_action, confidence_after_review, claude_market_adaptation = _analyze_experience_with_claude(
+            record
+        )
     except Exception:
         # Keep heuristic fallback to avoid blocking trade-close pipeline.
         pass
+    if isinstance(record.market_context, dict):
+        if claude_market_adaptation:
+            record.market_context["claude_market_adaptation"] = claude_market_adaptation
 
     with connect(settings.database_url, row_factory=dict_row) as conn:
         with conn.cursor() as cur:

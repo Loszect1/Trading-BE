@@ -14,6 +14,7 @@ from app.services.claude_service import ClaudeService
 from app.services.demo_trading_service import (
     get_active_scheduler_demo_session_id_from_db,
     get_demo_session_cash_balance,
+    get_demo_strategy_remaining_cash,
 )
 from app.services.gmail_service import GmailFetchService
 from app.services.redis_cache import RedisCacheService
@@ -53,6 +54,9 @@ def _mail_signal_allocated_nav() -> float:
 def _mail_signal_allocated_nav_for_mode(account_mode: str) -> float:
     if str(account_mode).upper() == "DEMO":
         active_demo_session_id = get_active_scheduler_demo_session_id_from_db()
+        strategy_cash = get_demo_strategy_remaining_cash(str(active_demo_session_id or ""), "MAIL_SIGNAL")
+        if strategy_cash > 0:
+            return max(1_000_000.0, strategy_cash)
         cash = get_demo_session_cash_balance(active_demo_session_id)
         if cash is not None and cash > 0:
             alloc = cash * float(settings.strategy_alloc_mail_signal_pct)
@@ -348,6 +352,7 @@ def run_prev_day_entry_auto_trading_once() -> dict[str, Any]:
                 "idempotency_key": idem_key,
                 "metadata": {
                     "source": "mail_signal_entry_scheduler",
+                    "strategy_code": "MAIL_SIGNAL",
                     "signal_day": prev_day.strftime("%Y-%m-%d"),
                     "confidence": float(item.confidence),
                     "take_profit": float(item.take_profit),

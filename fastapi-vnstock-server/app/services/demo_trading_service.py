@@ -123,11 +123,208 @@ def ensure_demo_trading_tables() -> None:
     );
     CREATE INDEX IF NOT EXISTS idx_demo_trades_session_created
         ON demo_trades (session_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS demo_strategy_cash (
+        session_id VARCHAR(128) NOT NULL REFERENCES demo_sessions(session_id) ON DELETE CASCADE,
+        strategy_code VARCHAR(20) NOT NULL CHECK (strategy_code IN ('SHORT_TERM', 'MAIL_SIGNAL', 'UNALLOCATED')),
+        cash_value DOUBLE PRECISION NOT NULL CHECK (cash_value >= 0),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (session_id, strategy_code)
+    );
     """
     with connect(settings.database_url) as conn:
         with conn.cursor() as cur:
             cur.execute(query)
         conn.commit()
+
+
+def _strategy_alloc_defaults(total_cash: float) -> dict[str, float]:
+    base_cash = max(0.0, float(total_cash))
+    short_pct = max(0.0, min(1.0, float(settings.strategy_alloc_short_term_pct)))
+    mail_pct = max(0.0, min(1.0, float(settings.strategy_alloc_mail_signal_pct)))
+    short_cash = base_cash * short_pct
+    mail_cash = base_cash * mail_pct
+    return {
+        "SHORT_TERM": short_cash,
+        "MAIL_SIGNAL": mail_cash,
+        "UNALLOCATED": max(0.0, base_cash - short_cash - mail_cash),
+    }
+
+
+def _ensure_demo_strategy_cash_rows(conn: Any, session_id: str, total_cash: float) -> None:
+    defaults = _strategy_alloc_defaults(total_cash)
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT strategy_code, cash_value
+            FROM demo_strategy_cash
+            WHERE session_id = %(session_id)s
+            """,
+            {"session_id": session_id},
+        )
+        rows = cur.fetchall() or []
+        if rows:
+            return
+        for strategy_code, cash_value in defaults.items():
+            cur.execute(
+                """
+                INSERT INTO demo_strategy_cash (session_id, strategy_code, cash_value, updated_at)
+                VALUES (%(session_id)s, %(strategy_code)s, %(cash_value)s, NOW())
+                ON CONFLICT (session_id, strategy_code)
+                DO UPDATE SET cash_value = EXCLUDED.cash_value, updated_at = NOW()
+                """,
+                {
+                    "session_id": session_id,
+                    "strategy_code": strategy_code,
+                    "cash_value": float(cash_value),
+                },
+            )
+
+
+def _strategy_used_notional_for_session(session_id: str) -> dict[str, float]:
+    used: dict[str, float] = {"SHORT_TERM": 0.0, "MAIL_SIGNAL": 0.0}
+    with connect(settings.database_url, row_factory=dict_row) as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT
+                    CASE
+                        WHEN COALESCE(order_metadata->>'strategy_code', '') IN ('SHORT_TERM', 'MAIL_SIGNAL')
+                            THEN COALESCE(order_metadata->>'strategy_code', '')
+                        WHEN COALESCE(order_metadata->>'source', '') IN ('short_term_schedule_entry', 'short_term_schedule_exit')
+                            THEN 'SHORT_TERM'
+                        WHEN COALESCE(order_metadata->>'source', '') LIKE 'mail_signal_%'
+                            THEN 'MAIL_SIGNAL'
+                        ELSE NULL
+                    END AS strategy_code,
+                    side,
+                    SUM(quantity * price)::double precision AS notional_sum
+                FROM orders_core
+                WHERE account_mode = 'DEMO'
+                  AND status = 'FILLED'
+                GROUP BY 1, 2
+                """
+            )
+            for row in cur.fetchall() or []:
+                strategy_code = str(row.get("strategy_code") or "").strip().upper()
+                side = str(row.get("side") or "").strip().upper()
+                notional = float(row.get("notional_sum") or 0.0)
+                if strategy_code not in used:
+                    continue
+                if side == "BUY":
+                    used[strategy_code] += notional
+                elif side == "SELL":
+                    used[strategy_code] -= notional
+    for key in list(used.keys()):
+        used[key] = max(0.0, used[key])
+    return used
+
+
+def get_demo_strategy_remaining_cash(session_id: str, strategy_code: str) -> float:
+    sid = normalize_demo_session_id(session_id)
+    strategy = str(strategy_code).strip().upper()
+    if strategy not in {"SHORT_TERM", "MAIL_SIGNAL"}:
+        return 0.0
+    ensure_demo_trading_tables()
+    with connect(settings.database_url, row_factory=dict_row) as conn:
+        _ensure_demo_session_exists(conn, sid)
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT cash_balance FROM demo_sessions WHERE session_id = %(session_id)s", {"session_id": sid})
+            session_row = cur.fetchone() or {}
+            total_cash = float(session_row.get("cash_balance") or 0.0)
+            _ensure_demo_strategy_cash_rows(conn, sid, total_cash)
+            cur.execute(
+                """
+                SELECT cash_value
+                FROM demo_strategy_cash
+                WHERE session_id = %(session_id)s AND strategy_code = %(strategy_code)s
+                """,
+                {"session_id": sid, "strategy_code": strategy},
+            )
+            alloc_row = cur.fetchone() or {}
+        conn.commit()
+    allocated = max(0.0, float(alloc_row.get("cash_value") or 0.0))
+    used = float(_strategy_used_notional_for_session(sid).get(strategy) or 0.0)
+    return max(0.0, allocated - used)
+
+
+def transfer_demo_strategy_cash_from_unallocated(
+    session_id: str, to_strategy: str, amount_vnd: float, from_strategy: str = "UNALLOCATED"
+) -> dict[str, Any]:
+    sid = normalize_demo_session_id(session_id)
+    target = str(to_strategy).strip().upper()
+    source = str(from_strategy).strip().upper()
+    amount = float(amount_vnd)
+    if target not in {"SHORT_TERM", "MAIL_SIGNAL", "UNALLOCATED"}:
+        raise ValueError("INVALID_TARGET_STRATEGY")
+    if source not in {"UNALLOCATED", "SHORT_TERM", "MAIL_SIGNAL"}:
+        raise ValueError("INVALID_SOURCE_STRATEGY")
+    if amount <= 0:
+        raise ValueError("INVALID_TRANSFER_AMOUNT")
+    ensure_demo_trading_tables()
+    with connect(settings.database_url, row_factory=dict_row) as conn:
+        _ensure_demo_session_exists(conn, sid)
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT cash_balance FROM demo_sessions WHERE session_id = %(session_id)s FOR UPDATE", {"session_id": sid})
+            session_row = cur.fetchone() or {}
+            total_cash = float(session_row.get("cash_balance") or 0.0)
+            _ensure_demo_strategy_cash_rows(conn, sid, total_cash)
+            if target == "UNALLOCATED" and source == "UNALLOCATED":
+                cur.execute(
+                    """
+                    UPDATE demo_sessions
+                    SET initial_balance = initial_balance + %(amount)s,
+                        cash_balance = cash_balance + %(amount)s,
+                        updated_at = NOW()
+                    WHERE session_id = %(session_id)s
+                    """,
+                    {"amount": amount, "session_id": sid},
+                )
+                cur.execute(
+                    """
+                    UPDATE demo_strategy_cash
+                    SET cash_value = cash_value + %(amount)s, updated_at = NOW()
+                    WHERE session_id = %(session_id)s AND strategy_code = 'UNALLOCATED'
+                    """,
+                    {"amount": amount, "session_id": sid},
+                )
+                conn.commit()
+                return {"session_id": sid, "transferred_to": target, "amount_vnd": amount}
+            if source == target:
+                raise ValueError("INVALID_TRANSFER_SAME_STRATEGY")
+            cur.execute(
+                """
+                SELECT strategy_code, cash_value
+                FROM demo_strategy_cash
+                WHERE session_id = %(session_id)s
+                  AND strategy_code IN (%(source)s, %(target)s)
+                FOR UPDATE
+                """,
+                {"session_id": sid, "source": source, "target": target},
+            )
+            rows = {str(r["strategy_code"]).upper(): float(r["cash_value"]) for r in (cur.fetchall() or [])}
+            source_cash = max(0.0, float(rows.get(source) or 0.0))
+            current_target = max(0.0, float(rows.get(target) or 0.0))
+            if amount > source_cash + 1e-9:
+                raise ValueError("INSUFFICIENT_UNALLOCATED_CASH")
+            cur.execute(
+                """
+                UPDATE demo_strategy_cash
+                SET cash_value = %(cash_value)s, updated_at = NOW()
+                WHERE session_id = %(session_id)s AND strategy_code = %(strategy_code)s
+                """,
+                {"session_id": sid, "strategy_code": source, "cash_value": max(0.0, source_cash - amount)},
+            )
+            cur.execute(
+                """
+                UPDATE demo_strategy_cash
+                SET cash_value = %(cash_value)s, updated_at = NOW()
+                WHERE session_id = %(session_id)s AND strategy_code = %(strategy_code)s
+                """,
+                {"session_id": sid, "strategy_code": target, "cash_value": current_target + amount},
+            )
+        conn.commit()
+    return {"session_id": sid, "transferred_to": target, "amount_vnd": amount}
 
 
 def create_demo_session() -> str:
@@ -721,6 +918,7 @@ def get_demo_session_overview(session_id: str) -> dict[str, Any]:
                 """
                 SELECT
                     s.session_id,
+                    s.initial_balance,
                     s.cash_balance,
                     s.realized_pnl,
                     s.created_at,
@@ -762,15 +960,71 @@ def get_demo_session_overview(session_id: str) -> dict[str, Any]:
     ]
     holdings_count = len(holdings)
     trade_count = int(session_row.get("trade_count") or 0)
+    cash_balance = max(0.0, float(session_row["cash_balance"]))
+    strategy_used_notional = _strategy_used_notional_for_session(str(session_row["session_id"]))
+    with connect(settings.database_url, row_factory=dict_row) as conn_alloc:
+        with conn_alloc.cursor(row_factory=dict_row) as cur_alloc:
+            _ensure_demo_strategy_cash_rows(conn_alloc, str(session_row["session_id"]), cash_balance)
+            cur_alloc.execute(
+                """
+                SELECT strategy_code, cash_value
+                FROM demo_strategy_cash
+                WHERE session_id = %(session_id)s
+                """,
+                {"session_id": str(session_row["session_id"])},
+            )
+            alloc_rows = {str(r["strategy_code"]).upper(): float(r["cash_value"]) for r in (cur_alloc.fetchall() or [])}
+        conn_alloc.commit()
+    short_term_cash = max(0.0, float(alloc_rows.get("SHORT_TERM") or 0.0))
+    mail_signal_cash = max(0.0, float(alloc_rows.get("MAIL_SIGNAL") or 0.0))
+    unallocated_cash = max(0.0, float(alloc_rows.get("UNALLOCATED") or 0.0))
+    alloc_total = short_term_cash + mail_signal_cash + unallocated_cash
+    alloc_short_term_pct = (short_term_cash / alloc_total) if alloc_total > 0 else 0.0
+    alloc_mail_signal_pct = (mail_signal_cash / alloc_total) if alloc_total > 0 else 0.0
+    alloc_unallocated_pct = (unallocated_cash / alloc_total) if alloc_total > 0 else 0.0
+    strategy_cash_overview = [
+        {
+            "strategy_code": "SHORT_TERM",
+            "allocation_pct": alloc_short_term_pct,
+            "cash_value": round(short_term_cash, 6),
+            "used_cash_value": round(float(strategy_used_notional.get("SHORT_TERM") or 0.0), 6),
+            "remaining_cash_value": round(
+                max(0.0, float(short_term_cash) - float(strategy_used_notional.get("SHORT_TERM") or 0.0)),
+                6,
+            ),
+        },
+        {
+            "strategy_code": "MAIL_SIGNAL",
+            "allocation_pct": alloc_mail_signal_pct,
+            "cash_value": round(mail_signal_cash, 6),
+            "used_cash_value": round(float(strategy_used_notional.get("MAIL_SIGNAL") or 0.0), 6),
+            "remaining_cash_value": round(
+                max(0.0, float(mail_signal_cash) - float(strategy_used_notional.get("MAIL_SIGNAL") or 0.0)),
+                6,
+            ),
+        },
+    ]
+    if unallocated_cash > 0:
+        strategy_cash_overview.append(
+            {
+                "strategy_code": "UNALLOCATED",
+                "allocation_pct": max(0.0, alloc_unallocated_pct),
+                "cash_value": round(unallocated_cash, 6),
+                "used_cash_value": 0.0,
+                "remaining_cash_value": round(unallocated_cash, 6),
+            }
+        )
 
     return {
         "session_id": str(session_row["session_id"]),
         "is_active": bool(trade_count > 0 or holdings_count > 0),
-        "cash_balance": float(session_row["cash_balance"]),
+        "initial_balance": float(session_row["initial_balance"]),
+        "cash_balance": cash_balance,
         "realized_pnl": float(session_row["realized_pnl"]),
         "trade_count": trade_count,
         "holdings_count": holdings_count,
         "holdings": holdings,
+        "strategy_cash_overview": strategy_cash_overview,
         "created_at": session_row["created_at"],
         "updated_at": session_row["updated_at"],
     }

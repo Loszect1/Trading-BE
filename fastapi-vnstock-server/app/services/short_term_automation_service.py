@@ -411,6 +411,7 @@ def _handle_one_sell_candidate(*, candidate: dict[str, Any], account_mode: str, 
             "auto_process": True,
             "metadata": {
                 "source": "short_term_schedule_exit",
+                "strategy_code": "SHORT_TERM",
                 "trigger": trigger,
                 "take_profit_price": float(candidate.get("take_profit_price") or 0.0),
                 "stoploss_price": float(candidate.get("stoploss_price") or 0.0),
@@ -484,7 +485,7 @@ def _handle_one_buy_signal(
     *,
     sig: dict[str, Any],
     account_mode: str,
-    nav: float,
+    available_cash: float,
     risk_per_trade: float,
     max_daily_new_orders: int,
     daily_new_orders: int,
@@ -513,6 +514,7 @@ def _handle_one_buy_signal(
             "execution_rejected": 1,
             "errors": 0,
             "daily_new_orders_delta": 0,
+            "cash_spent": 0.0,
             "detail": {
                 "symbol": symbol,
                 "outcome": "rejected",
@@ -523,11 +525,32 @@ def _handle_one_buy_signal(
                 "level_source": level_source,
             },
         }
+    safe_available_cash = max(0.0, float(available_cash))
+    if safe_available_cash < (entry * 100.0):
+        return {
+            "risk_rejected": 1,
+            "executed": 0,
+            "execution_rejected": 0,
+            "errors": 0,
+            "daily_new_orders_delta": 0,
+            "cash_spent": 0.0,
+            "detail": {
+                "symbol": symbol,
+                "outcome": "risk_rejected",
+                "reason": "insufficient_cash_for_lot100_runtime",
+                "entry_price": entry,
+                "take_profit_price": tp,
+                "stoploss_price": stoploss,
+                "level_source": level_source,
+                "available_cash": safe_available_cash,
+                "required_cash_for_lot100": round(entry * 100.0, 6),
+            },
+        }
 
     risk_payload = {
         "stoploss_price": stoploss,
         "entry_price": entry,
-        "nav": float(nav),
+        "nav": safe_available_cash,
         "risk_per_trade": float(risk_per_trade),
         "daily_new_orders": int(daily_new_orders),
         "max_daily_new_orders": int(max_daily_new_orders),
@@ -540,6 +563,7 @@ def _handle_one_buy_signal(
             "execution_rejected": 0,
             "errors": 0,
             "daily_new_orders_delta": 0,
+            "cash_spent": 0.0,
             "detail": {
                 "symbol": symbol,
                 "outcome": "risk_rejected",
@@ -565,6 +589,7 @@ def _handle_one_buy_signal(
             "execution_rejected": 0,
             "errors": 0,
             "daily_new_orders_delta": 0,
+            "cash_spent": 0.0,
             "detail": {
                 "symbol": symbol,
                 "outcome": "risk_rejected",
@@ -573,6 +598,30 @@ def _handle_one_buy_signal(
                 "take_profit_price": tp,
                 "stoploss_price": stoploss,
                 "level_source": level_source,
+                "planned_quantity": planned_lot_qty,
+                "risk_cap_quantity": risk_cap_lot_qty,
+            },
+        }
+    max_cash_lot_qty = int((safe_available_cash / entry) // 100) * 100 if entry > 0 else 0
+    if qty > max_cash_lot_qty:
+        qty = max_cash_lot_qty
+    if qty <= 0:
+        return {
+            "risk_rejected": 1,
+            "executed": 0,
+            "execution_rejected": 0,
+            "errors": 0,
+            "daily_new_orders_delta": 0,
+            "cash_spent": 0.0,
+            "detail": {
+                "symbol": symbol,
+                "outcome": "risk_rejected",
+                "reason": "insufficient_cash_after_risk_sizing",
+                "entry_price": entry,
+                "take_profit_price": tp,
+                "stoploss_price": stoploss,
+                "level_source": level_source,
+                "available_cash": safe_available_cash,
                 "planned_quantity": planned_lot_qty,
                 "risk_cap_quantity": risk_cap_lot_qty,
             },
@@ -590,6 +639,7 @@ def _handle_one_buy_signal(
             "auto_process": True,
             "metadata": {
                 "source": "short_term_schedule_entry",
+                "strategy_code": "SHORT_TERM",
                 "entry_price": entry,
                 "take_profit_price": tp,
                 "stoploss_price": stoploss,
@@ -600,12 +650,15 @@ def _handle_one_buy_signal(
     resolved_order = order_row.get("order") if isinstance(order_row.get("order"), dict) else order_row
     status = str((resolved_order or {}).get("status", "")).upper()
     if status == "FILLED":
+        filled_price = float((resolved_order or {}).get("price") or entry)
+        cash_spent = max(0.0, float(qty) * filled_price)
         return {
             "risk_rejected": 0,
             "executed": 1,
             "execution_rejected": 0,
             "errors": 0,
             "daily_new_orders_delta": 1,
+            "cash_spent": cash_spent,
             "detail": {
                 "symbol": symbol,
                 "outcome": "executed",
@@ -616,6 +669,7 @@ def _handle_one_buy_signal(
                 "level_source": level_source,
                 "planned_quantity": planned_lot_qty,
                 "risk_cap_quantity": risk_cap_lot_qty,
+                "cash_spent": cash_spent,
             },
         }
     if status == "REJECTED":
@@ -625,6 +679,7 @@ def _handle_one_buy_signal(
             "execution_rejected": 1,
             "errors": 0,
             "daily_new_orders_delta": 0,
+            "cash_spent": 0.0,
             "detail": {
                 "symbol": symbol,
                 "outcome": "execution_rejected",
@@ -643,6 +698,7 @@ def _handle_one_buy_signal(
         "execution_rejected": 1,
         "errors": 0,
         "daily_new_orders_delta": 0,
+        "cash_spent": 0.0,
         "detail": {
             "symbol": symbol,
             "outcome": "execution_rejected",
@@ -1342,12 +1398,13 @@ def run_short_term_production_cycle(
 
             daily_new_orders = _count_short_term_new_orders_today(account_mode)
             sell_candidates = _build_sell_candidates_from_positions(account_mode)
+            remaining_cash_runtime = max(0.0, float(nav))
             buy_rows_all = [s for s in signals if str(s.get("action", "")).upper() == "BUY"]
             sell_trigger_symbols = {str(row.get("symbol") or "").strip().upper() for row in sell_candidates}
             buy_rows_filtered = [
                 row for row in buy_rows_all if str(row.get("symbol") or "").strip().upper() not in sell_trigger_symbols
             ]
-            strategy_remaining_cash = max(0.0, float(nav))
+            strategy_remaining_cash = float(remaining_cash_runtime)
             buy_rows_decided, planned_qty_by_signal_id, decision_meta = _apply_claude_buy_decision(
                 buy_rows=buy_rows_filtered,
                 strategy_remaining_cash=strategy_remaining_cash,
@@ -1373,6 +1430,14 @@ def run_short_term_production_cycle(
                     continue
                 buy_rows.append(row)
             buy_candidates = len(buy_rows)
+            planned_spent_total = 0.0
+            for row in buy_rows:
+                sid = str(row.get("id") or "")
+                entry_price = float(row.get("entry_price") or 0.0)
+                planned_qty = int(planned_qty_by_signal_id.get(sid, 0))
+                if entry_price > 0 and planned_qty > 0:
+                    planned_spent_total += float(entry_price) * float(planned_qty)
+            actual_buy_cash_spent = 0.0
 
             for sell_candidate in sell_candidates:
                 try:
@@ -1412,7 +1477,7 @@ def run_short_term_production_cycle(
                                     _handle_one_buy_signal(
                                         sig=sig,
                                         account_mode=account_mode,
-                                        nav=float(nav),
+                                        available_cash=float(remaining_cash_runtime),
                                         risk_per_trade=float(risk_per_trade),
                                         max_daily_new_orders=int(max_daily_new_orders),
                                         daily_new_orders=int(daily_new_orders),
@@ -1437,8 +1502,14 @@ def run_short_term_production_cycle(
                     execution_rejected += int(one.get("execution_rejected") or 0)
                     errors += int(one.get("errors") or 0)
                     daily_new_orders += int(one.get("daily_new_orders_delta") or 0)
+                    actual_buy_cash_spent += float(one.get("cash_spent") or 0.0)
+                    remaining_cash_runtime = max(
+                        0.0,
+                        float(remaining_cash_runtime) - float(one.get("cash_spent") or 0.0),
+                    )
                     detail_row = one.get("detail")
                     if isinstance(detail_row, dict):
+                        detail_row["remaining_cash_after_order"] = round(float(remaining_cash_runtime), 6)
                         executions_detail.append(detail_row)
                     else:
                         executions_detail.append({"symbol": symbol, "outcome": "error", "error": "invalid_result"})
@@ -1469,6 +1540,15 @@ def run_short_term_production_cycle(
                     executions_detail.append({"symbol": symbol, "outcome": "error", "error": str(exc)})
 
             finished_at = _utc_now()
+            decision_meta_enriched = dict(decision_meta or {})
+            decision_meta_enriched["planned_spent"] = round(float(planned_spent_total), 2)
+            decision_meta_enriched["actual_spent"] = round(float(actual_buy_cash_spent), 2)
+            decision_meta_enriched["initial_strategy_cash"] = round(float(nav), 2)
+            decision_meta_enriched["remaining_cash_after_cycle"] = round(float(remaining_cash_runtime), 2)
+            decision_meta_enriched["execution_spent_gap"] = round(
+                float(planned_spent_total) - float(actual_buy_cash_spent),
+                2,
+            )
             detail = {
                 **base_detail,
                 "skipped_insufficient_data": int(batch.get("skipped_insufficient_data") or 0),
@@ -1476,7 +1556,8 @@ def run_short_term_production_cycle(
                 "executions": executions_detail,
                 "allocation_method": "claude_decision_with_score_fallback",
                 "allocation_nav_total": float(nav),
-                "buy_decision_meta": decision_meta,
+                "remaining_cash_after_cycle": round(float(remaining_cash_runtime), 6),
+                "buy_decision_meta": decision_meta_enriched,
                 "sell_candidates": len(sell_candidates),
             }
             for obs_key in (
@@ -1486,6 +1567,8 @@ def run_short_term_production_cycle(
                 "exchange_scope_summary",
                 "skipped_low_liquidity",
                 "skipped_no_volume_spike",
+                "experience_threshold_source_claude",
+                "experience_threshold_source_heuristic",
             ):
                 if obs_key in batch and batch.get(obs_key) is not None:
                     detail[obs_key] = batch.get(obs_key)
