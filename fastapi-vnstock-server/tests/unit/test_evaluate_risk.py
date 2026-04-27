@@ -35,10 +35,11 @@ def test_evaluate_risk_zero_stop_distance_rejected():
     assert r["suggested_size"] == 0
 
 
-def test_evaluate_risk_daily_limit_no_longer_blocks():
+def test_evaluate_risk_daily_limit_blocks():
     r = evaluate_risk(_base_payload(daily_new_orders=10, max_daily_new_orders=10))
-    assert r["pass"] is True
-    assert r["reason"] == "ok"
+    assert r["pass"] is False
+    assert r["reason"] == "max_daily_new_orders_reached"
+    assert r["suggested_size"] == 0
 
 
 def test_evaluate_risk_size_too_small_rounds_to_zero():

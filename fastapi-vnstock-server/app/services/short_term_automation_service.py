@@ -168,6 +168,150 @@ def _allocate_quantities_by_score(
     return allocations
 
 
+def _build_claude_buy_decision_prompt(
+    *,
+    buy_rows: list[dict[str, Any]],
+    strategy_remaining_cash: float,
+    lot_size: int = 100,
+) -> str:
+    compact_rows: list[dict[str, Any]] = []
+    for row in buy_rows:
+        compact_rows.append(
+            {
+                "signal_id": str(row.get("id") or "").strip(),
+                "symbol": str(row.get("symbol") or "").strip().upper(),
+                "entry_price": float(row.get("entry_price") or 0.0),
+                "take_profit_price": float(row.get("take_profit_price") or 0.0),
+                "stoploss_price": float(row.get("stoploss_price") or 0.0),
+                "confidence": float(row.get("confidence") or 0.0),
+                "metadata": row.get("metadata") if isinstance(row.get("metadata"), dict) else {},
+            }
+        )
+    payload = {
+        "strategy_remaining_cash": float(strategy_remaining_cash),
+        "lot_size": int(max(1, lot_size)),
+        "candidates": compact_rows,
+    }
+    return (
+        "You are a VN equities short-term trading decision engine.\n"
+        "Return only valid JSON with this exact schema:\n"
+        "{\n"
+        '  "items": [\n'
+        "    {\n"
+        '      "signal_id": "string",\n'
+        '      "symbol": "string",\n'
+        '      "quantity": 0,\n'
+        '      "entry_price": 0,\n'
+        '      "take_profit_price": 0,\n'
+        '      "stoploss_price": 0,\n'
+        '      "reason": "string"\n'
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        "Hard constraints:\n"
+        "- Total notional (sum(quantity * entry_price)) must be <= strategy_remaining_cash.\n"
+        "- quantity must be multiple of lot_size and >= 0.\n"
+        "- stoploss_price < entry_price <= take_profit_price.\n"
+        "- Select only symbols from candidates.\n"
+        "- Prefer higher quality setups and avoid over-concentration.\n"
+        f"Input: {json.dumps(payload, ensure_ascii=True)}"
+    )
+
+
+def _apply_claude_buy_decision(
+    *,
+    buy_rows: list[dict[str, Any]],
+    strategy_remaining_cash: float,
+    lot_size: int = 100,
+) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, Any]]:
+    if not buy_rows:
+        return [], {}, {"source": "none", "selected": 0}
+
+    safe_lot = max(1, int(lot_size))
+    fallback_qty = _allocate_quantities_by_score(buy_rows, float(strategy_remaining_cash), lot_size=safe_lot)
+    fallback_rows = [dict(row) for row in buy_rows]
+    prompt = _build_claude_buy_decision_prompt(
+        buy_rows=buy_rows,
+        strategy_remaining_cash=float(strategy_remaining_cash),
+        lot_size=safe_lot,
+    )
+    try:
+        raw = _automation_claude_service.generate_text_with_resilience(
+            prompt=prompt,
+            system_prompt="Return strict JSON only. No markdown or prose.",
+            model=settings.claude_model,
+            max_tokens=1200,
+            temperature=0.1,
+            cache_namespace="short-term-buy-decision",
+            cache_ttl_seconds=120,
+        )
+        parsed = _extract_json_object(raw)
+        if not isinstance(parsed, dict):
+            raise ValueError("claude_buy_decision_invalid_json")
+        raw_items = parsed.get("items")
+        if not isinstance(raw_items, list):
+            raise ValueError("claude_buy_decision_items_missing")
+
+        row_by_signal_id: dict[str, dict[str, Any]] = {
+            str(row.get("id") or "").strip(): dict(row)
+            for row in buy_rows
+            if str(row.get("id") or "").strip()
+        }
+        planned_qty_by_signal_id: dict[str, int] = {}
+        selected_rows: list[dict[str, Any]] = []
+        spent = 0.0
+
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            signal_id = str(item.get("signal_id") or "").strip()
+            symbol = str(item.get("symbol") or "").strip().upper()
+            base_row = row_by_signal_id.get(signal_id)
+            if base_row is None:
+                continue
+            if symbol and symbol != str(base_row.get("symbol") or "").strip().upper():
+                continue
+            try:
+                qty = int(item.get("quantity") or 0)
+                entry = float(item.get("entry_price") or base_row.get("entry_price") or 0.0)
+                tp = float(item.get("take_profit_price") or base_row.get("take_profit_price") or 0.0)
+                sl = float(item.get("stoploss_price") or base_row.get("stoploss_price") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if entry <= 0 or sl <= 0 or sl >= entry or tp < entry:
+                continue
+            qty = max(0, (qty // safe_lot) * safe_lot)
+            if qty <= 0:
+                continue
+            next_spent = spent + float(qty) * entry
+            if next_spent > float(strategy_remaining_cash):
+                continue
+            spent = next_spent
+            row = dict(base_row)
+            row["entry_price"] = entry
+            row["take_profit_price"] = tp
+            row["stoploss_price"] = sl
+            row["claude_decision_reason"] = str(item.get("reason") or "").strip()
+            selected_rows.append(row)
+            planned_qty_by_signal_id[signal_id] = qty
+
+        if selected_rows:
+            return selected_rows, planned_qty_by_signal_id, {
+                "source": "claude",
+                "selected": len(selected_rows),
+                "spent": round(spent, 2),
+                "strategy_remaining_cash": float(strategy_remaining_cash),
+            }
+    except Exception as exc:
+        logger.warning("short_term_claude_buy_decision_failed", extra={"error": str(exc)})
+
+    return fallback_rows, fallback_qty, {
+        "source": "score_weighted_fallback",
+        "selected": len(fallback_rows),
+        "strategy_remaining_cash": float(strategy_remaining_cash),
+    }
+
+
 def _resolve_sell_trigger(*, last_price: float, take_profit: float, stoploss: float) -> str | None:
     if last_price <= 0 or take_profit <= 0 or stoploss <= 0:
         return None
@@ -734,7 +878,7 @@ def _utc_now() -> datetime:
     return datetime.now(tz=timezone.utc)
 
 
-def _count_new_orders_today(account_mode: str) -> int:
+def _count_short_term_new_orders_today(account_mode: str) -> int:
     ensure_trading_core_tables()
     tz = settings.short_term_scan_timezone
     with connect(settings.database_url) as conn:
@@ -744,6 +888,8 @@ def _count_new_orders_today(account_mode: str) -> int:
                 SELECT COUNT(*)::int AS c
                 FROM orders_core
                 WHERE account_mode = %(mode)s
+                  AND side = 'BUY'
+                  AND COALESCE(order_metadata->>'source', '') = 'short_term_schedule_entry'
                   AND (created_at AT TIME ZONE %(tz)s)::date
                       = (NOW() AT TIME ZONE %(tz)s)::date
                 """,
@@ -1184,9 +1330,6 @@ def run_short_term_production_cycle(
 
             signals: list[dict[str, Any]] = list(batch.get("signals") or [])
             scanned = int(batch.get("scanned") or 0)
-            buy_rows_all = [s for s in signals if str(s.get("action", "")).upper() == "BUY"]
-            planned_qty_by_signal_id = _allocate_quantities_by_score(buy_rows_all, float(nav), lot_size=100)
-
             risk_rejected = 0
             executed = 0
             execution_rejected = 0
@@ -1197,14 +1340,21 @@ def run_short_term_production_cycle(
                 int(settings.automation_short_term_buy_step_timeout_seconds),
             )
 
-            daily_new_orders = _count_new_orders_today(account_mode)
+            daily_new_orders = _count_short_term_new_orders_today(account_mode)
             sell_candidates = _build_sell_candidates_from_positions(account_mode)
+            buy_rows_all = [s for s in signals if str(s.get("action", "")).upper() == "BUY"]
             sell_trigger_symbols = {str(row.get("symbol") or "").strip().upper() for row in sell_candidates}
             buy_rows_filtered = [
                 row for row in buy_rows_all if str(row.get("symbol") or "").strip().upper() not in sell_trigger_symbols
             ]
+            strategy_remaining_cash = max(0.0, float(nav))
+            buy_rows_decided, planned_qty_by_signal_id, decision_meta = _apply_claude_buy_decision(
+                buy_rows=buy_rows_filtered,
+                strategy_remaining_cash=strategy_remaining_cash,
+                lot_size=100,
+            )
             buy_rows: list[dict[str, Any]] = []
-            for row in buy_rows_filtered:
+            for row in buy_rows_decided:
                 sid = str(row.get("id") or "")
                 symbol = str(row.get("symbol") or "").strip().upper()
                 entry_price = float(row.get("entry_price") or 0.0)
@@ -1324,8 +1474,9 @@ def run_short_term_production_cycle(
                 "skipped_insufficient_data": int(batch.get("skipped_insufficient_data") or 0),
                 "scan_mode": str(batch.get("scan_mode") or "full"),
                 "executions": executions_detail,
-                "allocation_method": "score_weighted_nav_lot100",
+                "allocation_method": "claude_decision_with_score_fallback",
                 "allocation_nav_total": float(nav),
+                "buy_decision_meta": decision_meta,
                 "sell_candidates": len(sell_candidates),
             }
             for obs_key in (

@@ -223,8 +223,14 @@ def evaluate_risk(payload: dict[str, Any]) -> dict[str, Any]:
     entry = float(payload["entry_price"])
     nav = float(payload["nav"])
     risk_per_trade = float(payload["risk_per_trade"])
-    _ = int(payload["daily_new_orders"])
-    _ = int(payload["max_daily_new_orders"])
+    daily_new_orders = int(payload["daily_new_orders"])
+    max_daily_new_orders = int(payload["max_daily_new_orders"])
+    if max_daily_new_orders > 0 and daily_new_orders >= max_daily_new_orders:
+        return {
+            "pass": False,
+            "reason": "max_daily_new_orders_reached",
+            "suggested_size": 0,
+        }
     distance = abs(entry - stoploss)
     if distance <= 0:
         return {"pass": False, "reason": "invalid_stoploss_distance", "suggested_size": 0}

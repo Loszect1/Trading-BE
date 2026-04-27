@@ -864,6 +864,173 @@ def _is_short_term_volume_spike(spike_ratio: float) -> bool:
     return bool(spike_ratio >= float(settings.short_term_scan_min_volume_spike_ratio))
 
 
+def _short_term_entry_gate(
+    *,
+    closes: list[float],
+    volumes: list[float],
+    spike: float,
+    last_close: float,
+    ema20_proxy: float,
+    min_spike_ratio: float | None = None,
+    min_momentum_5d_pct: float = 1.0,
+    max_distance_from_ema20_pct: float = 8.0,
+) -> tuple[bool, dict[str, Any]]:
+    """
+    Production-safe BUY gate to reduce false positives:
+    - trend + liquidity/spike already filtered upstream
+    - add breakout confirmation, momentum confirmation, and avoid overly stretched entries.
+    """
+    if len(closes) < 25 or len(volumes) < 25 or ema20_proxy <= 0 or last_close <= 0:
+        return False, {"reason": "insufficient_bars_or_invalid_price"}
+
+    min_spike = float(min_spike_ratio) if min_spike_ratio is not None else float(settings.short_term_scan_min_volume_spike_ratio)
+    breakout_lookback = 20
+    prev_window = closes[-(breakout_lookback + 1) : -1]
+    prev_high = max(prev_window) if prev_window else last_close
+    breakout_ok = bool(last_close >= prev_high * 0.995)
+
+    momentum_5d = 0.0
+    if len(closes) >= 6 and closes[-6] > 0:
+        momentum_5d = ((last_close / closes[-6]) - 1.0) * 100.0
+    momentum_ok = bool(momentum_5d >= float(min_momentum_5d_pct))
+
+    distance_pct = ((last_close / ema20_proxy) - 1.0) * 100.0 if ema20_proxy > 0 else 0.0
+    not_overstretched = bool(distance_pct <= float(max_distance_from_ema20_pct))
+
+    pass_gate = bool(
+        spike >= min_spike
+        and last_close > ema20_proxy
+        and breakout_ok
+        and momentum_ok
+        and not_overstretched
+    )
+    return pass_gate, {
+        "min_spike_ratio": round(min_spike, 4),
+        "spike_ratio": round(float(spike), 4),
+        "prev_20d_high": round(float(prev_high), 4),
+        "breakout_ok": breakout_ok,
+        "momentum_5d_pct": round(float(momentum_5d), 4),
+        "min_momentum_5d_pct": round(float(min_momentum_5d_pct), 4),
+        "momentum_ok": momentum_ok,
+        "distance_from_ema20_pct": round(float(distance_pct), 4),
+        "max_distance_from_ema20_pct": round(float(max_distance_from_ema20_pct), 4),
+        "not_overstretched": not_overstretched,
+    }
+
+
+def _entry_gate_thresholds_from_experience(exp_meta: dict[str, Any] | None) -> dict[str, Any]:
+    """
+    Tighten entry gate when recent experience indicates frequent losses/stoploss.
+    """
+    base_spike = float(settings.short_term_scan_min_volume_spike_ratio)
+    thresholds = {
+        "experience_tightening_level": "normal",
+        "min_spike_ratio": base_spike,
+        "min_momentum_5d_pct": 1.0,
+        "max_distance_from_ema20_pct": 8.0,
+    }
+    if not isinstance(exp_meta, dict) or not bool(exp_meta.get("applied")):
+        return thresholds
+    stoploss_ratio = float(exp_meta.get("stoploss_ratio") or 0.0)
+    win_ratio = float(exp_meta.get("win_ratio") or 0.0)
+    avg_loss_pct = float(exp_meta.get("avg_loss_percent_abs") or 0.0)
+    if stoploss_ratio >= 0.7 or avg_loss_pct >= 2.5:
+        thresholds.update(
+            {
+                "experience_tightening_level": "strict",
+                "min_spike_ratio": max(base_spike, 2.2),
+                "min_momentum_5d_pct": 1.8,
+                "max_distance_from_ema20_pct": 5.0,
+            }
+        )
+    elif stoploss_ratio >= 0.5 or (win_ratio < 0.35 and stoploss_ratio >= 0.35):
+        thresholds.update(
+            {
+                "experience_tightening_level": "tight",
+                "min_spike_ratio": max(base_spike, 1.9),
+                "min_momentum_5d_pct": 1.3,
+                "max_distance_from_ema20_pct": 6.5,
+            }
+        )
+    return thresholds
+
+
+def _experience_buy_cooldown(symbol: str, action: str) -> tuple[bool, dict[str, Any]]:
+    """
+    Block re-entry for symbols that recently hit stoploss in experience records.
+    """
+    normalized_action = str(action or "").upper()
+    if normalized_action != "BUY":
+        return False, {"applied": False, "reason": "non_buy_action"}
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return False, {"applied": False, "reason": "missing_symbol"}
+    cooldown_days = 3
+    try:
+        with connect(settings.database_url, row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT created_at, pnl_percent, mistake_tags
+                    FROM experience
+                    WHERE symbol = %(symbol)s
+                      AND strategy_type = 'SHORT_TERM'
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    {"symbol": sym},
+                )
+                row = cur.fetchone()
+    except Exception:
+        return False, {"applied": False, "reason": "experience_query_failed", "cooldown_days": cooldown_days}
+    if not row:
+        return False, {"applied": False, "reason": "no_samples", "cooldown_days": cooldown_days}
+
+    created_at = row.get("created_at")
+    pnl_percent = float(row.get("pnl_percent") or 0.0)
+    tags = row.get("mistake_tags") or []
+    tags_norm = {str(t).strip().lower() for t in tags} if isinstance(tags, list) else set()
+    stoploss_like = bool("stoploss_hit" in tags_norm or pnl_percent <= -1.0)
+    if not stoploss_like:
+        return False, {"applied": True, "reason": "latest_trade_not_stoploss", "cooldown_days": cooldown_days}
+    if not isinstance(created_at, datetime):
+        return False, {"applied": True, "reason": "missing_created_at", "cooldown_days": cooldown_days}
+
+    age = datetime.now(tz=timezone.utc) - created_at
+    active = age < timedelta(days=cooldown_days)
+    return active, {
+        "applied": True,
+        "cooldown_days": cooldown_days,
+        "latest_experience_at": created_at.isoformat(),
+        "latest_pnl_percent": round(pnl_percent, 4),
+        "latest_stoploss_like": stoploss_like,
+        "cooldown_active": active,
+        "age_hours": round(max(0.0, age.total_seconds() / 3600.0), 4),
+    }
+
+
+def _dynamic_short_term_buy_composite_floor(*, benchmark_closes: list[float] | None) -> float:
+    """
+    Dynamic BUY gate for short-term composite score.
+    - Risk-on regime (VNINDEX above EMA20): lower floor.
+    - Risk-off regime (VNINDEX below EMA20): raise floor.
+    """
+    floor = 58.0
+    closes = [float(v) for v in (benchmark_closes or []) if float(v) > 0]
+    if len(closes) < 20:
+        return floor
+    last_close = float(closes[-1])
+    ema20_proxy = mean(closes[-20:])
+    if ema20_proxy <= 0:
+        return floor
+    trend_ratio = (last_close / ema20_proxy) - 1.0
+    if trend_ratio >= 0.01:
+        return 55.0
+    if trend_ratio <= -0.01:
+        return 62.0
+    return floor
+
+
 def _liquidity_cache_key(symbol: str, exchange: str) -> str:
     return f"scan:liquidity:{exchange}:{symbol}"
 
@@ -1029,11 +1196,15 @@ def _experience_confidence_adjustment(symbol: str, action: str) -> tuple[float, 
         return 0.0, {"applied": False, "reason": "no_samples"}
     stoploss_hits = 0
     wins = 0
+    losses = 0
+    loss_abs_sum = 0.0
     for row in samples:
         pnl = float(row.get("pnl_percent") or 0.0)
         tags = row.get("mistake_tags") or []
         tags_norm = {str(t).strip().lower() for t in tags} if isinstance(tags, list) else set()
         if pnl < 0:
+            losses += 1
+            loss_abs_sum += abs(pnl)
             if "stoploss_hit" in tags_norm or pnl <= -1.0:
                 stoploss_hits += 1
         elif pnl > 0:
@@ -1041,6 +1212,7 @@ def _experience_confidence_adjustment(symbol: str, action: str) -> tuple[float, 
     n = len(samples)
     stoploss_ratio = float(stoploss_hits) / float(n)
     win_ratio = float(wins) / float(n)
+    avg_loss_percent_abs = (loss_abs_sum / float(losses)) if losses > 0 else 0.0
     adjustment = 0.0
     if stoploss_ratio >= 0.5:
         adjustment -= min(12.0, 4.0 + stoploss_ratio * 12.0)
@@ -1052,8 +1224,10 @@ def _experience_confidence_adjustment(symbol: str, action: str) -> tuple[float, 
         "samples": n,
         "stoploss_hits": stoploss_hits,
         "wins": wins,
+        "losses": losses,
         "stoploss_ratio": round(stoploss_ratio, 4),
         "win_ratio": round(win_ratio, 4),
+        "avg_loss_percent_abs": round(avg_loss_percent_abs, 4),
         "confidence_adjustment": adjustment,
     }
 
@@ -1068,6 +1242,9 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
     skipped_insufficient_data = 0
     skipped_low_liquidity = 0
     skipped_no_volume_spike = 0
+    skipped_entry_gate = 0
+    skipped_experience_cooldown = 0
+    skipped_dynamic_buy_floor = 0
     scan_started_at = time.perf_counter()
     step_stats: dict[str, dict[str, float | int]] = {}
 
@@ -1084,6 +1261,7 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
         90,
     )
     _track_step("fetch_symbol_daily_closes_benchmark", bench_t0)
+    dynamic_buy_floor = _dynamic_short_term_buy_composite_floor(benchmark_closes=bench_closes)
 
     normalized_scope = _normalize_exchange_scope(exchange_scope)
     universe_t0 = time.perf_counter()
@@ -1137,13 +1315,35 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
             skipped_no_volume_spike += 1
             continue
 
+        exp_adj = 0.0
+        exp_meta: dict[str, Any] = {"applied": False, "reason": "not_computed"}
+        try:
+            exp_adj, exp_meta = _experience_confidence_adjustment(symbol=symbol, action="BUY")
+        except Exception:
+            pass
+        gate_thresholds = _entry_gate_thresholds_from_experience(exp_meta)
         action = "HOLD"
         confidence = 45.0
         reason = "Short-term conditions not strong enough."
-        if spike >= float(settings.short_term_scan_min_volume_spike_ratio) and last_close > ema20_proxy:
+        gate_pass, gate_meta = _short_term_entry_gate(
+            closes=closes,
+            volumes=volumes,
+            spike=spike,
+            last_close=last_close,
+            ema20_proxy=ema20_proxy,
+            min_spike_ratio=float(gate_thresholds["min_spike_ratio"]),
+            min_momentum_5d_pct=float(gate_thresholds["min_momentum_5d_pct"]),
+            max_distance_from_ema20_pct=float(gate_thresholds["max_distance_from_ema20_pct"]),
+        )
+        if gate_pass:
             action = "BUY"
             confidence = min(85.0, 55.0 + spike * 10.0)
-            reason = f"Volume spike {spike:.2f}x with price above EMA20 proxy."
+            reason = (
+                f"Entry gate passed: spike {spike:.2f}x, breakout and momentum confirmed "
+                "with price above EMA20 proxy."
+            )
+        else:
+            skipped_entry_gate += 1
 
         technical = score_short_term_technical(
             spike=spike,
@@ -1177,8 +1377,23 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
             weights=None,
             legacy_flat={"volume_spike_ratio": round(spike, 4)},
         )
+        metadata["entry_gate"] = gate_meta
+        metadata["experience_entry_tightening"] = gate_thresholds
+        cooldown_active, cooldown_meta = _experience_buy_cooldown(symbol=symbol, action=action)
+        metadata["experience_buy_cooldown"] = cooldown_meta
+        if action == "BUY" and cooldown_active:
+            action = "HOLD"
+            reason = "Recent stoploss cooldown active for symbol; downgraded to HOLD."
+            skipped_experience_cooldown += 1
         _track_step("build_signal_quality_metadata", meta_t0)
         composite = float(metadata["signal_quality"]["composite_score_0_100"])
+        if action == "BUY" and composite < dynamic_buy_floor:
+            action = "HOLD"
+            reason = (
+                f"Composite {composite:.1f} below dynamic BUY floor {dynamic_buy_floor:.1f}; "
+                "downgraded to HOLD."
+            )
+            skipped_dynamic_buy_floor += 1
         confidence = confidence_from_composite_and_action(
             action=action,
             base_confidence_from_rules=confidence,
@@ -1198,27 +1413,24 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
                 confidence = max(0.0, min(95.0, confidence + float(ai_scoring.get("confidence_adjustment") or 0.0)))
         except Exception:
             pass
-        try:
-            exp_adj, exp_meta = _experience_confidence_adjustment(symbol=symbol, action=action)
-            metadata["experience_scoring_adjustment"] = exp_meta
-            confidence = max(0.0, min(95.0, confidence + float(exp_adj)))
-        except Exception:
-            pass
+        metadata["experience_scoring_adjustment"] = exp_meta
+        confidence = max(0.0, min(95.0, confidence + float(exp_adj)))
 
         insert_t0 = time.perf_counter()
-        signal = _insert_signal(
-            "SHORT_TERM",
-            symbol,
-            action,
-            last_close if action == "BUY" else None,
-            (last_close * 1.04) if action == "BUY" else None,
-            (last_close * 0.97) if action == "BUY" else None,
-            confidence,
-            reason,
-            metadata,
-        )
-        _track_step("_insert_signal", insert_t0)
-        signals.append(signal)
+        if action in {"BUY", "SELL"}:
+            signal = _insert_signal(
+                "SHORT_TERM",
+                symbol,
+                action,
+                last_close if action == "BUY" else None,
+                (last_close * 1.04) if action == "BUY" else None,
+                (last_close * 0.97) if action == "BUY" else None,
+                confidence,
+                reason,
+                metadata,
+            )
+            _track_step("_insert_signal", insert_t0)
+            signals.append(signal)
     total_scan_seconds = time.perf_counter() - scan_started_at
     step_rows = sorted(
         (
@@ -1243,6 +1455,10 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
             "skipped_insufficient_data": skipped_insufficient_data,
             "skipped_low_liquidity": skipped_low_liquidity,
             "skipped_no_volume_spike": skipped_no_volume_spike,
+            "skipped_entry_gate": skipped_entry_gate,
+            "skipped_experience_cooldown": skipped_experience_cooldown,
+            "skipped_dynamic_buy_floor": skipped_dynamic_buy_floor,
+            "dynamic_buy_composite_floor": dynamic_buy_floor,
             "steps": step_rows,
         },
     )
@@ -1252,6 +1468,10 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
         "skipped_insufficient_data": skipped_insufficient_data,
         "skipped_low_liquidity": skipped_low_liquidity,
         "skipped_no_volume_spike": skipped_no_volume_spike,
+        "skipped_entry_gate": skipped_entry_gate,
+        "skipped_experience_cooldown": skipped_experience_cooldown,
+        "skipped_dynamic_buy_floor": skipped_dynamic_buy_floor,
+        "dynamic_buy_composite_floor": dynamic_buy_floor,
         "exchange_scope": normalized_scope,
     }
 
@@ -1269,6 +1489,9 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
     skipped_insufficient_data = 0
     skipped_low_liquidity = 0
     skipped_no_volume_spike = 0
+    skipped_entry_gate = 0
+    skipped_experience_cooldown = 0
+    skipped_dynamic_buy_floor = 0
     scan_started_at = time.perf_counter()
     step_stats: dict[str, dict[str, float | int]] = {}
 
@@ -1293,6 +1516,15 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
         per_exchange = None
         listing_per_exchange_cap = per_exchange
         listing_target_symbols = max_symbols
+
+    bench_t0 = time.perf_counter()
+    bench_closes = fetch_symbol_daily_closes(
+        vnstock_api_service.call_quote,
+        "VNINDEX",
+        90,
+    )
+    _track_step("fetch_symbol_daily_closes_benchmark", bench_t0)
+    dynamic_buy_floor = _dynamic_short_term_buy_composite_floor(benchmark_closes=bench_closes)
 
     if not symbol_batch:
         raise RuntimeError(
@@ -1343,13 +1575,35 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
             skipped_no_volume_spike += 1
             continue
 
+        exp_adj = 0.0
+        exp_meta: dict[str, Any] = {"applied": False, "reason": "not_computed"}
+        try:
+            exp_adj, exp_meta = _experience_confidence_adjustment(symbol=symbol, action="BUY")
+        except Exception:
+            pass
+        gate_thresholds = _entry_gate_thresholds_from_experience(exp_meta)
         action = "HOLD"
         confidence = 45.0
         reason = "Short-term conditions not strong enough."
-        if spike >= float(settings.short_term_scan_min_volume_spike_ratio) and last_close > ema20_proxy:
+        gate_pass, gate_meta = _short_term_entry_gate(
+            closes=closes,
+            volumes=volumes,
+            spike=spike,
+            last_close=last_close,
+            ema20_proxy=ema20_proxy,
+            min_spike_ratio=float(gate_thresholds["min_spike_ratio"]),
+            min_momentum_5d_pct=float(gate_thresholds["min_momentum_5d_pct"]),
+            max_distance_from_ema20_pct=float(gate_thresholds["max_distance_from_ema20_pct"]),
+        )
+        if gate_pass:
             action = "BUY"
             confidence = min(82.0, 55.0 + spike * 9.0)
-            reason = f"Volume spike {spike:.2f}x with price above EMA20 proxy."
+            reason = (
+                f"Entry gate passed: spike {spike:.2f}x, breakout and momentum confirmed "
+                "with price above EMA20 proxy."
+            )
+        else:
+            skipped_entry_gate += 1
 
         technical = score_short_term_technical(
             spike=spike,
@@ -1376,34 +1630,46 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
             weights=None,
             legacy_flat={"volume_spike_ratio": round(spike, 4), "scan_mode": "fallback_light"},
         )
+        metadata["entry_gate"] = gate_meta
+        metadata["experience_entry_tightening"] = gate_thresholds
+        cooldown_active, cooldown_meta = _experience_buy_cooldown(symbol=symbol, action=action)
+        metadata["experience_buy_cooldown"] = cooldown_meta
+        if action == "BUY" and cooldown_active:
+            action = "HOLD"
+            reason = "Recent stoploss cooldown active for symbol; downgraded to HOLD."
+            skipped_experience_cooldown += 1
         composite = float(metadata["signal_quality"]["composite_score_0_100"])
+        if action == "BUY" and composite < dynamic_buy_floor:
+            action = "HOLD"
+            reason = (
+                f"Composite {composite:.1f} below dynamic BUY floor {dynamic_buy_floor:.1f}; "
+                "downgraded to HOLD."
+            )
+            skipped_dynamic_buy_floor += 1
         confidence = confidence_from_composite_and_action(
             action=action,
             base_confidence_from_rules=confidence,
             composite=composite,
             blend=0.45,
         )
-        try:
-            exp_adj, exp_meta = _experience_confidence_adjustment(symbol=symbol, action=action)
-            metadata["experience_scoring_adjustment"] = exp_meta
-            confidence = max(0.0, min(95.0, confidence + float(exp_adj)))
-        except Exception:
-            pass
+        metadata["experience_scoring_adjustment"] = exp_meta
+        confidence = max(0.0, min(95.0, confidence + float(exp_adj)))
 
         insert_t0 = time.perf_counter()
-        signal = _insert_signal(
-            "SHORT_TERM",
-            symbol,
-            action,
-            last_close if action == "BUY" else None,
-            (last_close * 1.04) if action == "BUY" else None,
-            (last_close * 0.97) if action == "BUY" else None,
-            confidence,
-            reason,
-            metadata,
-        )
-        _track_step("_insert_signal", insert_t0)
-        signals.append(signal)
+        if action in {"BUY", "SELL"}:
+            signal = _insert_signal(
+                "SHORT_TERM",
+                symbol,
+                action,
+                last_close if action == "BUY" else None,
+                (last_close * 1.04) if action == "BUY" else None,
+                (last_close * 0.97) if action == "BUY" else None,
+                confidence,
+                reason,
+                metadata,
+            )
+            _track_step("_insert_signal", insert_t0)
+            signals.append(signal)
     total_scan_seconds = time.perf_counter() - scan_started_at
     step_rows = sorted(
         (
@@ -1428,6 +1694,10 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
             "skipped_insufficient_data": skipped_insufficient_data,
             "skipped_low_liquidity": skipped_low_liquidity,
             "skipped_no_volume_spike": skipped_no_volume_spike,
+            "skipped_entry_gate": skipped_entry_gate,
+            "skipped_experience_cooldown": skipped_experience_cooldown,
+            "skipped_dynamic_buy_floor": skipped_dynamic_buy_floor,
+            "dynamic_buy_composite_floor": dynamic_buy_floor,
             "steps": step_rows,
         },
     )
@@ -1437,6 +1707,10 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
         "skipped_insufficient_data": skipped_insufficient_data,
         "skipped_low_liquidity": skipped_low_liquidity,
         "skipped_no_volume_spike": skipped_no_volume_spike,
+        "skipped_entry_gate": skipped_entry_gate,
+        "skipped_experience_cooldown": skipped_experience_cooldown,
+        "skipped_dynamic_buy_floor": skipped_dynamic_buy_floor,
+        "dynamic_buy_composite_floor": dynamic_buy_floor,
         "scan_mode": "fallback_light",
         "exchange_scope": normalized_scope,
         "listing_target_symbols": listing_target_symbols if listing_target_symbols is not None else scanned,
