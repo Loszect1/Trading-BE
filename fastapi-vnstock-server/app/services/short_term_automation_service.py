@@ -34,7 +34,8 @@ logger = logging.getLogger(__name__)
 
 # Distinct advisory lock keys (two-argument form); avoid collision with other features.
 _ADVISORY_LOCK_SPACE = 582_901
-_ADVISORY_LOCK_KEY = 771_002
+_ADVISORY_LOCK_KEY_REAL = 771_002
+_ADVISORY_LOCK_KEY_DEMO = 771_003
 _ASYNC_RUNS_LOCK = threading.Lock()
 _ASYNC_RUNS: dict[str, dict[str, Any]] = {}
 _automation_claude_service = ClaudeService()
@@ -43,6 +44,13 @@ _automation_claude_service = ClaudeService()
 def _is_scanner_universe_empty_error(exc: Exception) -> bool:
     message = str(exc or "")
     return "scanner_universe_empty" in message
+
+
+def _resolve_advisory_lock_key(account_mode: str) -> int:
+    mode = str(account_mode or "").strip().upper()
+    if mode == "DEMO":
+        return _ADVISORY_LOCK_KEY_DEMO
+    return _ADVISORY_LOCK_KEY_REAL
 
 
 def _extract_json_object(raw_text: str) -> dict[str, Any] | None:
@@ -1074,10 +1082,11 @@ def run_short_term_production_cycle(
     When `enforce_vn_scan_schedule` is True, skips unless the current instant lies on the
     configured interval grid within VN regular sessions (weekdays; configured market holidays excluded).
     """
+    normalized_account_mode = str(account_mode or "").strip().upper()
     started_at = _utc_now()
     run_id = uuid4()
     base_detail: dict[str, Any] = {
-        "account_mode": account_mode,
+        "account_mode": normalized_account_mode,
         "limit_symbols": limit_symbols,
         "exchange_scope": str(exchange_scope).upper(),
         "enforce_vn_scan_schedule": enforce_vn_scan_schedule,
@@ -1090,13 +1099,14 @@ def run_short_term_production_cycle(
         base_detail["scheduler_sequence_total"] = int(scheduler_sequence_total)
     if manual_trigger_id:
         base_detail["manual_trigger_id"] = str(manual_trigger_id)
-    if str(account_mode).upper() == "DEMO" and demo_session_id:
+    if normalized_account_mode == "DEMO" and demo_session_id:
         base_detail["demo_session_id"] = str(demo_session_id).strip()
+    advisory_lock_key = _resolve_advisory_lock_key(normalized_account_mode)
     logger.warning(
         "short_term_cycle_started",
         extra={
             "run_id": str(run_id),
-            "account_mode": account_mode,
+            "account_mode": normalized_account_mode,
             "limit_symbols": limit_symbols,
             "exchange_scope": str(exchange_scope).upper(),
             "risk_per_trade": risk_per_trade,
@@ -1110,7 +1120,7 @@ def run_short_term_production_cycle(
         with lock_conn.cursor() as cur:
             cur.execute(
                 "SELECT pg_try_advisory_lock(%(k1)s, %(k2)s) AS locked",
-                {"k1": _ADVISORY_LOCK_SPACE, "k2": _ADVISORY_LOCK_KEY},
+                {"k1": _ADVISORY_LOCK_SPACE, "k2": advisory_lock_key},
             )
             locked_row = cur.fetchone()
         # Advisory lock is session-scoped, so we can commit immediately to avoid
@@ -1616,7 +1626,7 @@ def run_short_term_production_cycle(
             with lock_conn.cursor() as cur:
                 cur.execute(
                     "SELECT pg_advisory_unlock(%(k1)s, %(k2)s) AS unlocked",
-                    {"k1": _ADVISORY_LOCK_SPACE, "k2": _ADVISORY_LOCK_KEY},
+                            {"k1": _ADVISORY_LOCK_SPACE, "k2": advisory_lock_key},
                 )
             lock_conn.commit()
     finally:

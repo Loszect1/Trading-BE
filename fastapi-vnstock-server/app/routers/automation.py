@@ -10,6 +10,9 @@ from psycopg.rows import dict_row
 
 from app.core.config import settings
 from app.schemas.automation import (
+    MailSignalEntryRunOnceRequest,
+    RealRecommendationBuyRequest,
+    RealRecommendationScanRequest,
     SchedulerDemoSessionRequest,
     SchedulerStateRow,
     SchedulerStatusResponse,
@@ -21,6 +24,8 @@ from app.schemas.automation import (
     TechnicalCycleRunRequest,
     TechnicalCycleRunResponse,
 )
+from app.services.signal_engine_service import run_short_term_scan_batch
+from app.services.trading_core_service import evaluate_risk, place_order
 from app.services.automation_scheduler_service import (
     get_active_scheduler_demo_session_id,
     get_automation_scheduler_status,
@@ -44,11 +49,45 @@ from app.services.redis_cache import RedisCacheService
 from app.services.mail_signal_scheduler_service import (
     get_latest_mail_signals,
     get_latest_mail_signal_entry_run,
+    get_recent_mail_signal_entry_runs,
     get_today_mail_signals,
+    run_prev_day_entry_auto_trading_once,
 )
 
 logger = logging.getLogger(__name__)
 _redis_cache = RedisCacheService()
+_REAL_RECOMMENDATIONS_REDIS_KEY = "signals:real:short-term:recommendations:latest"
+_REAL_RECOMMENDATIONS_TTL_SECONDS = 86_400
+
+
+def _to_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _normalize_real_recommendation_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        entry = _to_float(row.get("entry"))
+        take_profit = _to_float(row.get("take_profit"))
+        stop_loss = _to_float(row.get("stop_loss"))
+        confidence = _to_float(row.get("confidence"))
+        if not symbol or entry is None or take_profit is None or stop_loss is None:
+            continue
+        out.append(
+            {
+                "symbol": symbol,
+                "entry": entry,
+                "take_profit": take_profit,
+                "stop_loss": stop_loss,
+                "confidence": max(0.0, min(100.0, confidence if confidence is not None else 50.0)),
+                "reason": str(row.get("reason") or "").strip(),
+            }
+        )
+    return out
 
 router = APIRouter(prefix="/automation", tags=["automation"])
 
@@ -61,6 +100,12 @@ def post_short_term_run_cycle(body: ShortTermCycleRunRequest = ShortTermCycleRun
     """
     payload = body
     try:
+        effective_nav = float(payload.nav)
+        if payload.account_mode == "REAL" and payload.real_account_available_cash_vnd is not None:
+            effective_nav = max(
+                1_000_000.0,
+                float(payload.real_account_available_cash_vnd) * float(settings.strategy_alloc_short_term_pct),
+            )
         normalized_scope = str(payload.exchange_scope).upper()
         should_queue_async = bool(payload.async_for_heavy) and normalized_scope == "ALL" and int(payload.limit_symbols) <= 0
         if should_queue_async:
@@ -68,7 +113,7 @@ def post_short_term_run_cycle(body: ShortTermCycleRunRequest = ShortTermCycleRun
                 limit_symbols=payload.limit_symbols,
                 exchange_scope=payload.exchange_scope,
                 account_mode=payload.account_mode,
-                nav=payload.nav,
+                nav=effective_nav,
                 risk_per_trade=payload.risk_per_trade,
                 max_daily_new_orders=payload.max_daily_new_orders,
                 enforce_vn_scan_schedule=payload.enforce_vn_scan_schedule,
@@ -79,7 +124,7 @@ def post_short_term_run_cycle(body: ShortTermCycleRunRequest = ShortTermCycleRun
             limit_symbols=payload.limit_symbols,
             exchange_scope=payload.exchange_scope,
             account_mode=payload.account_mode,
-            nav=payload.nav,
+            nav=effective_nav,
             risk_per_trade=payload.risk_per_trade,
             max_daily_new_orders=payload.max_daily_new_orders,
             enforce_vn_scan_schedule=payload.enforce_vn_scan_schedule,
@@ -372,3 +417,159 @@ def get_mail_signals_entry_run_latest() -> dict[str, Any]:
     except Exception as exc:
         logger.exception("automation.mail_signals_entry_run_latest_failed")
         raise HTTPException(status_code=500, detail=f"Failed to read latest mail entry run: {exc}") from exc
+
+
+@router.get("/mail-signals/entry-run/recent")
+def get_mail_signals_entry_run_recent(
+    limit: int = Query(default=10, ge=1, le=100),
+    demo_session_id: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """
+    Read recent entry scheduler run logs from Redis (latest first).
+    """
+    try:
+        rows = get_recent_mail_signal_entry_runs(limit=limit, demo_session_id=demo_session_id)
+        return {"success": True, "data": rows, "limit": limit, "demo_session_id": demo_session_id}
+    except Exception as exc:
+        logger.exception("automation.mail_signals_entry_run_recent_failed")
+        raise HTTPException(status_code=500, detail=f"Failed to read recent mail entry runs: {exc}") from exc
+
+
+@router.post("/mail-signals/entry-run-once")
+def post_mail_signals_entry_run_once(body: MailSignalEntryRunOnceRequest = MailSignalEntryRunOnceRequest()) -> dict[str, Any]:
+    """
+    Manually trigger one previous-day mail-signal entry execution run.
+    Used by FE-triggered schedulers (for REAL/DEMO) and ops manual reruns.
+    """
+    try:
+        effective_nav: float | None = None
+        if body.account_mode == "REAL" and body.real_account_available_cash_vnd is not None:
+            effective_nav = max(
+                1_000_000.0,
+                float(body.real_account_available_cash_vnd) * float(settings.strategy_alloc_mail_signal_pct),
+            )
+        raw = run_prev_day_entry_auto_trading_once(
+            account_mode_override=body.account_mode,
+            demo_session_id_override=body.demo_session_id,
+            nav_override=effective_nav,
+        )
+        return {"success": True, "data": raw}
+    except Exception as exc:
+        logger.exception("automation.mail_signals_entry_run_once_failed")
+        raise HTTPException(status_code=500, detail=f"Failed to run mail entry once: {exc}") from exc
+
+
+@router.post("/real/recommendations/scan")
+def post_real_recommendations_scan(body: RealRecommendationScanRequest = RealRecommendationScanRequest()) -> dict[str, Any]:
+    """
+    Run REAL scan in recommendation-only mode (no execution) and cache latest picks in Redis.
+    """
+    try:
+        scan_result = run_short_term_scan_batch(limit_symbols=body.limit_symbols, exchange_scope=body.exchange_scope)
+        raw_signals = scan_result.get("signals") or []
+        recommendations: list[dict[str, Any]] = []
+        for signal in raw_signals:
+            if not isinstance(signal, dict) or str(signal.get("action") or "").upper() != "BUY":
+                continue
+            recommendations.append(
+                {
+                    "symbol": str(signal.get("symbol") or "").strip().upper(),
+                    "entry": signal.get("entry_price"),
+                    "take_profit": signal.get("take_profit_price"),
+                    "stop_loss": signal.get("stoploss_price"),
+                    "confidence": signal.get("confidence"),
+                    "reason": signal.get("reason"),
+                }
+            )
+        recommendations = _normalize_real_recommendation_rows(recommendations)
+        payload = {
+            "generated_at": scan_result.get("scan_finished_at"),
+            "exchange_scope": str(body.exchange_scope).upper(),
+            "limit_symbols": int(body.limit_symbols),
+            "scanned": int(scan_result.get("scanned") or 0),
+            "recommendations": recommendations,
+            "count": len(recommendations),
+        }
+        _redis_cache.set_json(_REAL_RECOMMENDATIONS_REDIS_KEY, payload, ttl_seconds=_REAL_RECOMMENDATIONS_TTL_SECONDS)
+        return {"success": True, "data": payload}
+    except Exception as exc:
+        logger.exception("automation.real_recommendations_scan_failed")
+        raise HTTPException(status_code=500, detail=f"Failed to build real recommendations: {exc}") from exc
+
+
+@router.get("/real/recommendations/latest")
+def get_real_recommendations_latest() -> dict[str, Any]:
+    try:
+        row = _redis_cache.get_json(_REAL_RECOMMENDATIONS_REDIS_KEY) or {}
+        recommendations = _normalize_real_recommendation_rows(
+            cast(list[dict[str, Any]], row.get("recommendations") or [])
+        )
+        data = {
+            "generated_at": row.get("generated_at"),
+            "exchange_scope": row.get("exchange_scope"),
+            "limit_symbols": row.get("limit_symbols"),
+            "scanned": int(row.get("scanned") or 0),
+            "recommendations": recommendations,
+            "count": len(recommendations),
+        }
+        return {"success": True, "data": data}
+    except Exception as exc:
+        logger.exception("automation.real_recommendations_latest_failed")
+        raise HTTPException(status_code=500, detail=f"Failed to read real recommendations: {exc}") from exc
+
+
+@router.post("/real/recommendations/action-buy")
+def post_real_recommendations_action_buy(body: RealRecommendationBuyRequest) -> dict[str, Any]:
+    try:
+        symbol = str(body.symbol).strip().upper()
+        entry = float(body.entry)
+        stop_loss = float(body.stop_loss)
+        available_cash = float(body.available_cash_vnd)
+        risk_result = evaluate_risk(
+            {
+                "account_mode": "REAL",
+                "symbol": symbol,
+                "nav": max(1_000_000.0, available_cash * float(settings.strategy_alloc_short_term_pct)),
+                "risk_per_trade": float(settings.strategy_risk_per_trade),
+                "entry_price": entry,
+                "stoploss_price": stop_loss,
+                "daily_new_orders": 0,
+                "max_daily_new_orders": 10,
+            }
+        )
+        suggested_size = int(risk_result.get("suggested_size") or 0)
+        max_affordable_size = int(available_cash // entry) if entry > 0 else 0
+        raw_quantity = max(0, min(suggested_size, max_affordable_size))
+        quantity = (raw_quantity // 100) * 100
+        if quantity <= 0:
+            return {
+                "success": False,
+                "data": {
+                    "status": "REJECTED",
+                    "reason": "insufficient_size_or_cash_after_risk",
+                    "risk_result": risk_result,
+                    "suggested_size": suggested_size,
+                    "max_affordable_size": max_affordable_size,
+                },
+            }
+        order_row = place_order(
+            {
+                "account_mode": "REAL",
+                "symbol": symbol,
+                "side": "BUY",
+                "quantity": quantity,
+                "price": entry,
+                "auto_process": True,
+                "metadata": {
+                    "source": "real_recommendation_action_buy",
+                    "take_profit": float(body.take_profit),
+                    "stop_loss": stop_loss,
+                    "confidence": float(body.confidence),
+                    "reason": str(body.reason),
+                },
+            }
+        )
+        return {"success": True, "data": {"order": order_row, "risk_result": risk_result, "quantity": quantity}}
+    except Exception as exc:
+        logger.exception("automation.real_recommendations_action_buy_failed")
+        raise HTTPException(status_code=500, detail=f"Failed to action BUY from recommendation: {exc}") from exc

@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 AccountMode = Literal["REAL", "DEMO"]
 _ACCOUNT_MODES: tuple[AccountMode, ...] = ("REAL", "DEMO")
+_BACKEND_SCHEDULER_SUPPORTED_MODES: tuple[AccountMode, ...] = ("DEMO",)
 # Internal scheduler: one grid tick runs three persisted cycles in strict board order.
 _SHORT_TERM_SCHEDULER_EXCHANGE_SCOPES: tuple[str, ...] = ("HOSE", "HNX", "UPCOM")
 _loop_tasks: dict[AccountMode, asyncio.Task | None] = {mode: None for mode in _ACCOUNT_MODES}
@@ -39,6 +40,10 @@ _runtime_enabled: dict[AccountMode, bool] = {
     mode: bool(settings.automation_short_term_scheduler_enabled) for mode in _ACCOUNT_MODES
 }
 _active_demo_session_id: str | None = None
+
+
+def _is_backend_scheduler_supported(account_mode: AccountMode) -> bool:
+    return account_mode in _BACKEND_SCHEDULER_SUPPORTED_MODES
 
 
 def _short_term_allocated_nav() -> float:
@@ -282,7 +287,10 @@ def _load_runtime_enabled_from_db() -> None:
     for row in rows:
         account_mode = str(row.get("account_mode", "")).upper()
         if account_mode in _runtime_enabled:
-            _runtime_enabled[account_mode] = bool(row.get("enabled"))
+            enabled = bool(row.get("enabled"))
+            if not _is_backend_scheduler_supported(account_mode):  # type: ignore[arg-type]
+                enabled = False
+            _runtime_enabled[account_mode] = enabled
 
 
 def _persist_runtime_enabled(account_mode: AccountMode, enabled: bool) -> None:
@@ -576,6 +584,12 @@ async def start_automation_scheduler() -> None:
         logger.warning("short_term_scheduler_demo_context_load_failed", extra={"error": str(exc)})
 
     for mode in _ACCOUNT_MODES:
+        if not _is_backend_scheduler_supported(mode):
+            _runtime_enabled[mode] = False
+            _persist_runtime_enabled(mode, False)
+            logger.info("short_term_scheduler_backend_disabled_for_mode", extra={"account_mode": mode})
+            await _stop_mode_scheduler(mode)
+            continue
         if _runtime_enabled[mode]:
             await _start_mode_scheduler(mode)
         else:
@@ -590,6 +604,11 @@ async def stop_automation_scheduler() -> None:
 
 
 async def _start_mode_scheduler(account_mode: AccountMode) -> None:
+    if not _is_backend_scheduler_supported(account_mode):
+        _runtime_enabled[account_mode] = False
+        _persist_runtime_enabled(account_mode, False)
+        logger.info("short_term_scheduler_backend_disabled_for_mode", extra={"account_mode": account_mode})
+        return
     task = _loop_tasks[account_mode]
     if task and not task.done():
         return
@@ -643,10 +662,11 @@ async def _stop_cache_warm_scheduler() -> None:
 
 def get_automation_scheduler_status(account_mode: AccountMode) -> dict:
     running = _loop_tasks[account_mode] is not None and not _loop_tasks[account_mode].done()
+    enabled = bool(_runtime_enabled[account_mode]) and _is_backend_scheduler_supported(account_mode)
     grid = _scheduler_grid_snapshot()
     return {
         "account_mode": account_mode,
-        "enabled": _runtime_enabled[account_mode],
+        "enabled": enabled,
         "running": running,
         "poll_seconds": settings.automation_short_term_scheduler_poll_seconds,
         "interval_minutes": settings.short_term_scan_interval_minutes,
@@ -659,6 +679,15 @@ def get_automation_scheduler_status(account_mode: AccountMode) -> dict:
 
 
 async def set_automation_scheduler_enabled(account_mode: AccountMode, enabled: bool) -> dict:
+    if not _is_backend_scheduler_supported(account_mode):
+        _runtime_enabled[account_mode] = False
+        _persist_runtime_enabled(account_mode, False)
+        await _stop_mode_scheduler(account_mode)
+        logger.info(
+            "short_term_scheduler_backend_disabled_for_mode",
+            extra={"account_mode": account_mode, "requested_enabled": bool(enabled)},
+        )
+        return get_automation_scheduler_status(account_mode)
     _runtime_enabled[account_mode] = bool(enabled)
     _persist_runtime_enabled(account_mode, _runtime_enabled[account_mode])
     logger.warning(

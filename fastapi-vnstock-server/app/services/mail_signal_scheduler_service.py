@@ -44,6 +44,26 @@ _redis = RedisCacheService()
 _vnstock = VNStockApiService()
 
 
+def _normalize_vn_price_unit(price: float) -> float:
+    """
+    Normalize Vietnam stock price unit to VND.
+    Business rule: many signal sources return prices in "ngan dong" (e.g. 2.8 => 2,800 VND).
+    """
+    value = float(price)
+    if value <= 0:
+        return value
+    # Heuristic: values below 1000 are interpreted as "thousand VND" unit.
+    if value < 1000:
+        return value * 1000.0
+    return value
+
+
+def _normalize_board_lot_qty(quantity: int, lot_size: int = 100) -> int:
+    lot = max(1, int(lot_size))
+    qty = max(0, int(quantity))
+    return (qty // lot) * lot
+
+
 def _mail_signal_allocated_nav() -> float:
     total = float(settings.strategy_total_cash_vnd)
     pct = float(settings.strategy_alloc_mail_signal_pct)
@@ -130,9 +150,19 @@ def _parse_claude_json(raw_text: str) -> list[dict[str, Any]]:
             item = _SignalPick.model_validate(row)
         except ValidationError:
             continue
-        if item.stop_loss >= item.entry or item.take_profit <= item.entry:
+        normalized_entry = _normalize_vn_price_unit(float(item.entry))
+        normalized_take_profit = _normalize_vn_price_unit(float(item.take_profit))
+        normalized_stop_loss = _normalize_vn_price_unit(float(item.stop_loss))
+        if normalized_stop_loss >= normalized_entry or normalized_take_profit <= normalized_entry:
             continue
-        parsed.append(item.model_dump())
+        parsed.append(
+            {
+                **item.model_dump(),
+                "entry": normalized_entry,
+                "take_profit": normalized_take_profit,
+                "stop_loss": normalized_stop_loss,
+            }
+        )
     return parsed
 
 
@@ -216,22 +246,44 @@ def get_latest_mail_signals() -> dict[str, Any] | None:
 
 
 def get_latest_mail_signal_entry_run() -> dict[str, Any] | None:
+    rows = get_recent_mail_signal_entry_runs(limit=1)
+    if not rows:
+        return None
+    return rows[0]
+
+
+def get_recent_mail_signal_entry_runs(limit: int = 10, demo_session_id: str | None = None) -> list[dict[str, Any]]:
+    safe_limit = max(1, min(int(limit), 100))
+    demo_sid = str(demo_session_id or "").strip()
     keys = _redis.scan_keys("signals:mail:entry-run:*", limit=2000)
     if not keys:
-        return None
+        return []
     dated: list[tuple[str, str]] = []
     for key in keys:
         token = key.rsplit(":", 1)[-1].strip()
         if len(token) == 10 and token[4] == "-" and token[7] == "-":
             dated.append((token, key))
+        elif len(token) == 15 and token[8] == "-" and token[:8].isdigit() and token[9:].isdigit():
+            # New format: YYYYMMDD-HHMMSS keeps lexical sort aligned with time.
+            dated.append((token, key))
     if not dated:
-        return None
+        return []
     dated.sort(key=lambda row: row[0], reverse=True)
-    latest_key = dated[0][1]
-    payload = _redis.get_json(latest_key)
-    if payload is None:
-        return None
-    return {"redis_key": latest_key, **payload}
+    recent_rows: list[dict[str, Any]] = []
+    for _, key in dated:
+        payload = _redis.get_json(key)
+        if payload is None:
+            continue
+        row = {"redis_key": key, **payload}
+        if demo_sid:
+            if str(row.get("account_mode", "")).upper() != "DEMO":
+                continue
+            if str(row.get("demo_session_id") or "").strip() != demo_sid:
+                continue
+        recent_rows.append(row)
+        if len(recent_rows) >= safe_limit:
+            break
+    return recent_rows
 
 
 def _extract_latest_price(symbol: str) -> float | None:
@@ -286,108 +338,145 @@ def _entry_hit(side: str, market_price: float, entry: float) -> bool:
     return market_price >= entry
 
 
-def run_prev_day_entry_auto_trading_once() -> dict[str, Any]:
+def run_prev_day_entry_auto_trading_once(
+    account_mode_override: str | None = None,
+    demo_session_id_override: str | None = None,
+    nav_override: float | None = None,
+) -> dict[str, Any]:
     tz = ZoneInfo(settings.mail_signal_scheduler_timezone)
     now_local = datetime.now(tz=tz)
     prev_day = now_local - timedelta(days=1)
     prev_key = _daily_key_for(prev_day)
     payload = _redis.get_json(prev_key) or {}
     raw_items = payload.get("items") if isinstance(payload.get("items"), list) else []
-    account_mode = str(settings.mail_signal_entry_account_mode).upper()
-    nav = _mail_signal_allocated_nav_for_mode(account_mode)
+    requested_mode = str(account_mode_override or "").strip().upper()
+    account_mode = requested_mode if requested_mode in {"REAL", "DEMO"} else str(settings.mail_signal_entry_account_mode).upper()
+    if account_mode == "DEMO":
+        override_sid = str(demo_session_id_override or "").strip()
+        active_demo_session_id = override_sid or get_active_scheduler_demo_session_id_from_db()
+    else:
+        active_demo_session_id = None
+    nav = float(nav_override) if nav_override is not None else _mail_signal_allocated_nav_for_mode(account_mode)
+    nav = max(1_000_000.0, nav)
     risk_per_trade = float(settings.mail_signal_entry_risk_per_trade)
     max_qty = int(settings.mail_signal_entry_max_quantity)
 
     executed: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
+    run_success = True
+    run_error: str | None = None
 
-    for row in raw_items:
-        if not isinstance(row, dict):
-            continue
-        try:
-            item = _SignalPick.model_validate(row)
-        except ValidationError:
-            continue
+    try:
+        for row in raw_items:
+            if not isinstance(row, dict):
+                continue
+            try:
+                item = _SignalPick.model_validate(row)
+            except ValidationError:
+                continue
 
-        symbol = item.symbol.upper().strip()
-        if not symbol:
-            continue
-        execution_marker_key = f"signals:mail:executed:{prev_day.strftime('%Y-%m-%d')}:{symbol}:{account_mode}"
-        if _redis.get_json(execution_marker_key) is not None:
-            skipped.append({"symbol": symbol, "reason": "already_executed"})
-            continue
+            symbol = item.symbol.upper().strip()
+            if not symbol:
+                continue
+            try:
+                if account_mode == "DEMO" and not str(active_demo_session_id or "").strip():
+                    skipped.append({"symbol": symbol, "reason": "missing_demo_session_id"})
+                    continue
+                execution_marker_key = f"signals:mail:executed:{prev_day.strftime('%Y-%m-%d')}:{symbol}:{account_mode}"
+                if _redis.get_json(execution_marker_key) is not None:
+                    skipped.append({"symbol": symbol, "reason": "already_executed"})
+                    continue
 
-        market_price = _extract_latest_price(symbol)
-        if market_price is None or market_price <= 0:
-            skipped.append({"symbol": symbol, "reason": "missing_market_price"})
-            continue
-        if not _entry_hit("BUY", market_price, float(item.entry)):
-            skipped.append({"symbol": symbol, "reason": "entry_not_hit", "market_price": market_price, "entry": item.entry})
-            continue
+                market_price = _extract_latest_price(symbol)
+                if market_price is None or market_price <= 0:
+                    skipped.append({"symbol": symbol, "reason": "missing_market_price"})
+                    continue
+                if not _entry_hit("BUY", market_price, float(item.entry)):
+                    skipped.append({"symbol": symbol, "reason": "entry_not_hit", "market_price": market_price, "entry": item.entry})
+                    continue
 
-        risk = evaluate_risk(
-            {
-                "stoploss_price": float(item.stop_loss),
-                "entry_price": float(item.entry),
-                "nav": nav,
-                "risk_per_trade": risk_per_trade,
-                "daily_new_orders": 0,
-                "max_daily_new_orders": 10_000,
-            }
-        )
-        qty = min(max_qty, int(risk.get("suggested_size") or 0))
-        if qty <= 0:
-            skipped.append({"symbol": symbol, "reason": "risk_size_zero"})
-            continue
+                risk = evaluate_risk(
+                    {
+                        "stoploss_price": float(item.stop_loss),
+                        "entry_price": float(item.entry),
+                        "nav": nav,
+                        "risk_per_trade": risk_per_trade,
+                        "daily_new_orders": 0,
+                        "max_daily_new_orders": 10_000,
+                    }
+                )
+                raw_qty = min(max_qty, int(risk.get("suggested_size") or 0))
+                qty = _normalize_board_lot_qty(raw_qty, lot_size=100)
+                if qty < 100:
+                    skipped.append({"symbol": symbol, "reason": "risk_size_zero"})
+                    continue
 
-        idem_key = f"mail-entry-{prev_day.strftime('%Y%m%d')}-{account_mode}-{symbol}"
-        placed = place_order(
-            {
-                "account_mode": account_mode,
-                "symbol": symbol,
-                "side": "BUY",
-                "quantity": qty,
-                "price": float(item.entry),
-                "auto_process": True,
-                "idempotency_key": idem_key,
-                "metadata": {
-                    "source": "mail_signal_entry_scheduler",
-                    "strategy_code": "MAIL_SIGNAL",
-                    "signal_day": prev_day.strftime("%Y-%m-%d"),
-                    "confidence": float(item.confidence),
-                    "take_profit": float(item.take_profit),
-                    "stop_loss": float(item.stop_loss),
-                    "reason": item.reason,
-                    "market_price_at_check": market_price,
-                },
-            }
-        )
+                idem_key = f"mail-entry-{prev_day.strftime('%Y%m%d')}-{account_mode}-{symbol}"
+                placed = place_order(
+                    {
+                        "account_mode": account_mode,
+                        "symbol": symbol,
+                        "side": "BUY",
+                        "quantity": qty,
+                        "price": float(item.entry),
+                        "auto_process": True,
+                        "idempotency_key": idem_key,
+                        "metadata": {
+                            "source": "mail_signal_entry_scheduler",
+                            "strategy_code": "MAIL_SIGNAL",
+                            "demo_session_id": active_demo_session_id if account_mode == "DEMO" else None,
+                            "signal_day": prev_day.strftime("%Y-%m-%d"),
+                            "confidence": float(item.confidence),
+                            "take_profit": float(item.take_profit),
+                            "stop_loss": float(item.stop_loss),
+                            "reason": item.reason,
+                            "market_price_at_check": market_price,
+                        },
+                    }
+                )
+                _redis.set_json(
+                    execution_marker_key,
+                    {
+                        "executed_at": now_local.isoformat(),
+                        "symbol": symbol,
+                        "order_id": placed.get("id"),
+                        "status": placed.get("status"),
+                    },
+                    ttl_seconds=max(3600, int(settings.mail_signal_redis_ttl_seconds)),
+                )
+                executed.append({"symbol": symbol, "order_id": placed.get("id"), "status": placed.get("status"), "quantity": qty})
+            except Exception as symbol_exc:
+                logger.exception(
+                    "mail_signal_entry_symbol_failed",
+                    extra={"symbol": symbol, "account_mode": account_mode},
+                )
+                skipped.append({"symbol": symbol, "reason": "symbol_processing_error", "error": str(symbol_exc)})
+    except Exception as run_exc:
+        run_success = False
+        run_error = str(run_exc)
+        logger.exception("mail_signal_entry_run_failed", extra={"account_mode": account_mode})
+    finally:
+        result = {
+            "success": run_success,
+            "source_key": prev_key,
+            "account_mode": account_mode,
+            "demo_session_id": active_demo_session_id if account_mode == "DEMO" else None,
+            "scanned": len(raw_items),
+            "executed": executed,
+            "skipped": skipped,
+            "ran_at": now_local.isoformat(),
+            "error": run_error,
+        }
         _redis.set_json(
-            execution_marker_key,
-            {
-                "executed_at": now_local.isoformat(),
-                "symbol": symbol,
-                "order_id": placed.get("id"),
-                "status": placed.get("status"),
-            },
+            f"signals:mail:entry-run:{now_local.strftime('%Y-%m-%d')}",
+            result,
             ttl_seconds=max(3600, int(settings.mail_signal_redis_ttl_seconds)),
         )
-        executed.append({"symbol": symbol, "order_id": placed.get("id"), "status": placed.get("status"), "quantity": qty})
-
-    result = {
-        "success": True,
-        "source_key": prev_key,
-        "account_mode": account_mode,
-        "scanned": len(raw_items),
-        "executed": executed,
-        "skipped": skipped,
-        "ran_at": now_local.isoformat(),
-    }
-    _redis.set_json(
-        f"signals:mail:entry-run:{now_local.strftime('%Y-%m-%d')}",
-        result,
-        ttl_seconds=max(3600, int(settings.mail_signal_redis_ttl_seconds)),
-    )
+        _redis.set_json(
+            f"signals:mail:entry-run:{now_local.strftime('%Y%m%d-%H%M%S')}",
+            result,
+            ttl_seconds=max(3600, int(settings.mail_signal_redis_ttl_seconds)),
+        )
     return result
 
 

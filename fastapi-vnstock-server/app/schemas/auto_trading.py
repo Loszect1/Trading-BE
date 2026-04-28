@@ -112,6 +112,7 @@ class DemoHoldingOverviewItem(BaseModel):
     symbol: str
     quantity: int = Field(..., ge=0)
     average_buy_price: float = Field(..., ge=0)
+    position_value: float = Field(..., ge=0)
     opened_at: datetime
 
 
@@ -131,6 +132,8 @@ class DemoSessionOverviewData(BaseModel):
     )
     initial_balance: float = Field(..., ge=0)
     cash_balance: float = Field(..., ge=0)
+    stock_value: float = Field(..., ge=0)
+    total_assets: float = Field(..., ge=0)
     realized_pnl: float
     trade_count: int = Field(..., ge=0)
     holdings_count: int = Field(..., ge=0)

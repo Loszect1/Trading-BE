@@ -13,6 +13,7 @@ from app.services.alert_dispatcher_service import dispatch_alert_to_channels
 from app.services.alert_message_format import format_alert_plain_text
 from app.services.experience_service import ensure_experience_table, get_experience_claude_runtime_metrics
 from app.services.signal_engine_service import ensure_signals_table, get_signal_scoring_claude_runtime_metrics
+from app.services.short_term_automation_service import ensure_short_term_automation_runs_table
 from app.services.trading_core_service import get_kill_switch, get_monitoring_summary, get_positions, log_risk_event
 from app.services.vnstock_api_service import VNStockApiService
 
@@ -603,3 +604,81 @@ def list_recent_alerts(*, limit: int = 50) -> list[dict[str, Any]]:
             )
             rows = cur.fetchall()
     return [dict(r) for r in rows]
+
+
+def list_recent_runtime_logs(*, account_mode: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    """
+    Runtime operation logs for dashboard scrolling view.
+    Source: short_term_automation_runs persisted rows (scheduler/manual cycles).
+    """
+    safe = max(1, min(int(limit), 500))
+    ensure_short_term_automation_runs_table()
+    mode = str(account_mode or "").strip().upper()
+    with connect(settings.database_url, row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            if mode in {"REAL", "DEMO"}:
+                cur.execute(
+                    """
+                    SELECT
+                        id::text AS id,
+                        started_at,
+                        run_status,
+                        scanned,
+                        buy_candidates,
+                        executed,
+                        errors,
+                        detail
+                    FROM short_term_automation_runs
+                    WHERE detail->>'account_mode' = %(account_mode)s
+                    ORDER BY started_at DESC
+                    LIMIT %(limit)s
+                    """,
+                    {"account_mode": mode, "limit": safe},
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT
+                        id::text AS id,
+                        started_at,
+                        run_status,
+                        scanned,
+                        buy_candidates,
+                        executed,
+                        errors,
+                        detail
+                    FROM short_term_automation_runs
+                    ORDER BY started_at DESC
+                    LIMIT %(limit)s
+                    """,
+                    {"limit": safe},
+                )
+            rows = cur.fetchall()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        detail = dict(row.get("detail") or {})
+        row_mode = str(detail.get("account_mode") or "").strip().upper() or None
+        exchange_scope = str(detail.get("exchange_scope") or "-")
+        run_status = str(row.get("run_status") or "-")
+        scanned = int(row.get("scanned") or 0)
+        buy_candidates = int(row.get("buy_candidates") or 0)
+        executed = int(row.get("executed") or 0)
+        errors = int(row.get("errors") or 0)
+        skip_reason = str(detail.get("skip_reason") or "").strip()
+        runtime_message = (
+            f"{run_status} | scope={exchange_scope} | scan={scanned} | buy={buy_candidates} | exec={executed} | err={errors}"
+        )
+        if skip_reason:
+            runtime_message = f"{runtime_message} | skip_reason={skip_reason}"
+        out.append(
+            {
+                "id": str(row.get("id")),
+                "account_mode": row_mode,
+                "source": "short_term_automation_runs",
+                "level": "INFO" if errors == 0 else "WARN",
+                "message": runtime_message,
+                "payload": detail,
+                "created_at": row.get("started_at"),
+            }
+        )
+    return out

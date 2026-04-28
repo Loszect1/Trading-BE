@@ -183,6 +183,7 @@ def _ensure_demo_strategy_cash_rows(conn: Any, session_id: str, total_cash: floa
 
 def _strategy_used_notional_for_session(session_id: str) -> dict[str, float]:
     used: dict[str, float] = {"SHORT_TERM": 0.0, "MAIL_SIGNAL": 0.0}
+    sid = normalize_demo_session_id(session_id)
     with connect(settings.database_url, row_factory=dict_row) as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
@@ -193,7 +194,7 @@ def _strategy_used_notional_for_session(session_id: str) -> dict[str, float]:
                             THEN COALESCE(order_metadata->>'strategy_code', '')
                         WHEN COALESCE(order_metadata->>'source', '') IN ('short_term_schedule_entry', 'short_term_schedule_exit')
                             THEN 'SHORT_TERM'
-                        WHEN COALESCE(order_metadata->>'source', '') LIKE 'mail_signal_%'
+                        WHEN COALESCE(order_metadata->>'source', '') LIKE 'mail_signal_%%'
                             THEN 'MAIL_SIGNAL'
                         ELSE NULL
                     END AS strategy_code,
@@ -202,8 +203,10 @@ def _strategy_used_notional_for_session(session_id: str) -> dict[str, float]:
                 FROM orders_core
                 WHERE account_mode = 'DEMO'
                   AND status = 'FILLED'
+                  AND order_metadata->>'demo_session_id' = %(session_id)s
                 GROUP BY 1, 2
-                """
+                """,
+                {"session_id": sid},
             )
             for row in cur.fetchall() or []:
                 strategy_code = str(row.get("strategy_code") or "").strip().upper()
@@ -218,6 +221,75 @@ def _strategy_used_notional_for_session(session_id: str) -> dict[str, float]:
     for key in list(used.keys()):
         used[key] = max(0.0, used[key])
     return used
+
+
+def _get_demo_positions_from_core(session_id: str) -> list[dict[str, Any]]:
+    sid = normalize_demo_session_id(session_id)
+    with connect(settings.database_url, row_factory=dict_row) as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                WITH fills AS (
+                    SELECT
+                        symbol,
+                        side,
+                        SUM(quantity)::bigint AS qty_sum,
+                        SUM(quantity * price)::double precision AS notional_sum
+                    FROM orders_core
+                    WHERE account_mode = 'DEMO'
+                      AND status = 'FILLED'
+                      AND order_metadata->>'demo_session_id' = %(session_id)s
+                    GROUP BY symbol, side
+                ),
+                per_symbol AS (
+                    SELECT
+                        symbol,
+                        COALESCE(SUM(CASE WHEN side = 'BUY' THEN qty_sum ELSE 0 END), 0)::bigint AS buy_qty,
+                        COALESCE(SUM(CASE WHEN side = 'SELL' THEN qty_sum ELSE 0 END), 0)::bigint AS sell_qty,
+                        COALESCE(SUM(CASE WHEN side = 'BUY' THEN notional_sum ELSE 0 END), 0)::double precision AS buy_notional
+                    FROM fills
+                    GROUP BY symbol
+                )
+                SELECT
+                    symbol,
+                    (buy_qty - sell_qty)::bigint AS total_qty,
+                    CASE WHEN buy_qty > 0 THEN (buy_notional / buy_qty)::double precision ELSE 0::double precision END AS avg_price
+                FROM per_symbol
+                WHERE (buy_qty - sell_qty) > 0
+                ORDER BY symbol
+                """,
+                {"session_id": sid},
+            )
+            rows = cur.fetchall() or []
+    return [dict(row) for row in rows]
+
+
+def _get_demo_cash_balance_from_core(session_id: str) -> float:
+    """
+    Derive DEMO cash from filled execution orders (single source of truth).
+    """
+    sid = normalize_demo_session_id(session_id)
+    buy_notional = 0.0
+    sell_notional = 0.0
+    with connect(settings.database_url, row_factory=dict_row) as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT
+                    COALESCE(SUM(quantity * price) FILTER (WHERE side = 'BUY'), 0)::double precision AS buy_notional,
+                    COALESCE(SUM(quantity * price) FILTER (WHERE side = 'SELL'), 0)::double precision AS sell_notional
+                FROM orders_core
+                WHERE account_mode = 'DEMO'
+                  AND status = 'FILLED'
+                  AND order_metadata->>'demo_session_id' = %(session_id)s
+                """,
+                {"session_id": sid},
+            )
+            row = cur.fetchone() or {}
+            buy_notional = float(row.get("buy_notional") or 0.0)
+            sell_notional = float(row.get("sell_notional") or 0.0)
+    derived = float(DEMO_INITIAL_BALANCE_VND) + sell_notional - buy_notional
+    return max(0.0, derived)
 
 
 def get_demo_strategy_remaining_cash(session_id: str, strategy_code: str) -> float:
@@ -840,14 +912,14 @@ def get_demo_account_snapshot(
             session_row = cur.fetchone()
             cur.execute(
                 """
-                SELECT symbol, quantity, average_cost, opened_at
+                SELECT symbol, opened_at
                 FROM demo_positions
                 WHERE session_id = %(session_id)s
                 ORDER BY symbol
                 """,
                 {"session_id": session_id},
             )
-            positions_rows = cur.fetchall()
+            position_opened_rows = cur.fetchall()
             cur.execute(
                 "SELECT COUNT(*)::int AS c FROM demo_trades WHERE session_id = %(session_id)s",
                 {"session_id": session_id},
@@ -866,14 +938,17 @@ def get_demo_account_snapshot(
             trade_rows = cur.fetchall()
         conn.commit()
 
+    opened_at_by_symbol = {str(row["symbol"]).strip().upper(): row["opened_at"] for row in position_opened_rows}
+    fallback_opened_at = _utc_now()
+    core_positions_rows = _get_demo_positions_from_core(session_id)
     positions_out: list[dict[str, Any]] = []
     unrealized = 0.0
     market_value = 0.0
     present_symbols: set[str] = set()
-    for row in positions_rows:
+    for row in core_positions_rows:
         sym = str(row["symbol"])
-        qty = int(row["quantity"])
-        avg = float(row["average_cost"])
+        qty = int(row["total_qty"])
+        avg = float(row["avg_price"])
         mark = marks.get(sym, avg)
         present_symbols.add(sym)
         if qty > 0:
@@ -884,11 +959,11 @@ def get_demo_account_snapshot(
                 "symbol": sym,
                 "quantity": qty,
                 "average_cost": avg,
-                "opened_at": row["opened_at"],
+                "opened_at": opened_at_by_symbol.get(sym, fallback_opened_at),
             }
         )
     marks_used = {s: marks[s] for s in marks if s in present_symbols}
-    cash = float((session_row or {}).get("cash_balance", float(DEMO_INITIAL_BALANCE_VND)))
+    cash = _get_demo_cash_balance_from_core(session_id)
     realized = float((session_row or {}).get("realized_pnl", 0.0))
     equity = cash + market_value
     return {
@@ -936,31 +1011,40 @@ def get_demo_session_overview(session_id: str) -> dict[str, Any]:
             session_row = cur.fetchone()
             cur.execute(
                 """
-                SELECT symbol, quantity, average_cost, opened_at
+                SELECT symbol, opened_at
                 FROM demo_positions
                 WHERE session_id = %(session_id)s
                 ORDER BY symbol
                 """,
                 {"session_id": session_id},
             )
-            holdings_rows = cur.fetchall()
+            holdings_opened_rows = cur.fetchall()
         conn.commit()
 
     if not session_row:
         raise ValueError("DEMO_SESSION_NOT_FOUND")
 
+    opened_at_by_symbol = {str(row["symbol"]).strip().upper(): row["opened_at"] for row in holdings_opened_rows}
+    fallback_opened_at = session_row["created_at"]
+    core_positions_rows = _get_demo_positions_from_core(session_id)
     holdings = [
         {
             "symbol": str(row["symbol"]),
-            "quantity": int(row["quantity"]),
-            "average_buy_price": float(row["average_cost"]),
-            "opened_at": row["opened_at"],
+            "quantity": int(row["total_qty"]),
+            "average_buy_price": float(row["avg_price"]),
+            "position_value": float(row["total_qty"]) * float(row["avg_price"]),
+            "opened_at": opened_at_by_symbol.get(str(row["symbol"]).strip().upper(), fallback_opened_at),
         }
-        for row in holdings_rows
+        for row in core_positions_rows
     ]
+    stock_value = sum(
+        float(item.get("quantity") or 0) * float(item.get("average_buy_price") or 0.0)
+        for item in holdings
+    )
     holdings_count = len(holdings)
     trade_count = int(session_row.get("trade_count") or 0)
-    cash_balance = max(0.0, float(session_row["cash_balance"]))
+    cash_balance = _get_demo_cash_balance_from_core(session_id)
+    total_assets = max(0.0, cash_balance + stock_value)
     strategy_used_notional = _strategy_used_notional_for_session(str(session_row["session_id"]))
     with connect(settings.database_url, row_factory=dict_row) as conn_alloc:
         with conn_alloc.cursor(row_factory=dict_row) as cur_alloc:
@@ -1020,6 +1104,8 @@ def get_demo_session_overview(session_id: str) -> dict[str, Any]:
         "is_active": bool(trade_count > 0 or holdings_count > 0),
         "initial_balance": float(session_row["initial_balance"]),
         "cash_balance": cash_balance,
+        "stock_value": float(stock_value),
+        "total_assets": float(total_assets),
         "realized_pnl": float(session_row["realized_pnl"]),
         "trade_count": trade_count,
         "holdings_count": holdings_count,

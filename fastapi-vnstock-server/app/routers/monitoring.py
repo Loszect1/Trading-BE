@@ -9,6 +9,7 @@ from app.services.monitoring_service import (
     build_account_monitoring_dashboard,
     evaluate_alerts_for_modes,
     get_monitoring_summary_all,
+    list_recent_runtime_logs,
     list_recent_alerts,
 )
 from app.services.trading_core_service import set_kill_switch
@@ -54,3 +55,15 @@ def monitoring_kill_switch(body: KillSwitchRequest) -> dict:
         return {"success": True, "data": row}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Kill switch update error: {str(exc)}") from exc
+
+
+@router.get("/runtime-logs")
+def monitoring_runtime_logs(
+    account_mode: Optional[Literal["REAL", "DEMO"]] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> dict:
+    try:
+        data = list_recent_runtime_logs(account_mode=account_mode, limit=limit)
+        return {"success": True, "data": data, "limit": limit, "account_mode": account_mode}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Runtime logs error: {str(exc)}") from exc

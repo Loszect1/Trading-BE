@@ -28,6 +28,11 @@ class ShortTermCycleRunRequest(BaseModel):
         default=None,
         description="Optional FE demo session id for log scoping when account_mode=DEMO.",
     )
+    real_account_available_cash_vnd: float | None = Field(
+        default=None,
+        gt=0,
+        description="Optional REAL account available cash from FE (DNSE) for runtime NAV sizing.",
+    )
 
 
 class ShortTermCycleRunResponse(BaseModel):
@@ -112,3 +117,31 @@ class SchedulerStateRow(BaseModel):
     account_mode: Literal["REAL", "DEMO"]
     enabled: bool
     updated_at: datetime
+
+
+class MailSignalEntryRunOnceRequest(BaseModel):
+    account_mode: Literal["REAL", "DEMO"] = "REAL"
+    demo_session_id: str | None = Field(
+        default=None,
+        description="Optional DEMO session id when account_mode=DEMO.",
+    )
+    real_account_available_cash_vnd: float | None = Field(
+        default=None,
+        gt=0,
+        description="Optional REAL account available cash from FE (DNSE) for runtime NAV sizing.",
+    )
+
+
+class RealRecommendationScanRequest(BaseModel):
+    exchange_scope: Literal["ALL", "HOSE", "HNX", "UPCOM"] = "ALL"
+    limit_symbols: int = Field(default=0, ge=0)
+
+
+class RealRecommendationBuyRequest(BaseModel):
+    symbol: str = Field(min_length=1, max_length=20)
+    entry: float = Field(gt=0)
+    take_profit: float = Field(gt=0)
+    stop_loss: float = Field(gt=0)
+    confidence: float = Field(default=50.0, ge=0, le=100)
+    reason: str = Field(default="", max_length=2000)
+    available_cash_vnd: float = Field(gt=0)
