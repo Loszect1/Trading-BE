@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Literal
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from psycopg import connect
 from psycopg.rows import dict_row
 
 from app.core.config import settings
 from app.schemas.auto_trading import DEMO_INITIAL_BALANCE_VND, DemoTradeRequest
+from app.services.vn_market_holiday_calendar import add_vn_trading_days_live, vn_market_local_today
 from app.services.vnstock_api_service import VNStockApiService
 
 
@@ -19,6 +21,10 @@ def _utc_now() -> datetime:
 
 
 _vnstock_api = VNStockApiService()
+_VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
+_DEMO_TP_SLOT_PCT_DEFAULT = 0.3
+_DEMO_TP_SLOT_PCT_MIN = 0.1
+_DEMO_TP_SLOT_PCT_MAX = 0.9
 
 
 def _last_daily_close_mark(symbol: str) -> float | None:
@@ -107,6 +113,11 @@ def _create_demo_session_id() -> str:
     return f"demo-{uuid4()}"
 
 
+def _demo_lot_settle_date(opened_at: datetime) -> date:
+    local_trade_date = opened_at.astimezone(_VN_TZ).date()
+    return add_vn_trading_days_live(local_trade_date, 2)
+
+
 def ensure_demo_trading_tables() -> None:
     query = """
     CREATE TABLE IF NOT EXISTS demo_sessions (
@@ -162,6 +173,21 @@ def ensure_demo_trading_tables() -> None:
         cash_value DOUBLE PRECISION NOT NULL CHECK (cash_value >= 0),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         PRIMARY KEY (session_id, strategy_code)
+    );
+
+    CREATE TABLE IF NOT EXISTS demo_session_exit_config (
+        session_id VARCHAR(128) PRIMARY KEY REFERENCES demo_sessions(session_id) ON DELETE CASCADE,
+        tp_slot_pct DOUBLE PRECISION NOT NULL CHECK (tp_slot_pct >= 0.1 AND tp_slot_pct <= 0.9),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS demo_symbol_exit_levels (
+        session_id VARCHAR(128) NOT NULL REFERENCES demo_sessions(session_id) ON DELETE CASCADE,
+        symbol VARCHAR(20) NOT NULL,
+        take_profit_price DOUBLE PRECISION NOT NULL CHECK (take_profit_price > 0),
+        stoploss_price DOUBLE PRECISION NOT NULL CHECK (stoploss_price > 0),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (session_id, symbol)
     );
     """
     with connect(settings.database_url) as conn:
@@ -296,6 +322,109 @@ def _get_demo_positions_from_core(session_id: str) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def _get_demo_position_exit_levels_from_core(session_id: str) -> dict[str, tuple[float, float]]:
+    sid = normalize_demo_session_id(session_id)
+    out: dict[str, tuple[float, float]] = {}
+    with connect(settings.database_url, row_factory=dict_row) as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT ON (symbol)
+                    symbol,
+                    order_metadata
+                FROM orders_core
+                WHERE account_mode = 'DEMO'
+                  AND status = 'FILLED'
+                  AND side = 'BUY'
+                  AND order_metadata->>'demo_session_id' = %(session_id)s
+                ORDER BY symbol, created_at DESC
+                """,
+                {"session_id": sid},
+            )
+            rows = cur.fetchall() or []
+    for row in rows:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        meta = row.get("order_metadata")
+        if not isinstance(meta, dict):
+            continue
+        try:
+            tp = float(meta.get("take_profit_price") or 0.0)
+            sl = float(meta.get("stoploss_price") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if tp > 0 and sl > 0:
+            out[symbol] = (tp, sl)
+    return out
+
+
+def _get_demo_position_exit_levels_overrides(session_id: str) -> dict[str, tuple[float, float]]:
+    sid = normalize_demo_session_id(session_id)
+    out: dict[str, tuple[float, float]] = {}
+    with connect(settings.database_url, row_factory=dict_row) as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT symbol, take_profit_price, stoploss_price
+                FROM demo_symbol_exit_levels
+                WHERE session_id = %(session_id)s
+                """,
+                {"session_id": sid},
+            )
+            rows = cur.fetchall() or []
+    for row in rows:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        try:
+            tp = float(row.get("take_profit_price") or 0.0)
+            sl = float(row.get("stoploss_price") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if symbol and tp > 0 and sl > 0:
+            out[symbol] = (tp, sl)
+    return out
+
+
+def _get_demo_symbol_settlement_snapshot(session_id: str) -> dict[str, dict[str, Any]]:
+    sid = normalize_demo_session_id(session_id)
+    out: dict[str, dict[str, Any]] = {}
+    with connect(settings.database_url, row_factory=dict_row) as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT
+                    pl.symbol,
+                    COALESCE(SUM(pl.available_qty), 0)::bigint AS settled_quantity,
+                    COALESCE(SUM(pl.qty - pl.available_qty), 0)::bigint AS pending_settlement_quantity,
+                    MIN(pl.settle_date) AS next_settle_date
+                FROM position_lots pl
+                JOIN orders_core o ON o.id = pl.buy_order_id
+                WHERE pl.account_mode = 'DEMO'
+                  AND o.account_mode = 'DEMO'
+                  AND o.status = 'FILLED'
+                  AND COALESCE(o.order_metadata->>'demo_session_id', '') = %(session_id)s
+                GROUP BY pl.symbol
+                """,
+                {"session_id": sid},
+            )
+            rows = cur.fetchall() or []
+    for row in rows:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        settled_quantity = int(row.get("settled_quantity") or 0)
+        pending_quantity = int(row.get("pending_settlement_quantity") or 0)
+        settle_date = row.get("next_settle_date")
+        if settled_quantity <= 0 and pending_quantity <= 0:
+            continue
+        out[symbol] = {
+            "settled_quantity": max(0, settled_quantity),
+            "pending_settlement_quantity": max(0, pending_quantity),
+            "next_settle_date": settle_date if isinstance(settle_date, date) else None,
+        }
+    return out
+
+
 def _get_demo_cash_balance_from_core(session_id: str) -> float:
     """
     Derive DEMO cash from filled execution orders (single source of truth).
@@ -324,6 +453,53 @@ def _get_demo_cash_balance_from_core(session_id: str) -> float:
     return max(0.0, derived)
 
 
+def _get_demo_trade_history_from_core(
+    session_id: str,
+    *,
+    limit: int,
+    offset: int,
+) -> tuple[list[dict[str, Any]], int]:
+    sid = normalize_demo_session_id(session_id)
+    safe_limit = max(1, min(int(limit), 200))
+    safe_offset = max(0, int(offset))
+    with connect(settings.database_url, row_factory=dict_row) as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*)::int AS c
+                FROM orders_core
+                WHERE account_mode = 'DEMO'
+                  AND status = 'FILLED'
+                  AND COALESCE(order_metadata->>'demo_session_id', '') = %(session_id)s
+                """,
+                {"session_id": sid},
+            )
+            total_row = cur.fetchone() or {}
+            cur.execute(
+                """
+                SELECT
+                    id::text AS trade_id,
+                    created_at,
+                    side,
+                    symbol,
+                    quantity,
+                    price,
+                    (quantity * price)::double precision AS notional,
+                    0::double precision AS realized_pnl_on_trade,
+                    0::double precision AS cash_after
+                FROM orders_core
+                WHERE account_mode = 'DEMO'
+                  AND status = 'FILLED'
+                  AND COALESCE(order_metadata->>'demo_session_id', '') = %(session_id)s
+                ORDER BY created_at DESC
+                LIMIT %(limit)s OFFSET %(offset)s
+                """,
+                {"session_id": sid, "limit": safe_limit, "offset": safe_offset},
+            )
+            rows = cur.fetchall() or []
+    return ([dict(row) for row in rows], int(total_row.get("c", 0)))
+
+
 def get_demo_strategy_remaining_cash(session_id: str, strategy_code: str) -> float:
     sid = normalize_demo_session_id(session_id)
     strategy = str(strategy_code).strip().upper()
@@ -350,6 +526,108 @@ def get_demo_strategy_remaining_cash(session_id: str, strategy_code: str) -> flo
     allocated = max(0.0, float(alloc_row.get("cash_value") or 0.0))
     used = float(_strategy_used_notional_for_session(sid).get(strategy) or 0.0)
     return max(0.0, allocated - used)
+
+
+def _clamp_demo_tp_slot_pct(value: float) -> float:
+    return min(_DEMO_TP_SLOT_PCT_MAX, max(_DEMO_TP_SLOT_PCT_MIN, float(value)))
+
+
+def get_demo_session_tp_slot_pct(session_id: str) -> float:
+    sid = normalize_demo_session_id(session_id)
+    ensure_demo_trading_tables()
+    with connect(settings.database_url, row_factory=dict_row) as conn:
+        _ensure_demo_session_exists(conn, sid)
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                INSERT INTO demo_session_exit_config (session_id, tp_slot_pct, updated_at)
+                VALUES (%(session_id)s, %(tp_slot_pct)s, NOW())
+                ON CONFLICT (session_id) DO NOTHING
+                """,
+                {"session_id": sid, "tp_slot_pct": _DEMO_TP_SLOT_PCT_DEFAULT},
+            )
+            cur.execute(
+                """
+                SELECT tp_slot_pct
+                FROM demo_session_exit_config
+                WHERE session_id = %(session_id)s
+                """,
+                {"session_id": sid},
+            )
+            row = cur.fetchone() or {}
+        conn.commit()
+    return _clamp_demo_tp_slot_pct(float(row.get("tp_slot_pct") or _DEMO_TP_SLOT_PCT_DEFAULT))
+
+
+def upsert_demo_session_tp_slot_pct(session_id: str, tp_slot_pct: float) -> float:
+    sid = normalize_demo_session_id(session_id)
+    next_pct = _clamp_demo_tp_slot_pct(tp_slot_pct)
+    ensure_demo_trading_tables()
+    with connect(settings.database_url, row_factory=dict_row) as conn:
+        _ensure_demo_session_exists(conn, sid)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO demo_session_exit_config (session_id, tp_slot_pct, updated_at)
+                VALUES (%(session_id)s, %(tp_slot_pct)s, NOW())
+                ON CONFLICT (session_id)
+                DO UPDATE SET tp_slot_pct = EXCLUDED.tp_slot_pct, updated_at = NOW()
+                """,
+                {"session_id": sid, "tp_slot_pct": next_pct},
+            )
+        conn.commit()
+    return next_pct
+
+
+def upsert_demo_symbol_exit_levels(session_id: str, symbol: str, take_profit_price: float, stoploss_price: float) -> None:
+    sid = normalize_demo_session_id(session_id)
+    sym = str(symbol or "").strip().upper()
+    tp = float(take_profit_price)
+    sl = float(stoploss_price)
+    if not sym:
+        raise ValueError("INVALID_SYMBOL")
+    if tp <= 0 or sl <= 0:
+        raise ValueError("INVALID_EXIT_LEVELS")
+    ensure_demo_trading_tables()
+    with connect(settings.database_url, row_factory=dict_row) as conn:
+        _ensure_demo_session_exists(conn, sid)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO demo_symbol_exit_levels (session_id, symbol, take_profit_price, stoploss_price, updated_at)
+                VALUES (%(session_id)s, %(symbol)s, %(take_profit_price)s, %(stoploss_price)s, NOW())
+                ON CONFLICT (session_id, symbol)
+                DO UPDATE SET
+                    take_profit_price = EXCLUDED.take_profit_price,
+                    stoploss_price = EXCLUDED.stoploss_price,
+                    updated_at = NOW()
+                """,
+                {
+                    "session_id": sid,
+                    "symbol": sym,
+                    "take_profit_price": tp,
+                    "stoploss_price": sl,
+                },
+            )
+        conn.commit()
+
+
+def delete_demo_symbol_exit_levels(session_id: str, symbol: str) -> None:
+    sid = normalize_demo_session_id(session_id)
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return
+    ensure_demo_trading_tables()
+    with connect(settings.database_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM demo_symbol_exit_levels
+                WHERE session_id = %(session_id)s AND symbol = %(symbol)s
+                """,
+                {"session_id": sid, "symbol": sym},
+            )
+        conn.commit()
 
 
 def transfer_demo_strategy_cash_from_unallocated(
@@ -808,6 +1086,14 @@ def execute_demo_trade(session_id: str, body: DemoTradeRequest) -> DemoTradeExec
         position = _load_position_with_lots(conn, session_id, symbol)
         if position is None or position.quantity < qty:
             raise ValueError("INSUFFICIENT_POSITION")
+        today_local = vn_market_local_today()
+        settled_quantity = 0
+        for lot in position.lots:
+            settle_date = _demo_lot_settle_date(lot.opened_at)
+            if settle_date <= today_local:
+                settled_quantity += int(lot.quantity)
+        if settled_quantity < qty:
+            raise ValueError("INSUFFICIENT_SETTLED_POSITION")
 
         opened_at = position.opened_at
         avg_before = position.average_cost
@@ -816,6 +1102,9 @@ def execute_demo_trade(session_id: str, body: DemoTradeRequest) -> DemoTradeExec
         for lot in position.lots:
             if remaining <= 0:
                 break
+            settle_date = _demo_lot_settle_date(lot.opened_at)
+            if settle_date > today_local:
+                continue
             take = min(lot.quantity, remaining)
             realized_on_trade += (price - lot.unit_cost) * take
             lot.quantity -= take
@@ -885,7 +1174,7 @@ def execute_demo_trade(session_id: str, body: DemoTradeRequest) -> DemoTradeExec
             }
 
         experience_candidate: dict[str, Any] | None = None
-        if fully_closed and realized_on_trade < 0:
+        if fully_closed:
             cost_basis = avg_before * qty if avg_before > 0 else 0.0
             pnl_pct = (realized_on_trade / cost_basis * 100.0) if cost_basis > 1e-9 else 0.0
             experience_candidate = {
@@ -904,6 +1193,7 @@ def execute_demo_trade(session_id: str, body: DemoTradeRequest) -> DemoTradeExec
                     "quantity": qty,
                     "average_entry": avg_before,
                     "rr_realized": float(body.market_context.get("rr_realized", 0.0)),
+                    "prediction_outcome": "correct" if realized_on_trade >= 0 else "wrong",
                 },
             }
 
@@ -997,6 +1287,14 @@ def get_demo_account_snapshot(
     marks_used = {s: marks[s] for s in marks if s in present_symbols}
     cash = _get_demo_cash_balance_from_core(session_id)
     realized = float((session_row or {}).get("realized_pnl", 0.0))
+    trade_history_out = [dict(item) for item in trade_rows]
+    trade_history_total = int(total_row.get("c", 0))
+    if not trade_history_out and trade_history_total == 0:
+        trade_history_out, trade_history_total = _get_demo_trade_history_from_core(
+            session_id,
+            limit=safe_limit,
+            offset=safe_offset,
+        )
     equity = cash + market_value
     return {
         "session_id": session_id,
@@ -1006,8 +1304,8 @@ def get_demo_account_snapshot(
         "unrealized_pnl": unrealized,
         "equity_approx_vnd": equity,
         "marks_used": marks_used,
-        "trade_history": [dict(item) for item in trade_rows],
-        "trade_history_total": int(total_row.get("c", 0)),
+        "trade_history": trade_history_out,
+        "trade_history_total": trade_history_total,
         "trade_history_limit": safe_limit,
         "trade_history_offset": safe_offset,
     }
@@ -1059,23 +1357,52 @@ def get_demo_session_overview(session_id: str) -> dict[str, Any]:
     opened_at_by_symbol = {str(row["symbol"]).strip().upper(): row["opened_at"] for row in holdings_opened_rows}
     fallback_opened_at = session_row["created_at"]
     core_positions_rows = _get_demo_positions_from_core(session_id)
+    exit_levels_by_symbol = _get_demo_position_exit_levels_from_core(session_id)
+    override_exit_levels_by_symbol = _get_demo_position_exit_levels_overrides(session_id)
+    settlement_by_symbol = _get_demo_symbol_settlement_snapshot(session_id)
+    tp_slot_pct = get_demo_session_tp_slot_pct(session_id)
     holdings: list[dict[str, Any]] = []
     stock_value = 0.0
     for row in core_positions_rows:
         symbol = str(row["symbol"])
         quantity = int(row["total_qty"])
         average_buy_price = float(row["avg_price"])
+        fallback_tp = average_buy_price * 1.04 if average_buy_price > 0 else 0.0
+        fallback_sl = average_buy_price * 0.97 if average_buy_price > 0 else 0.0
+        tp, sl = override_exit_levels_by_symbol.get(
+            symbol.strip().upper(),
+            exit_levels_by_symbol.get(symbol.strip().upper(), (fallback_tp, fallback_sl)),
+        )
         # Mark-to-market for overview totals: use last daily close, fallback to cost basis.
         mark = _last_daily_close_mark(symbol)
         used_price = mark if mark is not None and mark > 0 else average_buy_price
         position_value = float(quantity) * float(used_price)
         stock_value += position_value
+        settlement = settlement_by_symbol.get(symbol.strip().upper(), {})
+        settled_quantity = int(settlement.get("settled_quantity") or 0)
+        pending_settlement_quantity = int(settlement.get("pending_settlement_quantity") or 0)
+        next_settle_date = settlement.get("next_settle_date")
         holdings.append(
             {
                 "symbol": symbol,
                 "quantity": quantity,
                 "average_buy_price": average_buy_price,
                 "position_value": position_value,
+                "take_profit_price": tp if tp > 0 else None,
+                "stoploss_price": sl if sl > 0 else None,
+                "settled_quantity": max(0, settled_quantity),
+                "pending_settlement_quantity": max(0, pending_settlement_quantity),
+                "next_settle_date": (
+                    datetime(
+                        next_settle_date.year,
+                        next_settle_date.month,
+                        next_settle_date.day,
+                        tzinfo=_VN_TZ,
+                    )
+                    if isinstance(next_settle_date, date)
+                    else None
+                ),
+                "is_t2_sell_allowed": bool(settled_quantity > 0),
                 "opened_at": opened_at_by_symbol.get(symbol.strip().upper(), fallback_opened_at),
             }
         )
@@ -1148,6 +1475,7 @@ def get_demo_session_overview(session_id: str) -> dict[str, Any]:
         "trade_count": trade_count,
         "holdings_count": holdings_count,
         "holdings": holdings,
+        "tp_slot_pct": float(tp_slot_pct),
         "strategy_cash_overview": strategy_cash_overview,
         "created_at": session_row["created_at"],
         "updated_at": session_row["updated_at"],
@@ -1198,3 +1526,93 @@ def get_demo_session_cash_balance(session_id: str | None) -> float | None:
     if cash <= 0:
         return None
     return cash
+
+
+def _resolve_exit_trigger(last_price: float, take_profit: float, stoploss: float) -> str | None:
+    if last_price <= 0 or take_profit <= 0 or stoploss <= 0:
+        return None
+    if last_price >= take_profit:
+        return "take_profit_hit"
+    if last_price <= stoploss:
+        return "stoploss_hit"
+    return None
+
+
+def run_demo_auto_exit_cycle(session_id: str) -> dict[str, Any]:
+    sid = normalize_demo_session_id(session_id)
+    overview = get_demo_session_overview(sid)
+    holdings = list(overview.get("holdings") or [])
+    if not holdings:
+        return {"session_id": sid, "scanned": 0, "executed": 0}
+    tp_slot_pct = float(overview.get("tp_slot_pct") or _DEMO_TP_SLOT_PCT_DEFAULT)
+    executed = 0
+    scanned = 0
+    details: list[dict[str, Any]] = []
+    for row in holdings:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        sellable_qty = int(row.get("settled_quantity") or 0)
+        quantity_total = int(row.get("quantity") or 0)
+        tp = float(row.get("take_profit_price") or 0.0)
+        sl = float(row.get("stoploss_price") or 0.0)
+        if not symbol or sellable_qty < 100:
+            continue
+        mark = _last_daily_close_mark(symbol)
+        last = float(mark or 0.0)
+        trigger = _resolve_exit_trigger(last, tp, sl)
+        scanned += 1
+        if not trigger:
+            continue
+        slot_qty = max(100, int((((sellable_qty * tp_slot_pct) + 99) // 100) * 100))
+        sell_qty = sellable_qty if trigger == "stoploss_hit" else min(sellable_qty, slot_qty)
+        if sell_qty <= 0:
+            continue
+        try:
+            result = execute_demo_trade(
+                sid,
+                DemoTradeRequest(
+                    side="SELL",
+                    symbol=symbol,
+                    quantity=sell_qty,
+                    price=last,
+                    strategy_type="SHORT_TERM",
+                    market_context={
+                        "source": "demo_auto_sell_threshold",
+                        "trigger": trigger,
+                        "take_profit_price": tp,
+                        "stoploss_price": sl,
+                        "sell_mode": "full_exit" if trigger == "stoploss_hit" else "take_profit_slot",
+                        "take_profit_slot_pct_applied": 1.0 if trigger == "stoploss_hit" else float(tp_slot_pct),
+                        "sell_quantity": int(sell_qty),
+                        "remaining_quantity": max(0, int(quantity_total - sell_qty)),
+                    },
+                ),
+            )
+            executed += 1
+            realized = float(result.realized_pnl_on_trade)
+            next_tp_slot_pct = _clamp_demo_tp_slot_pct(
+                float(tp_slot_pct) - 0.05 if realized >= 0 else float(tp_slot_pct) + 0.05
+            )
+            tp_slot_pct = upsert_demo_session_tp_slot_pct(sid, next_tp_slot_pct)
+            remaining_qty = max(0, int(quantity_total - sell_qty))
+            if trigger == "take_profit_hit" and remaining_qty >= 100:
+                next_tp = last * 1.03
+                next_sl = last * 0.985
+                upsert_demo_symbol_exit_levels(
+                    session_id=sid,
+                    symbol=symbol,
+                    take_profit_price=next_tp,
+                    stoploss_price=next_sl,
+                )
+            else:
+                delete_demo_symbol_exit_levels(sid, symbol)
+            details.append(
+                {
+                    "symbol": symbol,
+                    "trigger": trigger,
+                    "sell_quantity": sell_qty,
+                    "price": last,
+                }
+            )
+        except Exception as exc:
+            details.append({"symbol": symbol, "trigger": trigger, "error": str(exc)})
+    return {"session_id": sid, "scanned": scanned, "executed": executed, "details": details}

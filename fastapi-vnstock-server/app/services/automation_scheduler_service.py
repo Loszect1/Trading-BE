@@ -12,7 +12,11 @@ from psycopg.rows import dict_row
 
 from app.core.config import get_vn_market_holiday_dates, settings
 from app.services.alert_dispatcher_service import dispatch_alert_to_channels
-from app.services.demo_trading_service import get_demo_session_cash_balance, get_demo_strategy_remaining_cash
+from app.services.demo_trading_service import (
+    get_demo_session_cash_balance,
+    get_demo_strategy_remaining_cash,
+    run_demo_auto_exit_cycle,
+)
 from app.services.short_term_automation_service import run_short_term_production_cycle
 from app.services.short_term_scan_schedule import (
     is_instant_on_short_term_scan_grid,
@@ -47,6 +51,8 @@ _REAL_RECOMMENDATIONS_TTL_SECONDS = 86_400
 _real_scan_only_loop_task: asyncio.Task | None = None
 _real_scan_only_last_slot_marker: str | None = None
 _runtime_real_scan_only_enabled: bool = False
+_demo_auto_exit_loop_task: asyncio.Task | None = None
+_demo_auto_exit_last_slot_marker: str | None = None
 _redis_cache = RedisCacheService()
 _runtime_enabled: dict[AccountMode, bool] = {
     mode: bool(settings.automation_short_term_scheduler_enabled) for mode in _ACCOUNT_MODES
@@ -87,6 +93,76 @@ def _normalize_real_recommendation_rows(rows: list[dict[str, Any]]) -> list[dict
 def _real_scan_only_slot_marker(now_local: datetime) -> str:
     # Unique per VN slot grid boundary.
     return f"{now_local.date().isoformat()}-{now_local.hour:02d}:{now_local.minute:02d}"
+
+
+def _is_vn_market_open(now_local: datetime) -> bool:
+    if now_local.weekday() >= 5:
+        return False
+    minute_of_day = now_local.hour * 60 + now_local.minute
+    in_morning = (9 * 60) <= minute_of_day <= (11 * 60 + 30)
+    in_afternoon = (13 * 60) <= minute_of_day <= (14 * 60 + 45)
+    return in_morning or in_afternoon
+
+
+async def _demo_auto_exit_scheduler_loop() -> None:
+    global _demo_auto_exit_last_slot_marker
+    tz = ZoneInfo(settings.short_term_scan_timezone)
+    logger.info("demo_auto_exit_scheduler_started", extra={"timezone": settings.short_term_scan_timezone})
+    while True:
+        try:
+            if not bool(_runtime_enabled.get("DEMO")):
+                logger.info("demo_auto_exit_scheduler_disabled_by_state")
+                return
+            session_id = (_active_demo_session_id or "").strip()
+            if not session_id:
+                await asyncio.sleep(10)
+                continue
+            now_local = datetime.now(tz=tz)
+            if not _is_vn_market_open(now_local):
+                await asyncio.sleep(10)
+                continue
+            marker = _real_scan_only_slot_marker(now_local)
+            if marker == _demo_auto_exit_last_slot_marker:
+                await asyncio.sleep(10)
+                continue
+            result = await asyncio.to_thread(run_demo_auto_exit_cycle, session_id)
+            _demo_auto_exit_last_slot_marker = marker
+            logger.warning(
+                "demo_auto_exit_cycle_finished",
+                extra={
+                    "session_id": session_id,
+                    "marker": marker,
+                    "scanned": int(result.get("scanned") or 0),
+                    "executed": int(result.get("executed") or 0),
+                },
+            )
+        except Exception as exc:
+            logger.warning("demo_auto_exit_scheduler_tick_failed", extra={"error": str(exc)})
+        await asyncio.sleep(10)
+
+
+async def _start_demo_auto_exit_scheduler() -> None:
+    global _demo_auto_exit_loop_task
+    if _demo_auto_exit_loop_task and not _demo_auto_exit_loop_task.done():
+        return
+    _demo_auto_exit_loop_task = asyncio.create_task(
+        _demo_auto_exit_scheduler_loop(),
+        name="demo-auto-exit-scheduler",
+    )
+    logger.warning("demo_auto_exit_scheduler_task_started")
+
+
+async def _stop_demo_auto_exit_scheduler() -> None:
+    global _demo_auto_exit_loop_task, _demo_auto_exit_last_slot_marker
+    if _demo_auto_exit_loop_task and not _demo_auto_exit_loop_task.done():
+        _demo_auto_exit_loop_task.cancel()
+        try:
+            await _demo_auto_exit_loop_task
+        except asyncio.CancelledError:
+            pass
+    _demo_auto_exit_loop_task = None
+    _demo_auto_exit_last_slot_marker = None
+    logger.warning("demo_auto_exit_scheduler_task_stopped")
 
 
 def _run_real_scan_only_and_persist() -> None:
@@ -256,6 +332,25 @@ def _resolve_post_close_refresh_hours() -> tuple[int, ...]:
 
     # Deduplicate and keep deterministic execution order.
     return tuple(sorted(set(parsed_hours)))
+
+
+def run_short_term_post_close_refresh_once() -> dict[str, Any]:
+    """
+    Run one post-close refresh cycle on demand.
+    Shared by scheduler slot (e.g. 16:00) and manual trigger endpoint.
+    """
+    volume_stats = warm_daily_volume_for_saved_symbols(30)
+    redis_stats = refresh_short_term_liquidity_cache_from_db(30, "ALL")
+    news_stats = scan_and_persist_symbol_news_from_liquidity_cache(
+        exchange_scope="ALL",
+        max_symbols=0,
+        per_symbol_news_limit=20,
+    )
+    return {
+        "volume_stats": volume_stats,
+        "redis_stats": redis_stats,
+        "news_stats": news_stats,
+    }
 
 
 def _ensure_automation_scheduler_state_table() -> None:
@@ -672,29 +767,15 @@ async def _cache_warm_loop() -> None:
                 and current_slot_marker not in _post_close_refresh_run_markers
             )
             if should_refresh_post_close:
-                volume_stats = await asyncio.to_thread(
-                    warm_daily_volume_for_saved_symbols,
-                    30,
-                )
-                redis_stats = await asyncio.to_thread(
-                    refresh_short_term_liquidity_cache_from_db,
-                    30,
-                    "ALL",
-                )
-                news_stats = await asyncio.to_thread(
-                    scan_and_persist_symbol_news_from_liquidity_cache,
-                    exchange_scope="ALL",
-                    max_symbols=0,
-                    per_symbol_news_limit=20,
-                )
+                refresh_result = await asyncio.to_thread(run_short_term_post_close_refresh_once)
                 _post_close_refresh_run_markers.add(current_slot_marker)
                 logger.warning(
                     "short_term_post_close_refresh_completed",
                     extra={
                         "slot_marker": current_slot_marker,
-                        "volume_stats": volume_stats,
-                        "redis_stats": redis_stats,
-                        "news_stats": news_stats,
+                        "volume_stats": refresh_result.get("volume_stats"),
+                        "redis_stats": refresh_result.get("redis_stats"),
+                        "news_stats": refresh_result.get("news_stats"),
                     },
                 )
         except Exception as exc:
@@ -844,6 +925,7 @@ async def start_automation_scheduler() -> None:
 async def stop_automation_scheduler() -> None:
     for mode in _ACCOUNT_MODES:
         await _stop_mode_scheduler(mode)
+    await _stop_demo_auto_exit_scheduler()
     await _stop_real_scan_only_scheduler()
     await _stop_cache_warm_scheduler()
 
@@ -861,6 +943,8 @@ async def _start_mode_scheduler(account_mode: AccountMode) -> None:
         _scheduler_loop(account_mode),
         name=f"short-term-automation-scheduler-{account_mode.lower()}",
     )
+    if account_mode == "DEMO":
+        await _start_demo_auto_exit_scheduler()
     logger.warning("short_term_scheduler_task_started", extra={"account_mode": account_mode})
 
 
@@ -873,6 +957,8 @@ async def _stop_mode_scheduler(account_mode: AccountMode) -> None:
         except asyncio.CancelledError:
             pass
     _loop_tasks[account_mode] = None
+    if account_mode == "DEMO":
+        await _stop_demo_auto_exit_scheduler()
     logger.warning("short_term_scheduler_task_stopped", extra={"account_mode": account_mode})
 
 

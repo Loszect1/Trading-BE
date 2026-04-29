@@ -12,6 +12,7 @@ from app.services.claude_service import ClaudeService
 from app.services.redis_cache import RedisCacheService
 from app.services.vnstock_api_service import VNStockApiService
 from app.services.vnstock_service import VNStockService
+from app.services.vn_market_holiday_calendar import is_vn_market_trading_day_live
 
 router = APIRouter(prefix="/market", tags=["market"])
 vnstock_service = VNStockService()
@@ -24,6 +25,10 @@ def _build_scanner_cache_key(as_of: date, days: int, top_n: int, use_ai: bool) -
     return "market:scanner-top:" + sha256(
         f"{as_of.isoformat()}:{days}:{top_n}:{use_ai}".encode("utf-8")
     ).hexdigest()
+
+
+def _build_trading_day_check_cache_key(day: date) -> str:
+    return f"market:trading-day-check:{day.isoformat()}"
 
 
 @router.get("/history")
@@ -326,3 +331,34 @@ def scanner_top_symbols(
             status_code=500,
             detail=f"Failed to scan top symbols: {str(exc)}",
         ) from exc
+
+
+@router.get("/trading-day/check")
+def check_vn_trading_day(
+    day: str = Query(..., description="Date to check, format YYYY-MM-DD"),
+    force_refresh: bool = Query(False, description="Bypass Redis cache and probe live market data"),
+) -> dict:
+    try:
+        target_day = date.fromisoformat(day.strip())
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid date format, expected YYYY-MM-DD") from exc
+    cache_key = _build_trading_day_check_cache_key(target_day)
+    if not force_refresh:
+        cached = redis_cache_service.get_json(cache_key)
+        if isinstance(cached, dict):
+            return {"success": True, "data": cached}
+    is_open = is_vn_market_trading_day_live(target_day)
+    if target_day.weekday() >= 5:
+        reason = "weekend"
+    else:
+        reason = "open" if is_open else "closed_no_session_data"
+    data = {
+        "date": target_day.isoformat(),
+        "is_trading_day": bool(is_open),
+        "reason": reason,
+        "method": "live_market_data_probe",
+        "probe_symbol": "VNINDEX",
+    }
+    # Keep one-day cache per checked date to reduce repeated upstream probes.
+    redis_cache_service.set_json(cache_key, data, ttl_seconds=86_400 + 600)
+    return {"success": True, "data": data}

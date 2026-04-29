@@ -165,6 +165,50 @@ def is_vn_market_trading_day(on: date, holidays: frozenset[date] | set[date] | N
     return True
 
 
+@lru_cache(maxsize=1024)
+def _probe_market_open_by_history_day(day_iso: str) -> bool:
+    """
+    Runtime market-day probe without static holiday files:
+    check whether VNINDEX has valid 1D bar on the exact date.
+    """
+    try:
+        from app.services.vnstock_api_service import VNStockApiService
+
+        api = VNStockApiService()
+        rows = api.call_quote(
+            "history",
+            source="VCI",
+            symbol="VNINDEX",
+            method_kwargs={"interval": "1D", "start": day_iso, "end": day_iso},
+        )
+    except Exception:
+        return False
+    if not isinstance(rows, list):
+        return False
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw_close = row.get("close")
+        try:
+            close = float(raw_close)
+        except (TypeError, ValueError):
+            continue
+        if close > 0:
+            return True
+    return False
+
+
+def is_vn_market_trading_day_live(on: date) -> bool:
+    """
+    Live trading-day check:
+    - Weekend => closed
+    - Weekday => probe market data to determine holiday/non-trading day
+    """
+    if on.weekday() >= 5:
+        return False
+    return _probe_market_open_by_history_day(on.isoformat())
+
+
 def add_vn_trading_days(start_date: date, trading_days: int, holidays: frozenset[date] | set[date]) -> date:
     """
     Add `trading_days` VN trading days (skips weekends and dates in `holidays`).
@@ -175,5 +219,18 @@ def add_vn_trading_days(start_date: date, trading_days: int, holidays: frozenset
     while remain > 0:
         cursor += timedelta(days=1)
         if is_vn_market_trading_day(cursor, holidays):
+            remain -= 1
+    return cursor
+
+
+def add_vn_trading_days_live(start_date: date, trading_days: int) -> date:
+    """
+    Add trading days using live market-day probe (no static holiday set).
+    """
+    remain = max(0, int(trading_days))
+    cursor = start_date
+    while remain > 0:
+        cursor += timedelta(days=1)
+        if is_vn_market_trading_day_live(cursor):
             remain -= 1
     return cursor

@@ -10,6 +10,8 @@ from app.schemas.auto_trading import (
     AutoTradingConfigData,
     DemoAccountResponseData,
     DemoSessionOverviewData,
+    DemoTpSlotPctUpdateRequest,
+    DemoExitSymbolLevelsUpsertRequest,
     DemoPositionSnapshot,
     DemoStrategyCashTransferData,
     DemoStrategyCashTransferRequest,
@@ -24,6 +26,9 @@ from app.services.demo_trading_service import (
     get_demo_account_snapshot,
     get_demo_session_overview,
     transfer_demo_strategy_cash_from_unallocated,
+    upsert_demo_session_tp_slot_pct,
+    upsert_demo_symbol_exit_levels,
+    delete_demo_symbol_exit_levels,
     list_demo_sessions,
     normalize_demo_session_id,
 )
@@ -127,6 +132,8 @@ def post_demo_trade(
             raise HTTPException(status_code=400, detail="Insufficient cash for this buy") from exc
         if code == "INSUFFICIENT_POSITION":
             raise HTTPException(status_code=400, detail="Cannot sell more than open position") from exc
+        if code == "INSUFFICIENT_SETTLED_POSITION":
+            raise HTTPException(status_code=400, detail="Cannot sell before T+2 settlement in VN market") from exc
         raise HTTPException(status_code=400, detail="Demo trade rejected") from exc
     except HTTPException:
         raise
@@ -244,3 +251,52 @@ def post_demo_strategy_cash_transfer(
     except Exception as exc:
         logger.exception("auto_trading.demo_strategy_cash_transfer_failed", extra={"session_id": session_id})
         raise HTTPException(status_code=500, detail="Failed to transfer strategy cash") from exc
+
+
+@router.post("/demo/exit-config/tp-slot")
+def post_demo_tp_slot_pct(
+    body: DemoTpSlotPctUpdateRequest,
+    x_demo_session_id: Annotated[Optional[str], Header(alias="X-Demo-Session-Id")] = None,
+) -> dict[str, Any]:
+    session_id = _resolve_demo_session_id(x_demo_session_id)
+    try:
+        next_pct = upsert_demo_session_tp_slot_pct(session_id, body.tp_slot_pct)
+        return {"success": True, "data": {"session_id": session_id, "tp_slot_pct": float(next_pct)}}
+    except Exception as exc:
+        logger.exception("auto_trading.demo_tp_slot_pct_update_failed", extra={"session_id": session_id})
+        raise HTTPException(status_code=500, detail="Failed to update demo tp slot percentage") from exc
+
+
+@router.post("/demo/exit-config/symbol-levels")
+def post_demo_symbol_exit_levels(
+    body: DemoExitSymbolLevelsUpsertRequest,
+    x_demo_session_id: Annotated[Optional[str], Header(alias="X-Demo-Session-Id")] = None,
+) -> dict[str, Any]:
+    session_id = _resolve_demo_session_id(x_demo_session_id)
+    try:
+        upsert_demo_symbol_exit_levels(
+            session_id=session_id,
+            symbol=body.symbol,
+            take_profit_price=body.take_profit_price,
+            stoploss_price=body.stoploss_price,
+        )
+        return {"success": True, "data": {"session_id": session_id, "symbol": body.symbol}}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("auto_trading.demo_symbol_exit_levels_upsert_failed", extra={"session_id": session_id})
+        raise HTTPException(status_code=500, detail="Failed to update demo symbol exit levels") from exc
+
+
+@router.delete("/demo/exit-config/symbol-levels/{symbol}")
+def delete_demo_symbol_exit_levels_api(
+    symbol: str,
+    x_demo_session_id: Annotated[Optional[str], Header(alias="X-Demo-Session-Id")] = None,
+) -> dict[str, Any]:
+    session_id = _resolve_demo_session_id(x_demo_session_id)
+    try:
+        delete_demo_symbol_exit_levels(session_id=session_id, symbol=symbol)
+        return {"success": True, "data": {"session_id": session_id, "symbol": str(symbol).strip().upper()}}
+    except Exception as exc:
+        logger.exception("auto_trading.demo_symbol_exit_levels_delete_failed", extra={"session_id": session_id})
+        raise HTTPException(status_code=500, detail="Failed to clear demo symbol exit levels") from exc

@@ -10,11 +10,11 @@ from psycopg import connect
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
-from app.core.config import get_vn_market_holiday_dates, settings
+from app.core.config import settings
 from app.services.execution import get_execution_adapter
 from app.services.execution.broker_status import build_dnse_reconcile_metadata_snapshot
 from app.services.execution.types import OrderExecutionContext
-from app.services.vn_market_holiday_calendar import add_vn_trading_days, vn_market_local_today
+from app.services.vn_market_holiday_calendar import add_vn_trading_days_live, vn_market_local_today
 
 logger = logging.getLogger(__name__)
 _trading_core_tables_ready = False
@@ -656,7 +656,7 @@ def process_order(order_id: str) -> dict[str, Any]:
                     final_reason = "sell_fifo_consume_failed"
         else:
             buy_trade_date = _settlement_effective_today()
-            settle_date = add_vn_trading_days(buy_trade_date, 2, get_vn_market_holiday_dates())
+            settle_date = add_vn_trading_days_live(buy_trade_date, 2)
             with conn.cursor() as cur:
                 cur.execute(
                     """

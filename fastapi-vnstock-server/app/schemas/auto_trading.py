@@ -113,6 +113,12 @@ class DemoHoldingOverviewItem(BaseModel):
     quantity: int = Field(..., ge=0)
     average_buy_price: float = Field(..., ge=0)
     position_value: float = Field(..., ge=0)
+    take_profit_price: float | None = Field(default=None, gt=0)
+    stoploss_price: float | None = Field(default=None, gt=0)
+    settled_quantity: int = Field(default=0, ge=0)
+    pending_settlement_quantity: int = Field(default=0, ge=0)
+    next_settle_date: datetime | None = None
+    is_t2_sell_allowed: bool = False
     opened_at: datetime
 
 
@@ -138,6 +144,7 @@ class DemoSessionOverviewData(BaseModel):
     trade_count: int = Field(..., ge=0)
     holdings_count: int = Field(..., ge=0)
     holdings: list[DemoHoldingOverviewItem] = Field(default_factory=list)
+    tp_slot_pct: float = Field(default=0.3, ge=0.1, le=0.9)
     strategy_cash_overview: list[DemoStrategyCashOverviewItem] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
@@ -153,3 +160,21 @@ class DemoStrategyCashTransferData(BaseModel):
     session_id: str
     transferred_to: Literal["SHORT_TERM", "MAIL_SIGNAL", "UNALLOCATED"]
     amount_vnd: float = Field(..., gt=0.0)
+
+
+class DemoTpSlotPctUpdateRequest(BaseModel):
+    tp_slot_pct: float = Field(..., ge=0.1, le=0.9)
+
+
+class DemoExitSymbolLevelsUpsertRequest(BaseModel):
+    symbol: str = Field(..., min_length=1, max_length=20)
+    take_profit_price: float = Field(..., gt=0.0)
+    stoploss_price: float = Field(..., gt=0.0)
+
+    @field_validator("symbol")
+    @classmethod
+    def normalize_symbol(cls, value: str) -> str:
+        cleaned = value.strip().upper()
+        if not cleaned.replace("-", "").isalnum():
+            raise ValueError("symbol must be alphanumeric (hyphen allowed)")
+        return cleaned

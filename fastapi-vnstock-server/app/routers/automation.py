@@ -32,6 +32,7 @@ from app.services.automation_scheduler_service import (
     get_automation_scheduler_status,
     get_persisted_scheduler_states,
     get_real_scan_only_scheduler_status,
+    run_short_term_post_close_refresh_once,
     set_automation_scheduler_demo_session_id,
     set_automation_scheduler_enabled,
     set_real_scan_only_scheduler_enabled,
@@ -54,6 +55,7 @@ from app.services.mail_signal_scheduler_service import (
     get_latest_mail_signal_entry_run,
     get_recent_mail_signal_entry_runs,
     get_today_mail_signals,
+    run_mail_signal_pipeline,
     run_prev_day_entry_auto_trading_once,
 )
 
@@ -331,6 +333,19 @@ def get_short_term_cache_eligible(
         raise HTTPException(status_code=500, detail=f"Failed to read short-term cache eligible rows: {exc}") from exc
 
 
+@router.post("/short-term/post-close-refresh/run-once")
+def post_short_term_post_close_refresh_run_once() -> dict[str, Any]:
+    """
+    Manually trigger one post-close refresh cycle (the same logic as 16:00 task).
+    """
+    try:
+        raw = run_short_term_post_close_refresh_once()
+        return {"success": True, "data": raw}
+    except Exception as exc:
+        logger.exception("automation.short_term_post_close_refresh_run_once_failed")
+        raise HTTPException(status_code=500, detail=f"Failed to run post-close refresh once: {exc}") from exc
+
+
 @router.get("/scheduler/status", response_model=SchedulerStatusResponse)
 def get_scheduler_status(account_mode: Literal["REAL", "DEMO"] = Query(default="DEMO")) -> SchedulerStatusResponse:
     try:
@@ -425,6 +440,19 @@ def get_mail_signals_latest() -> dict[str, Any]:
     except Exception as exc:
         logger.exception("automation.mail_signals_latest_failed")
         raise HTTPException(status_code=500, detail=f"Failed to read latest mail signals: {exc}") from exc
+
+
+@router.post("/mail-signals/run-once")
+def post_mail_signals_run_once() -> dict[str, Any]:
+    """
+    Manually trigger one mail->Claude signal ingestion run and persist into Redis.
+    """
+    try:
+        raw = run_mail_signal_pipeline()
+        return {"success": True, "data": raw}
+    except Exception as exc:
+        logger.exception("automation.mail_signals_run_once_failed")
+        raise HTTPException(status_code=500, detail=f"Failed to run mail signals once: {exc}") from exc
 
 
 @router.get("/mail-signals/entry-run/latest")
