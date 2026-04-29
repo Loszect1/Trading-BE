@@ -18,7 +18,9 @@ from app.services.short_term_scan_schedule import (
     is_instant_on_short_term_scan_grid,
     next_run_datetimes,
 )
+from app.services.redis_cache import RedisCacheService
 from app.services.signal_engine_service import (
+    run_short_term_scan_batch,
     refresh_short_term_liquidity_cache_from_db,
     scan_and_persist_symbol_news_from_liquidity_cache,
     warm_daily_volume_for_saved_symbols,
@@ -29,17 +31,92 @@ logger = logging.getLogger(__name__)
 
 AccountMode = Literal["REAL", "DEMO"]
 _ACCOUNT_MODES: tuple[AccountMode, ...] = ("REAL", "DEMO")
-_BACKEND_SCHEDULER_SUPPORTED_MODES: tuple[AccountMode, ...] = ("DEMO",)
+# Backend internal short-term scheduler must support REAL as well so
+# that toggling "auto schedule" for REAL actually triggers the same grid loop as DEMO.
+_BACKEND_SCHEDULER_SUPPORTED_MODES: tuple[AccountMode, ...] = ("REAL", "DEMO")
 # Internal scheduler: one grid tick runs three persisted cycles in strict board order.
 _SHORT_TERM_SCHEDULER_EXCHANGE_SCOPES: tuple[str, ...] = ("HOSE", "HNX", "UPCOM")
 _loop_tasks: dict[AccountMode, asyncio.Task | None] = {mode: None for mode in _ACCOUNT_MODES}
 _cache_warm_task: asyncio.Task | None = None
 _last_cache_warm_local_date: date | None = None
 _post_close_refresh_run_markers: set[str] = set()
+
+# REAL scan-only scheduler persistence + execution.
+_REAL_RECOMMENDATIONS_REDIS_KEY = "signals:real:short-term:recommendations:latest"
+_REAL_RECOMMENDATIONS_TTL_SECONDS = 86_400
+_real_scan_only_loop_task: asyncio.Task | None = None
+_real_scan_only_last_slot_marker: str | None = None
+_runtime_real_scan_only_enabled: bool = False
+_redis_cache = RedisCacheService()
 _runtime_enabled: dict[AccountMode, bool] = {
     mode: bool(settings.automation_short_term_scheduler_enabled) for mode in _ACCOUNT_MODES
 }
 _active_demo_session_id: str | None = None
+
+
+def _to_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _normalize_real_recommendation_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        entry = _to_float(row.get("entry"))
+        take_profit = _to_float(row.get("take_profit"))
+        stop_loss = _to_float(row.get("stop_loss"))
+        confidence = _to_float(row.get("confidence"))
+        if not symbol or entry is None or take_profit is None or stop_loss is None:
+            continue
+        out.append(
+            {
+                "symbol": symbol,
+                "entry": entry,
+                "take_profit": take_profit,
+                "stop_loss": stop_loss,
+                "confidence": max(0.0, min(100.0, confidence if confidence is not None else 50.0)),
+                "reason": str(row.get("reason") or "").strip(),
+            }
+        )
+    return out
+
+
+def _real_scan_only_slot_marker(now_local: datetime) -> str:
+    # Unique per VN slot grid boundary.
+    return f"{now_local.date().isoformat()}-{now_local.hour:02d}:{now_local.minute:02d}"
+
+
+def _run_real_scan_only_and_persist() -> None:
+    scan_result = run_short_term_scan_batch(limit_symbols=0, exchange_scope="ALL")
+    raw_signals = scan_result.get("signals") or []
+    recommendations: list[dict[str, Any]] = []
+    for signal in raw_signals:
+        if not isinstance(signal, dict) or str(signal.get("action") or "").upper() != "BUY":
+            continue
+        recommendations.append(
+            {
+                "symbol": str(signal.get("symbol") or "").strip().upper(),
+                "entry": signal.get("entry_price"),
+                "take_profit": signal.get("take_profit_price"),
+                "stop_loss": signal.get("stoploss_price"),
+                "confidence": signal.get("confidence"),
+                "reason": signal.get("reason"),
+            }
+        )
+
+    normalized = _normalize_real_recommendation_rows(recommendations)
+    payload = {
+        "generated_at": scan_result.get("scan_finished_at"),
+        "exchange_scope": "ALL",
+        "limit_symbols": 0,
+        "scanned": int(scan_result.get("scanned") or 0),
+        "recommendations": normalized,
+        "count": len(normalized),
+    }
+    _redis_cache.set_json(_REAL_RECOMMENDATIONS_REDIS_KEY, payload, ttl_seconds=_REAL_RECOMMENDATIONS_TTL_SECONDS)
 
 
 def _is_backend_scheduler_supported(account_mode: AccountMode) -> bool:
@@ -206,6 +283,61 @@ def _ensure_automation_scheduler_demo_context_table() -> None:
     with connect(settings.database_url) as conn:
         with conn.cursor() as cur:
             cur.execute(query)
+        conn.commit()
+
+
+def _ensure_real_scan_only_state_table() -> None:
+    query = """
+    CREATE TABLE IF NOT EXISTS automation_real_scan_only_state (
+        id SMALLINT PRIMARY KEY CHECK (id = 1),
+        enabled BOOLEAN NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """
+    with connect(settings.database_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(query)
+        conn.commit()
+
+
+def _load_runtime_real_scan_only_enabled_from_db() -> None:
+    global _runtime_real_scan_only_enabled
+    _ensure_real_scan_only_state_table()
+    with connect(settings.database_url, row_factory=dict_row) as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                INSERT INTO automation_real_scan_only_state (id, enabled)
+                VALUES (1, FALSE)
+                ON CONFLICT (id) DO NOTHING
+                """
+            )
+            cur.execute(
+                """
+                SELECT enabled
+                FROM automation_real_scan_only_state
+                WHERE id = 1
+                """
+            )
+            row = cur.fetchone() or {}
+        conn.commit()
+
+    _runtime_real_scan_only_enabled = bool(row.get("enabled"))
+
+
+def _persist_runtime_real_scan_only_enabled(enabled: bool) -> None:
+    _ensure_real_scan_only_state_table()
+    with connect(settings.database_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO automation_real_scan_only_state (id, enabled)
+                VALUES (1, %(enabled)s)
+                ON CONFLICT (id)
+                DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = NOW()
+                """,
+                {"enabled": bool(enabled)},
+            )
         conn.commit()
 
 
@@ -573,6 +705,102 @@ async def _cache_warm_loop() -> None:
         await asyncio.sleep(poll_seconds)
 
 
+async def _real_scan_only_scheduler_loop() -> None:
+    poll_seconds = settings.automation_short_term_scheduler_poll_seconds
+    logger.info(
+        "real_scan_only_scheduler_started",
+        extra={"poll_seconds": poll_seconds, "timezone": settings.short_term_scan_timezone},
+    )
+    while True:
+        try:
+            if not bool(_runtime_real_scan_only_enabled):
+                logger.info("real_scan_only_scheduler_disabled_by_state")
+                return
+
+            grid = _scheduler_grid_snapshot()
+            if bool(grid["on_grid"]):
+                now_local = grid["now_local"]
+                if isinstance(now_local, datetime):
+                    marker = _real_scan_only_slot_marker(now_local)
+                    if marker != _real_scan_only_last_slot_marker:
+                        await asyncio.to_thread(_run_real_scan_only_and_persist)
+                        _real_scan_only_last_slot_marker = marker
+        except Exception as exc:
+            logger.warning(
+                "real_scan_only_scheduler_tick_failed",
+                extra={"error": str(exc)},
+            )
+        await asyncio.sleep(poll_seconds)
+
+
+async def _start_real_scan_only_scheduler() -> None:
+    global _real_scan_only_loop_task
+    if not bool(_runtime_real_scan_only_enabled):
+        return
+    if _real_scan_only_loop_task and not _real_scan_only_loop_task.done():
+        return
+    _real_scan_only_loop_task = asyncio.create_task(
+        _real_scan_only_scheduler_loop(),
+        name="real-scan-only-scheduler",
+    )
+    logger.warning("real_scan_only_scheduler_task_started")
+
+
+async def _stop_real_scan_only_scheduler() -> None:
+    global _real_scan_only_loop_task
+    if _real_scan_only_loop_task and not _real_scan_only_loop_task.done():
+        _real_scan_only_loop_task.cancel()
+        try:
+            await _real_scan_only_loop_task
+        except asyncio.CancelledError:
+            pass
+    _real_scan_only_loop_task = None
+    _real_scan_only_last_slot_marker = None
+    logger.warning("real_scan_only_scheduler_task_stopped")
+
+
+def get_real_scan_only_scheduler_status() -> dict:
+    running = _real_scan_only_loop_task is not None and not _real_scan_only_loop_task.done()
+    grid = _scheduler_grid_snapshot()
+    return {
+        "account_mode": "REAL",
+        "mode": "SCAN_ONLY",
+        "enabled": bool(_runtime_real_scan_only_enabled),
+        "running": running,
+        "poll_seconds": settings.automation_short_term_scheduler_poll_seconds,
+        "interval_minutes": settings.short_term_scan_interval_minutes,
+        "timezone": settings.short_term_scan_timezone,
+        "on_grid": bool(grid["on_grid"]),
+        "now_local": grid["now_local"],
+        "next_grid_run_at": grid["next_grid_run_at"],
+        "active_demo_session_id": None,
+    }
+
+
+async def set_real_scan_only_scheduler_enabled(enabled: bool) -> dict:
+    global _runtime_real_scan_only_enabled
+    enabled = bool(enabled)
+
+    # Mutual exclusivity: scan-only scheduler vs production scheduler for REAL.
+    if enabled:
+        _runtime_real_scan_only_enabled = True
+        _persist_runtime_real_scan_only_enabled(True)
+        if _runtime_enabled.get("REAL"):
+            _runtime_enabled["REAL"] = False
+            _persist_runtime_enabled("REAL", False)
+            await _stop_mode_scheduler("REAL")
+    else:
+        _runtime_real_scan_only_enabled = False
+        _persist_runtime_real_scan_only_enabled(False)
+
+    if enabled:
+        await _start_real_scan_only_scheduler()
+    else:
+        await _stop_real_scan_only_scheduler()
+
+    return get_real_scan_only_scheduler_status()
+
+
 async def start_automation_scheduler() -> None:
     try:
         _load_runtime_enabled_from_db()
@@ -582,6 +810,18 @@ async def start_automation_scheduler() -> None:
         _load_active_demo_session_from_db()
     except Exception as exc:
         logger.warning("short_term_scheduler_demo_context_load_failed", extra={"error": str(exc)})
+
+    try:
+        _load_runtime_real_scan_only_enabled_from_db()
+    except Exception as exc:
+        logger.warning("real_scan_only_scheduler_state_load_failed", extra={"error": str(exc)})
+
+    # Scan-only mode takes precedence over production mode for REAL.
+    if bool(_runtime_real_scan_only_enabled):
+        if _runtime_enabled.get("REAL"):
+            _runtime_enabled["REAL"] = False
+            _persist_runtime_enabled("REAL", False)
+        await _stop_mode_scheduler("REAL")
 
     for mode in _ACCOUNT_MODES:
         if not _is_backend_scheduler_supported(mode):
@@ -594,12 +834,17 @@ async def start_automation_scheduler() -> None:
             await _start_mode_scheduler(mode)
         else:
             logger.info("short_term_scheduler_disabled", extra={"account_mode": mode})
+
+    if bool(_runtime_real_scan_only_enabled):
+        await _start_real_scan_only_scheduler()
+
     await _start_cache_warm_scheduler()
 
 
 async def stop_automation_scheduler() -> None:
     for mode in _ACCOUNT_MODES:
         await _stop_mode_scheduler(mode)
+    await _stop_real_scan_only_scheduler()
     await _stop_cache_warm_scheduler()
 
 
@@ -679,6 +924,8 @@ def get_automation_scheduler_status(account_mode: AccountMode) -> dict:
 
 
 async def set_automation_scheduler_enabled(account_mode: AccountMode, enabled: bool) -> dict:
+    global _runtime_real_scan_only_enabled
+
     if not _is_backend_scheduler_supported(account_mode):
         _runtime_enabled[account_mode] = False
         _persist_runtime_enabled(account_mode, False)
@@ -688,6 +935,13 @@ async def set_automation_scheduler_enabled(account_mode: AccountMode, enabled: b
             extra={"account_mode": account_mode, "requested_enabled": bool(enabled)},
         )
         return get_automation_scheduler_status(account_mode)
+
+    # Mutual exclusivity: enabling production scheduler for REAL disables scan-only.
+    if account_mode == "REAL" and bool(enabled) and bool(_runtime_real_scan_only_enabled):
+        _runtime_real_scan_only_enabled = False
+        _persist_runtime_real_scan_only_enabled(False)
+        await _stop_real_scan_only_scheduler()
+
     _runtime_enabled[account_mode] = bool(enabled)
     _persist_runtime_enabled(account_mode, _runtime_enabled[account_mode])
     logger.warning(

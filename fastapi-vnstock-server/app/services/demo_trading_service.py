@@ -11,10 +11,42 @@ from psycopg.rows import dict_row
 
 from app.core.config import settings
 from app.schemas.auto_trading import DEMO_INITIAL_BALANCE_VND, DemoTradeRequest
+from app.services.vnstock_api_service import VNStockApiService
 
 
 def _utc_now() -> datetime:
     return datetime.now(tz=timezone.utc)
+
+
+_vnstock_api = VNStockApiService()
+
+
+def _last_daily_close_mark(symbol: str) -> float | None:
+    try:
+        rows = _vnstock_api.call_quote(
+            "history",
+            source="VCI",
+            symbol=symbol,
+            method_kwargs={"interval": "1D", "count_back": 3},
+        )
+    except Exception:
+        return None
+    if not isinstance(rows, list):
+        return None
+    for row in reversed(rows):
+        if not isinstance(row, dict):
+            continue
+        close_raw = row.get("close")
+        try:
+            close = float(close_raw)
+        except (TypeError, ValueError):
+            continue
+        # VN market convention: some sources return price in "nghin dong" (e.g. 42.65 -> 42,650 VND).
+        if 0 < close < 1000:
+            close *= 1000.0
+        if close > 0:
+            return close
+    return None
 
 
 _SESSION_ID_PATTERN = re.compile(r"^[\w\-]{1,128}$")
@@ -1027,20 +1059,26 @@ def get_demo_session_overview(session_id: str) -> dict[str, Any]:
     opened_at_by_symbol = {str(row["symbol"]).strip().upper(): row["opened_at"] for row in holdings_opened_rows}
     fallback_opened_at = session_row["created_at"]
     core_positions_rows = _get_demo_positions_from_core(session_id)
-    holdings = [
-        {
-            "symbol": str(row["symbol"]),
-            "quantity": int(row["total_qty"]),
-            "average_buy_price": float(row["avg_price"]),
-            "position_value": float(row["total_qty"]) * float(row["avg_price"]),
-            "opened_at": opened_at_by_symbol.get(str(row["symbol"]).strip().upper(), fallback_opened_at),
-        }
-        for row in core_positions_rows
-    ]
-    stock_value = sum(
-        float(item.get("quantity") or 0) * float(item.get("average_buy_price") or 0.0)
-        for item in holdings
-    )
+    holdings: list[dict[str, Any]] = []
+    stock_value = 0.0
+    for row in core_positions_rows:
+        symbol = str(row["symbol"])
+        quantity = int(row["total_qty"])
+        average_buy_price = float(row["avg_price"])
+        # Mark-to-market for overview totals: use last daily close, fallback to cost basis.
+        mark = _last_daily_close_mark(symbol)
+        used_price = mark if mark is not None and mark > 0 else average_buy_price
+        position_value = float(quantity) * float(used_price)
+        stock_value += position_value
+        holdings.append(
+            {
+                "symbol": symbol,
+                "quantity": quantity,
+                "average_buy_price": average_buy_price,
+                "position_value": position_value,
+                "opened_at": opened_at_by_symbol.get(symbol.strip().upper(), fallback_opened_at),
+            }
+        )
     holdings_count = len(holdings)
     trade_count = int(session_row.get("trade_count") or 0)
     cash_balance = _get_demo_cash_balance_from_core(session_id)

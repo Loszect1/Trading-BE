@@ -11,6 +11,7 @@ from datetime import date, datetime, timedelta, timezone
 from statistics import mean
 from typing import Any, Literal
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from psycopg import connect
 from psycopg.rows import dict_row
@@ -2198,7 +2199,10 @@ def refresh_short_term_liquidity_cache_from_db(days: int = 30, exchange_scope: s
     normalized_scope = _normalize_exchange_scope(exchange_scope)
     exchanges = _resolve_exchange_list(normalized_scope)
     safe_days = max(5, min(int(days), int(settings.market_symbol_daily_volume_retention_days)))
-    cutoff_date = date.today() - timedelta(days=safe_days - 1)
+    # Use app timezone so "today" matches scheduler triggers (e.g. Asia/Ho_Chi_Minh).
+    tz = ZoneInfo(settings.short_term_scan_timezone)
+    today_local = datetime.now(tz=tz).date()
+    cutoff_date = today_local - timedelta(days=safe_days - 1)
 
     with connect(settings.database_url, row_factory=dict_row) as conn:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -2226,15 +2230,25 @@ def refresh_short_term_liquidity_cache_from_db(days: int = 30, exchange_scope: s
         for exchange in exchanges:
             deleted_old_keys += _redis_cache.delete_keys_by_pattern(f"scan:liquidity:{exchange}:*")
 
-    volume_by_symbol: dict[str, list[float]] = defaultdict(list)
+    # Keep (trading_date, volume) so we can decide whether "latest_vol" is truly today.
+    volume_by_symbol: dict[str, list[tuple[date, float]]] = defaultdict(list)
     exchange_by_symbol: dict[str, str] = {}
     for row in rows:
         symbol = str(row.get("symbol", "")).strip().upper()
         exchange = str(row.get("exchange", "")).strip().upper() or "UNKNOWN"
         volume = _to_float(row.get("volume"))
+        trading_date = row.get("trading_date")
         if not symbol:
             continue
-        volume_by_symbol[symbol].append(volume)
+        if not isinstance(trading_date, date):
+            # Be defensive: psycopg usually returns DATE as datetime.date
+            if isinstance(trading_date, datetime):
+                trading_date = trading_date.date()
+            else:
+                continue
+        if volume is None:
+            continue
+        volume_by_symbol[symbol].append((trading_date, float(volume)))
         exchange_by_symbol[symbol] = exchange
 
     scanned = 0
@@ -2244,21 +2258,26 @@ def refresh_short_term_liquidity_cache_from_db(days: int = 30, exchange_scope: s
     no_volume_spike = 0
     skipped_not_spike = 0
 
-    for symbol, volumes in volume_by_symbol.items():
-        # Need at least latest + 1 baseline point.
-        if len(volumes) < 2:
-            skipped_insufficient_data += 1
-            continue
-        latest_vol = float(volumes[0])
-        baseline_slice = [float(v) for v in volumes[1:] if float(v) >= 0]
+    for symbol, dated_volumes in volume_by_symbol.items():
+        # Eligibility uses "today" as the latest point.
+        # If we don't have today's volume in DB, latest_vol(today)=0 (do not use stale latest).
+        baseline_slice: list[float] = []
+        latest_vol_today = 0.0
+        for trading_date, vol in dated_volumes:
+            if trading_date == today_local:
+                latest_vol_today = float(vol)
+            else:
+                baseline_slice.append(float(vol))
+
+        # Need at least 1 baseline point to compute spike ratio.
         if not baseline_slice:
             skipped_insufficient_data += 1
             continue
 
         scanned += 1
         baseline_vol = float(mean(baseline_slice))
-        spike = (latest_vol / baseline_vol) if baseline_vol > 0 else 0.0
-        eligible_liquidity = _is_short_term_liquid_enough(baseline_vol, latest_vol)
+        spike = (latest_vol_today / baseline_vol) if baseline_vol > 0 else 0.0
+        eligible_liquidity = _is_short_term_liquid_enough(baseline_vol, latest_vol_today)
         eligible_spike = _is_short_term_volume_spike(spike)
         if not eligible_spike:
             skipped_not_spike += 1
@@ -2270,7 +2289,7 @@ def refresh_short_term_liquidity_cache_from_db(days: int = 30, exchange_scope: s
             symbol=symbol,
             exchange=exchange_by_symbol.get(symbol, "UNKNOWN"),
             baseline_vol=baseline_vol,
-            latest_vol=latest_vol,
+            latest_vol=latest_vol_today,
             spike_ratio=spike,
             eligible_liquidity=eligible_liquidity,
             eligible_spike=eligible_spike,

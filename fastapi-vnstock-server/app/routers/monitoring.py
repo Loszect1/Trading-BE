@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Literal, Optional, Annotated
 
-from fastapi import APIRouter, Body, HTTPException, Query
+from fastapi import APIRouter, Body, HTTPException, Query, Header
 
 from app.schemas.monitoring import KillSwitchRequest, MonitoringEvaluateRequest
 from app.services.monitoring_service import (
@@ -24,10 +24,19 @@ def monitoring_summary(
         description="When set, returns merged operations dashboard (trading summary + KPI + health). "
         "When omitted, returns aggregate for both modes (legacy).",
     ),
+    sub_account: Optional[str] = Query(
+        default=None,
+        description="Optional DNSE sub-account for REAL KPI server-side valuation.",
+    ),
+    x_dnse_access_token: Annotated[Optional[str], Header(alias="X-Dnse-Access-Token")] = None,
 ) -> dict:
     try:
         if account_mode is not None:
-            data = build_account_monitoring_dashboard(str(account_mode).upper())
+            data = build_account_monitoring_dashboard(
+                str(account_mode).upper(),
+                sub_account=sub_account,
+                dnse_access_token=x_dnse_access_token,
+            )
             data["recent_alerts"] = list_recent_alerts(limit=30)
             return {"success": True, "data": data}
         summary = get_monitoring_summary_all()

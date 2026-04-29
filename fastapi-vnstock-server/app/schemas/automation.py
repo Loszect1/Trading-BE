@@ -93,6 +93,10 @@ class SchedulerToggleRequest(BaseModel):
     enabled: bool
 
 
+class RealScanOnlyToggleRequest(BaseModel):
+    enabled: bool
+
+
 class SchedulerDemoSessionRequest(BaseModel):
     demo_session_id: str | None = Field(
         default=None,

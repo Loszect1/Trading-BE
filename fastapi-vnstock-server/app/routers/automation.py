@@ -13,6 +13,7 @@ from app.schemas.automation import (
     MailSignalEntryRunOnceRequest,
     RealRecommendationBuyRequest,
     RealRecommendationScanRequest,
+    RealScanOnlyToggleRequest,
     SchedulerDemoSessionRequest,
     SchedulerStateRow,
     SchedulerStatusResponse,
@@ -30,8 +31,10 @@ from app.services.automation_scheduler_service import (
     get_active_scheduler_demo_session_id,
     get_automation_scheduler_status,
     get_persisted_scheduler_states,
+    get_real_scan_only_scheduler_status,
     set_automation_scheduler_demo_session_id,
     set_automation_scheduler_enabled,
+    set_real_scan_only_scheduler_enabled,
 )
 from app.services.short_term_automation_service import (
     get_short_term_async_job,
@@ -380,6 +383,24 @@ def get_scheduler_state_rows() -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"Failed to read scheduler state rows: {exc}") from exc
 
 
+@router.get("/scheduler/real-scan-only/status")
+def get_real_scan_only_status() -> dict[str, Any]:
+    try:
+        return get_real_scan_only_scheduler_status()
+    except Exception as exc:
+        logger.exception("automation.real_scan_only_status_failed")
+        raise HTTPException(status_code=500, detail=f"Failed to read real scan-only status: {exc}") from exc
+
+
+@router.post("/scheduler/real-scan-only/toggle")
+async def post_real_scan_only_toggle(body: RealScanOnlyToggleRequest) -> dict[str, Any]:
+    try:
+        return await set_real_scan_only_scheduler_enabled(body.enabled)
+    except Exception as exc:
+        logger.exception("automation.real_scan_only_toggle_failed")
+        raise HTTPException(status_code=500, detail=f"Failed to toggle real scan-only scheduler: {exc}") from exc
+
+
 @router.get("/mail-signals/today")
 def get_mail_signals_today() -> dict[str, Any]:
     """
@@ -448,10 +469,21 @@ def post_mail_signals_entry_run_once(body: MailSignalEntryRunOnceRequest = MailS
                 1_000_000.0,
                 float(body.real_account_available_cash_vnd) * float(settings.strategy_alloc_mail_signal_pct),
             )
+        logger.warning(
+            "mail_signals_entry_run_once_requested",
+            extra={
+                "account_mode": body.account_mode,
+                "demo_session_id": body.demo_session_id,
+                "real_account_available_cash_vnd": body.real_account_available_cash_vnd,
+                "strategy_alloc_mail_signal_pct": float(settings.strategy_alloc_mail_signal_pct),
+                "effective_nav_vnd": effective_nav,
+            },
+        )
         raw = run_prev_day_entry_auto_trading_once(
             account_mode_override=body.account_mode,
             demo_session_id_override=body.demo_session_id,
             nav_override=effective_nav,
+            real_account_available_cash_vnd=body.real_account_available_cash_vnd,
         )
         return {"success": True, "data": raw}
     except Exception as exc:

@@ -342,6 +342,7 @@ def run_prev_day_entry_auto_trading_once(
     account_mode_override: str | None = None,
     demo_session_id_override: str | None = None,
     nav_override: float | None = None,
+    real_account_available_cash_vnd: float | None = None,
 ) -> dict[str, Any]:
     tz = ZoneInfo(settings.mail_signal_scheduler_timezone)
     now_local = datetime.now(tz=tz)
@@ -461,6 +462,10 @@ def run_prev_day_entry_auto_trading_once(
             "source_key": prev_key,
             "account_mode": account_mode,
             "demo_session_id": active_demo_session_id if account_mode == "DEMO" else None,
+            "real_account_available_cash_vnd": float(real_account_available_cash_vnd)
+            if real_account_available_cash_vnd is not None
+            else None,
+            "effective_nav_vnd": float(nav),
             "scanned": len(raw_items),
             "executed": executed,
             "skipped": skipped,

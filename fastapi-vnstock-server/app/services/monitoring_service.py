@@ -16,12 +16,81 @@ from app.services.signal_engine_service import ensure_signals_table, get_signal_
 from app.services.short_term_automation_service import ensure_short_term_automation_runs_table
 from app.services.trading_core_service import get_kill_switch, get_monitoring_summary, get_positions, log_risk_event
 from app.services.vnstock_api_service import VNStockApiService
+from vnstock.connector.dnse import Trade
 
 _vnstock_api_service = VNStockApiService()
 
 
 def _utc_now() -> datetime:
     return datetime.now(tz=timezone.utc)
+
+
+def _normalize_dnse_records(data: Any) -> list[dict[str, Any]]:
+    if data is None:
+        return []
+    if hasattr(data, "to_dict"):
+        try:
+            converted = data.to_dict(orient="records")
+        except TypeError:
+            converted = data.to_dict()
+        if isinstance(converted, list):
+            return [row for row in converted if isinstance(row, dict)]
+        if isinstance(converted, dict):
+            return [converted]
+        return []
+    if isinstance(data, list):
+        return [row for row in data if isinstance(row, dict)]
+    if isinstance(data, dict):
+        return [data]
+    return []
+
+
+def _to_finite_number(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except Exception:
+        return None
+    if parsed != parsed:  # NaN
+        return None
+    if parsed in {float("inf"), float("-inf")}:
+        return None
+    return parsed
+
+
+def _pick_first_finite_number(record: dict[str, Any], keys: list[str]) -> float | None:
+    for key in keys:
+        parsed = _to_finite_number(record.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _fetch_dnse_balance_row_for_sub_account(
+    sub_account: str,
+    dnse_access_token: str | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    sub = str(sub_account or "").strip()
+    if not sub:
+        return None, "missing_sub_account"
+    try:
+        token = str(dnse_access_token or "").strip()
+        trade = Trade()
+        if token:
+            trade.token = token
+        else:
+            username = str(settings.dnse_username or "").strip()
+            password = str(settings.dnse_password or "").strip()
+            if not username or not password:
+                return None, "missing_dnse_credentials"
+            login_token = trade.login(username, password)
+            if not login_token:
+                return None, "dnse_login_failed"
+        rows = _normalize_dnse_records(trade.account_balance(sub_account=sub))
+        if not rows:
+            return None, "dnse_balance_empty"
+        return rows[0], None
+    except Exception as exc:
+        return None, f"dnse_balance_error:{exc}"
 
 
 def ensure_monitoring_tables() -> None:
@@ -314,7 +383,11 @@ def compute_dashboard_trading_kpis(account_mode: str) -> dict[str, Any]:
     return out
 
 
-def build_account_monitoring_dashboard(account_mode: str) -> dict[str, Any]:
+def build_account_monitoring_dashboard(
+    account_mode: str,
+    sub_account: str | None = None,
+    dnse_access_token: str | None = None,
+) -> dict[str, Any]:
     mode = str(account_mode).upper()
     if mode not in {"REAL", "DEMO"}:
         raise ValueError("account_mode must be REAL or DEMO")
@@ -328,7 +401,47 @@ def build_account_monitoring_dashboard(account_mode: str) -> dict[str, Any]:
         kpis = compute_dashboard_trading_kpis(mode)
     except Exception as exc:
         kpis = {"kpis_error": str(exc)}
-    kpis["drawdown_proxy_pct"] = float(metrics.get("drawdown_proxy_pct") or 0.0)
+    if mode == "REAL" and str(sub_account or "").strip():
+        balance_row, balance_error = _fetch_dnse_balance_row_for_sub_account(
+            str(sub_account),
+            dnse_access_token=dnse_access_token,
+        )
+        if balance_row is not None:
+            cash = _pick_first_finite_number(
+                balance_row,
+                ["cashBalance", "cash_balance", "availableCash", "available_cash", "cash", "buyingPower", "buying_power"],
+            )
+            net_asset = _pick_first_finite_number(
+                balance_row,
+                ["netAssetValue", "net_asset_value", "totalAsset", "total_asset", "nav"],
+            )
+            unrealized = _pick_first_finite_number(
+                balance_row,
+                ["unrealizedPnl", "unrealized_pnl", "floatingPnl", "floating_pnl", "openPnl", "open_pnl"],
+            )
+            drawdown_pct = _pick_first_finite_number(
+                balance_row,
+                ["drawdownPct", "drawdown_pct", "maxDrawdownPct", "max_drawdown_pct"],
+            )
+            if cash is not None and net_asset is not None:
+                kpis["exposure_market_vnd"] = round(max(0.0, net_asset - cash), 6)
+            if net_asset is not None and unrealized is not None:
+                kpis["exposure_cost_basis_vnd"] = round(max(0.0, net_asset - unrealized), 6)
+            if unrealized is not None:
+                kpis["unrealized_pnl_vnd"] = round(unrealized, 6)
+            if drawdown_pct is not None:
+                kpis["drawdown_proxy_pct"] = round(drawdown_pct, 6)
+            kpis["valuation_method"] = "DNSE_SUB_ACCOUNT_BALANCE_RUNTIME"
+            kpis["valuation_notes"] = (
+                f"KPI REAL duoc tinh tu DNSE account-balance sub-account={str(sub_account).strip()} "
+                "tren server-side; field thieu se fallback ve monitoring core."
+            )
+        elif balance_error:
+            kpis["valuation_notes"] = (
+                f"Fallback monitoring core do khong doc duoc DNSE balance cho sub-account={str(sub_account).strip()}: {balance_error}"
+            )
+    if "drawdown_proxy_pct" not in kpis:
+        kpis["drawdown_proxy_pct"] = float(metrics.get("drawdown_proxy_pct") or 0.0)
     merged = dict(base)
     merged["operational_health"] = {"bot_status": bot_status, "kill_switch": kill, "metrics": metrics}
     merged["kpis"] = kpis
