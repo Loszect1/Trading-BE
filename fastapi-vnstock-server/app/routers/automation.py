@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import cast
 from typing import Any, Literal
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query
 from psycopg import connect
@@ -25,7 +27,7 @@ from app.schemas.automation import (
     TechnicalCycleRunRequest,
     TechnicalCycleRunResponse,
 )
-from app.services.signal_engine_service import run_short_term_scan_batch
+from app.services.signal_engine_service import extract_short_term_scan_diagnostics, run_short_term_scan_batch
 from app.services.trading_core_service import evaluate_risk, place_order
 from app.services.automation_scheduler_service import (
     get_active_scheduler_demo_session_id,
@@ -62,7 +64,31 @@ from app.services.mail_signal_scheduler_service import (
 logger = logging.getLogger(__name__)
 _redis_cache = RedisCacheService()
 _REAL_RECOMMENDATIONS_REDIS_KEY = "signals:real:short-term:recommendations:latest"
+_REAL_RECOMMENDATIONS_REDIS_LOG_PREFIX = "signals:real:short-term:recommendations:run:"
 _REAL_RECOMMENDATIONS_TTL_SECONDS = 86_400
+
+
+def _real_recommendations_run_key(now_local: datetime | None = None) -> str:
+    ts = now_local or datetime.now(tz=ZoneInfo(settings.short_term_scan_timezone))
+    return f"{_REAL_RECOMMENDATIONS_REDIS_LOG_PREFIX}{ts.strftime('%Y%m%d-%H%M%S')}"
+
+
+def _persist_real_recommendations_payload(payload: dict[str, Any]) -> None:
+    _redis_cache.set_json(_REAL_RECOMMENDATIONS_REDIS_KEY, payload, ttl_seconds=_REAL_RECOMMENDATIONS_TTL_SECONDS)
+    _redis_cache.set_json(
+        _real_recommendations_run_key(),
+        payload,
+        ttl_seconds=_REAL_RECOMMENDATIONS_TTL_SECONDS,
+    )
+
+
+def _extract_mail_signal_recommendations(mail_out: Any) -> list[dict[str, Any]]:
+    if not isinstance(mail_out, dict):
+        return []
+    raw_items = mail_out.get("items")
+    if not isinstance(raw_items, list):
+        return []
+    return _normalize_real_recommendation_rows(cast(list[dict[str, Any]], raw_items))
 
 
 def _to_float(value: Any) -> float | None:
@@ -105,6 +131,22 @@ def post_short_term_run_cycle(body: ShortTermCycleRunRequest = ShortTermCycleRun
     """
     payload = body
     try:
+        resolved_demo_session_id = payload.demo_session_id
+        if payload.account_mode == "DEMO":
+            active_scheduler_demo_session_id = get_active_scheduler_demo_session_id()
+            if active_scheduler_demo_session_id:
+                requested = str(payload.demo_session_id or "").strip()
+                active = str(active_scheduler_demo_session_id).strip()
+                if requested and requested != active:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "DEMO run-cycle must target active scheduler demo session only: "
+                            f"active={active}, requested={requested}"
+                        ),
+                    )
+                resolved_demo_session_id = active
+
         effective_nav = float(payload.nav)
         if payload.account_mode == "REAL" and payload.real_account_available_cash_vnd is not None:
             effective_nav = max(
@@ -122,7 +164,7 @@ def post_short_term_run_cycle(body: ShortTermCycleRunRequest = ShortTermCycleRun
                 risk_per_trade=payload.risk_per_trade,
                 max_daily_new_orders=payload.max_daily_new_orders,
                 enforce_vn_scan_schedule=payload.enforce_vn_scan_schedule,
-                demo_session_id=payload.demo_session_id,
+                demo_session_id=resolved_demo_session_id,
             )
             return ShortTermCycleRunResponse.model_validate(raw)
         raw: dict[str, Any] = run_short_term_production_cycle(
@@ -133,7 +175,7 @@ def post_short_term_run_cycle(body: ShortTermCycleRunRequest = ShortTermCycleRun
             risk_per_trade=payload.risk_per_trade,
             max_daily_new_orders=payload.max_daily_new_orders,
             enforce_vn_scan_schedule=payload.enforce_vn_scan_schedule,
-            demo_session_id=payload.demo_session_id,
+            demo_session_id=resolved_demo_session_id,
         )
         return ShortTermCycleRunResponse.model_validate(raw)
     except HTTPException:
@@ -523,8 +565,19 @@ def post_mail_signals_entry_run_once(body: MailSignalEntryRunOnceRequest = MailS
 def post_real_recommendations_scan(body: RealRecommendationScanRequest = RealRecommendationScanRequest()) -> dict[str, Any]:
     """
     Run REAL scan in recommendation-only mode (no execution) and cache latest picks in Redis.
+    Also refreshes Gmail mail-signal cache (same as mail pipeline) so Scan-only covers short-term + mail discovery.
     """
     try:
+        mail_recommendations: list[dict[str, Any]] = []
+        try:
+            mail_out = run_mail_signal_pipeline()
+            mail_recommendations = _extract_mail_signal_recommendations(mail_out)
+        except Exception as mail_exc:
+            logger.warning(
+                "automation.real_recommendations_scan_mail_pipeline_failed",
+                extra={"error": str(mail_exc)},
+            )
+
         scan_result = run_short_term_scan_batch(limit_symbols=body.limit_symbols, exchange_scope=body.exchange_scope)
         raw_signals = scan_result.get("signals") or []
         recommendations: list[dict[str, Any]] = []
@@ -549,8 +602,13 @@ def post_real_recommendations_scan(body: RealRecommendationScanRequest = RealRec
             "scanned": int(scan_result.get("scanned") or 0),
             "recommendations": recommendations,
             "count": len(recommendations),
+            "short_term_recommendations": recommendations,
+            "short_term_count": len(recommendations),
+            "mail_signal_recommendations": mail_recommendations,
+            "mail_signal_count": len(mail_recommendations),
+            "scan_diagnostics": extract_short_term_scan_diagnostics(scan_result),
         }
-        _redis_cache.set_json(_REAL_RECOMMENDATIONS_REDIS_KEY, payload, ttl_seconds=_REAL_RECOMMENDATIONS_TTL_SECONDS)
+        _persist_real_recommendations_payload(payload)
         return {"success": True, "data": payload}
     except Exception as exc:
         logger.exception("automation.real_recommendations_scan_failed")
@@ -564,18 +622,77 @@ def get_real_recommendations_latest() -> dict[str, Any]:
         recommendations = _normalize_real_recommendation_rows(
             cast(list[dict[str, Any]], row.get("recommendations") or [])
         )
+        short_term_recommendations = _normalize_real_recommendation_rows(
+            cast(list[dict[str, Any]], row.get("short_term_recommendations") or recommendations)
+        )
+        mail_signal_recommendations = _normalize_real_recommendation_rows(
+            cast(list[dict[str, Any]], row.get("mail_signal_recommendations") or [])
+        )
+        diag = row.get("scan_diagnostics")
+        if not isinstance(diag, dict):
+            diag = {}
         data = {
             "generated_at": row.get("generated_at"),
             "exchange_scope": row.get("exchange_scope"),
             "limit_symbols": row.get("limit_symbols"),
             "scanned": int(row.get("scanned") or 0),
-            "recommendations": recommendations,
-            "count": len(recommendations),
+            "recommendations": short_term_recommendations,
+            "count": len(short_term_recommendations),
+            "short_term_recommendations": short_term_recommendations,
+            "short_term_count": len(short_term_recommendations),
+            "mail_signal_recommendations": mail_signal_recommendations,
+            "mail_signal_count": len(mail_signal_recommendations),
+            "scan_diagnostics": diag,
         }
         return {"success": True, "data": data}
     except Exception as exc:
         logger.exception("automation.real_recommendations_latest_failed")
         raise HTTPException(status_code=500, detail=f"Failed to read real recommendations: {exc}") from exc
+
+
+@router.get("/real/recommendations/recent")
+def get_real_recommendations_recent(limit: int = Query(default=10, ge=1, le=50)) -> dict[str, Any]:
+    try:
+        keys = _redis_cache.scan_keys(f"{_REAL_RECOMMENDATIONS_REDIS_LOG_PREFIX}*", limit=5000)
+        runs: list[dict[str, Any]] = []
+        for key in sorted(keys, reverse=True):
+            payload = _redis_cache.get_json(key)
+            if not isinstance(payload, dict):
+                continue
+            recommendations = _normalize_real_recommendation_rows(
+                cast(list[dict[str, Any]], payload.get("recommendations") or [])
+            )
+            short_term_recommendations = _normalize_real_recommendation_rows(
+                cast(list[dict[str, Any]], payload.get("short_term_recommendations") or recommendations)
+            )
+            mail_signal_recommendations = _normalize_real_recommendation_rows(
+                cast(list[dict[str, Any]], payload.get("mail_signal_recommendations") or [])
+            )
+            diag = payload.get("scan_diagnostics")
+            if not isinstance(diag, dict):
+                diag = {}
+            runs.append(
+                {
+                    "redis_key": key,
+                    "generated_at": payload.get("generated_at"),
+                    "exchange_scope": payload.get("exchange_scope"),
+                    "limit_symbols": payload.get("limit_symbols"),
+                    "scanned": int(payload.get("scanned") or 0),
+                    "recommendations": short_term_recommendations,
+                    "count": len(short_term_recommendations),
+                    "short_term_recommendations": short_term_recommendations,
+                    "short_term_count": len(short_term_recommendations),
+                    "mail_signal_recommendations": mail_signal_recommendations,
+                    "mail_signal_count": len(mail_signal_recommendations),
+                    "scan_diagnostics": diag,
+                }
+            )
+            if len(runs) >= int(limit):
+                break
+        return {"success": True, "data": runs, "limit": int(limit)}
+    except Exception as exc:
+        logger.exception("automation.real_recommendations_recent_failed")
+        raise HTTPException(status_code=500, detail=f"Failed to read real recommendations recent runs: {exc}") from exc
 
 
 @router.post("/real/recommendations/action-buy")

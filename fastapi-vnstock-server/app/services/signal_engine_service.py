@@ -1321,6 +1321,30 @@ def _experience_confidence_adjustment(symbol: str, action: str) -> tuple[float, 
     }
 
 
+def extract_short_term_scan_diagnostics(scan_result: dict[str, Any]) -> dict[str, Any]:
+    """
+    Observable counters for FE / Redis payloads (why scanned N but 0 BUY recommendations).
+    """
+    keys = (
+        "skipped_insufficient_data",
+        "skipped_low_liquidity",
+        "skipped_no_volume_spike",
+        "skipped_entry_gate",
+        "skipped_experience_cooldown",
+        "skipped_dynamic_buy_floor",
+    )
+    out: dict[str, Any] = {k: int(scan_result.get(k) or 0) for k in keys}
+    floor = scan_result.get("dynamic_buy_composite_floor")
+    try:
+        if floor is not None:
+            out["dynamic_buy_composite_floor"] = round(float(floor), 4)
+    except Exception:
+        pass
+    raw_signals = scan_result.get("signals") or []
+    out["buy_signals_written"] = len(raw_signals) if isinstance(raw_signals, list) else 0
+    return out
+
+
 def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL") -> dict[str, Any]:
     """
     Run the short-term scanner once, returning inserted rows plus coverage counters
@@ -1565,6 +1589,7 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
             "steps": step_rows,
         },
     )
+    tz = ZoneInfo(settings.short_term_scan_timezone)
     return {
         "signals": signals,
         "scanned": scanned,
@@ -1578,6 +1603,7 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
         "experience_threshold_source_claude": experience_threshold_source_claude,
         "experience_threshold_source_heuristic": experience_threshold_source_heuristic,
         "exchange_scope": normalized_scope,
+        "scan_finished_at": datetime.now(tz=tz).isoformat(),
     }
 
 
@@ -2127,30 +2153,40 @@ def warm_daily_volume_for_saved_symbols(days: int = 30) -> dict[str, Any]:
             symbols = cur.fetchall()
             cur.execute(
                 """
-                SELECT DISTINCT symbol
+                SELECT symbol, ARRAY_AGG(trading_date ORDER BY trading_date DESC) AS trading_dates
                 FROM market_symbol_daily_volume
-                """
+                WHERE trading_date >= %(cutoff_date)s
+                GROUP BY symbol
+                """,
+                {"cutoff_date": cutoff_date},
             )
             existing_symbol_rows = cur.fetchall()
         conn.commit()
 
-    existing_symbols = {
-        str(row.get("symbol", "")).strip().upper()
-        for row in existing_symbol_rows
-        if str(row.get("symbol", "")).strip()
-    }
+    existing_dates_by_symbol: dict[str, set[date]] = {}
+    for row in existing_symbol_rows:
+        symbol = str(row.get("symbol", "")).strip().upper()
+        if not symbol:
+            continue
+        raw_dates = row.get("trading_dates")
+        dates_set: set[date] = set()
+        if isinstance(raw_dates, list):
+            for value in raw_dates:
+                if isinstance(value, datetime):
+                    dates_set.add(value.date())
+                elif isinstance(value, date):
+                    dates_set.add(value)
+        existing_dates_by_symbol[symbol] = dates_set
 
     scanned = 0
     warmed = 0
     errors = 0
-    skipped_existing = 0
+    skipped_up_to_date = 0
+    missing_days_filled = 0
     for row in symbols:
         symbol = str(row.get("symbol", "")).strip().upper()
         exchange = str(row.get("exchange", "")).strip().upper()
         if not symbol:
-            continue
-        if symbol in existing_symbols:
-            skipped_existing += 1
             continue
         scanned += 1
         try:
@@ -2163,6 +2199,19 @@ def warm_daily_volume_for_saved_symbols(days: int = 30) -> dict[str, Any]:
             if not isinstance(rows, list):
                 continue
             dict_rows = [item for item in rows if isinstance(item, dict)]
+            source_dates: set[date] = set()
+            for item in dict_rows:
+                trading_date = _parse_trading_date_from_row(item)
+                if trading_date is None or trading_date < cutoff_date:
+                    continue
+                source_dates.add(trading_date)
+            if not source_dates:
+                continue
+            existing_dates = existing_dates_by_symbol.get(symbol, set())
+            missing_dates = source_dates - existing_dates
+            if not missing_dates:
+                skipped_up_to_date += 1
+                continue
             _persist_symbol_daily_volume_rows(
                 symbol=symbol,
                 exchange=exchange or "UNKNOWN",
@@ -2171,6 +2220,8 @@ def warm_daily_volume_for_saved_symbols(days: int = 30) -> dict[str, Any]:
                 min_trading_date=cutoff_date,
             )
             warmed += 1
+            missing_days_filled += len(missing_dates)
+            existing_dates_by_symbol[symbol] = existing_dates.union(source_dates)
         except Exception as exc:
             errors += 1
             logger.warning(
@@ -2183,9 +2234,10 @@ def warm_daily_volume_for_saved_symbols(days: int = 30) -> dict[str, Any]:
         "days": safe_days,
         "cutoff_date": str(cutoff_date),
         "total_symbols": len(symbols),
-        "symbols_skipped_existing": skipped_existing,
         "symbols_scanned": scanned,
-        "symbols_warmed": warmed,
+        "symbols_skipped_up_to_date": skipped_up_to_date,
+        "symbols_backfilled": warmed,
+        "missing_days_filled": missing_days_filled,
         "errors": errors,
     }
 

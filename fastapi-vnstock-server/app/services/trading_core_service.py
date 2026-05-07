@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import queue as _queue
 import threading
 from datetime import date, datetime, timezone
 from typing import Any
@@ -10,13 +11,41 @@ from psycopg import connect
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
-from app.core.config import settings
+from app.core.config import get_vn_market_holiday_dates, settings
 from app.services.execution import get_execution_adapter
 from app.services.execution.broker_status import build_dnse_reconcile_metadata_snapshot
 from app.services.execution.types import OrderExecutionContext
-from app.services.vn_market_holiday_calendar import add_vn_trading_days_live, vn_market_local_today
+from app.services.vn_market_holiday_calendar import add_vn_trading_days, add_vn_trading_days_live, vn_market_local_today
 
 logger = logging.getLogger(__name__)
+
+
+def _settle_date_with_timeout(trade_date: date, days: int = 2, timeout_seconds: float = 10) -> date:
+    """
+    Compute VN settlement date via live calendar probe with a hard timeout.
+    Falls back to the offline calendar if the live probe hangs or fails.
+    Prevents a hung vnstock calendar call from holding an open DB transaction.
+    """
+    result_q: _queue.Queue[date] = _queue.Queue(maxsize=1)
+
+    def _worker() -> None:
+        try:
+            result_q.put(add_vn_trading_days_live(trade_date, days))
+        except Exception:
+            try:
+                result_q.put(add_vn_trading_days(trade_date, days, get_vn_market_holiday_dates()))
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    try:
+        return result_q.get(timeout=timeout_seconds)
+    except _queue.Empty:
+        logger.warning("settle_date_live_probe_timeout", extra={"trade_date": str(trade_date), "days": days})
+        return add_vn_trading_days(trade_date, days, get_vn_market_holiday_dates())
+
+
 _trading_core_tables_ready = False
 _trading_core_tables_lock = threading.Lock()
 
@@ -255,6 +284,25 @@ def check_settlement(account_mode: str, symbol: str, quantity: int) -> dict[str,
     available_qty = int(row.get("available_qty", 0))
     pending_qty = int(row.get("pending_settlement_qty", 0))
     return {"pass": available_qty >= quantity, "available_qty": available_qty, "pending_settlement_qty": pending_qty}
+
+
+def roll_settlement(account_mode: str) -> None:
+    """
+    Public helper to update `position_lots.available_qty` when `settle_date` has passed.
+    Safe to call frequently; it performs an idempotent UPDATE.
+    """
+    ensure_trading_core_tables()
+    mode = str(account_mode).upper()
+    with connect(settings.database_url) as conn:
+        try:
+            # Avoid long lock chains when many requests call settlement refresh concurrently.
+            with conn.cursor() as cur:
+                cur.execute("SET LOCAL lock_timeout = '500ms'")
+                cur.execute("SET LOCAL statement_timeout = '2000ms'")
+            _roll_settlement(conn, mode)
+            conn.commit()
+        except Exception:
+            conn.rollback()
 
 
 def get_kill_switch(account_mode: str) -> dict[str, Any]:
@@ -620,12 +668,16 @@ def process_order(order_id: str) -> dict[str, Any]:
             "Order acknowledged",
             {"broker": trimmed, "messages": outcome.log_messages},
         )
-
-        _roll_settlement(conn, account_mode)
+        conn.commit()
 
         final_status = "FILLED"
         final_reason = None
         if side == "SELL":
+            # check_settlement opens its own connection and calls _roll_settlement internally.
+            # Do not call _roll_settlement(conn, ...) here; doing so holds a row lock on
+            # position_lots inside conn's open transaction, then check_settlement tries to
+            # acquire the same lock via a second connection: self-deadlock (conn idle-in-
+            # transaction forever, second conn blocked, PostgreSQL cannot detect it).
             settlement_result = check_settlement(account_mode, symbol, quantity)
             if not settlement_result["pass"]:
                 final_status = "REJECTED"
@@ -656,7 +708,9 @@ def process_order(order_id: str) -> dict[str, Any]:
                     final_reason = "sell_fifo_consume_failed"
         else:
             buy_trade_date = _settlement_effective_today()
-            settle_date = add_vn_trading_days_live(buy_trade_date, 2)
+            # Compute settle_date via a thread with timeout so a hung live calendar
+            # probe cannot hold the DB transaction open indefinitely.
+            settle_date = _settle_date_with_timeout(buy_trade_date, days=2, timeout_seconds=10)
             with conn.cursor() as cur:
                 cur.execute(
                     """

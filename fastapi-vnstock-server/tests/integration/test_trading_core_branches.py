@@ -259,6 +259,54 @@ def test_sell_rejected_fifo_when_guard_passes_but_no_lots(trading_db: str, monke
 
 
 @pytest.mark.postgres
+def test_process_order_does_not_hold_transaction_during_settlement_guard(
+    trading_db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import app.services.trading_core_service as tcs
+
+    class FillAdapter:
+        name = "demo"
+
+        def execute(self, ctx: OrderExecutionContext) -> ExecutionOutcome:  # noqa: ARG002
+            return ExecutionOutcome(internal_status="FILLED", broker_order_id="brk-no-deadlock")
+
+    def fail_roll_settlement(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("process_order must not call _roll_settlement before check_settlement")
+
+    seen_statuses: list[str] = []
+
+    def settlement_guard(_account_mode: str, _symbol: str, _quantity: int) -> dict[str, object]:
+        with connect(trading_db, row_factory=dict_row) as check_conn:
+            with check_conn.cursor() as cur:
+                cur.execute("SELECT status FROM orders_core WHERE id = %(id)s::uuid", {"id": sell["id"]})
+                row = cur.fetchone()
+        seen_statuses.append(str(row["status"]) if row else "")
+        return {"pass": False, "available_qty": 0, "pending_settlement_qty": 0}
+
+    monkeypatch.setattr(tcs, "get_execution_adapter", lambda _mode: FillAdapter())
+    monkeypatch.setattr(tcs, "_roll_settlement", fail_roll_settlement)
+    monkeypatch.setattr(tcs, "check_settlement", settlement_guard)
+
+    sell = place_order(
+        {
+            "account_mode": "DEMO",
+            "symbol": "TSTNODL",
+            "side": "SELL",
+            "quantity": 3,
+            "price": 5000.0,
+            "idempotency_key": "idem-tstnodl",
+            "auto_process": False,
+        }
+    )
+
+    out = process_order(sell["id"])
+
+    assert seen_statuses == ["ACK"]
+    assert out["order"]["status"] == "REJECTED"
+    assert out["order"]["reason"] == "settlement_guard_failed"
+
+
+@pytest.mark.postgres
 def test_partial_then_filled_merges_reconcile_metadata(trading_db: str, monkeypatch: pytest.MonkeyPatch) -> None:
     import app.services.trading_core_service as tcs
 

@@ -17,14 +17,18 @@ from app.services.demo_trading_service import (
     get_demo_strategy_remaining_cash,
     run_demo_auto_exit_cycle,
 )
+from app.services.mail_signal_scheduler_service import run_mail_signal_pipeline
 from app.services.short_term_automation_service import run_short_term_production_cycle
+from app.services.short_term_automation_service import mark_stale_short_term_running_runs
 from app.services.short_term_scan_schedule import (
     is_instant_on_short_term_scan_grid,
     next_run_datetimes,
 )
 from app.services.redis_cache import RedisCacheService
 from app.services.signal_engine_service import (
+    extract_short_term_scan_diagnostics,
     run_short_term_scan_batch,
+    run_short_term_scan_batch_light,
     refresh_short_term_liquidity_cache_from_db,
     scan_and_persist_symbol_news_from_liquidity_cache,
     warm_daily_volume_for_saved_symbols,
@@ -41,12 +45,14 @@ _BACKEND_SCHEDULER_SUPPORTED_MODES: tuple[AccountMode, ...] = ("REAL", "DEMO")
 # Internal scheduler: one grid tick runs three persisted cycles in strict board order.
 _SHORT_TERM_SCHEDULER_EXCHANGE_SCOPES: tuple[str, ...] = ("HOSE", "HNX", "UPCOM")
 _loop_tasks: dict[AccountMode, asyncio.Task | None] = {mode: None for mode in _ACCOUNT_MODES}
+_scheduler_last_slot_markers: dict[AccountMode, str | None] = {mode: None for mode in _ACCOUNT_MODES}
 _cache_warm_task: asyncio.Task | None = None
 _last_cache_warm_local_date: date | None = None
 _post_close_refresh_run_markers: set[str] = set()
 
 # REAL scan-only scheduler persistence + execution.
 _REAL_RECOMMENDATIONS_REDIS_KEY = "signals:real:short-term:recommendations:latest"
+_REAL_RECOMMENDATIONS_REDIS_LOG_PREFIX = "signals:real:short-term:recommendations:run:"
 _REAL_RECOMMENDATIONS_TTL_SECONDS = 86_400
 _real_scan_only_loop_task: asyncio.Task | None = None
 _real_scan_only_last_slot_marker: str | None = None
@@ -58,6 +64,10 @@ _runtime_enabled: dict[AccountMode, bool] = {
     mode: bool(settings.automation_short_term_scheduler_enabled) for mode in _ACCOUNT_MODES
 }
 _active_demo_session_id: str | None = None
+
+
+def _log_task_state(task_name: str, status: str, **detail: Any) -> None:
+    logger.warning("scheduler_task_state | task=%s | status=%s | detail=%s", task_name, status, detail or {})
 
 
 def _to_float(value: Any) -> float | None:
@@ -95,6 +105,11 @@ def _real_scan_only_slot_marker(now_local: datetime) -> str:
     return f"{now_local.date().isoformat()}-{now_local.hour:02d}:{now_local.minute:02d}"
 
 
+def _real_recommendations_run_key(now_local: datetime | None = None) -> str:
+    ts = now_local or datetime.now(tz=ZoneInfo(settings.short_term_scan_timezone))
+    return f"{_REAL_RECOMMENDATIONS_REDIS_LOG_PREFIX}{ts.strftime('%Y%m%d-%H%M%S')}"
+
+
 def _is_vn_market_open(now_local: datetime) -> bool:
     if now_local.weekday() >= 5:
         return False
@@ -127,6 +142,14 @@ async def _demo_auto_exit_scheduler_loop() -> None:
                 continue
             result = await asyncio.to_thread(run_demo_auto_exit_cycle, session_id)
             _demo_auto_exit_last_slot_marker = marker
+            _log_task_state(
+                "demo_auto_exit_scheduler",
+                "FINISHED",
+                marker=marker,
+                session_id=session_id,
+                scanned=int(result.get("scanned") or 0),
+                executed=int(result.get("executed") or 0),
+            )
             logger.warning(
                 "demo_auto_exit_cycle_finished",
                 extra={
@@ -137,6 +160,7 @@ async def _demo_auto_exit_scheduler_loop() -> None:
                 },
             )
         except Exception as exc:
+            _log_task_state("demo_auto_exit_scheduler", "FAILED", error=str(exc))
             logger.warning("demo_auto_exit_scheduler_tick_failed", extra={"error": str(exc)})
         await asyncio.sleep(10)
 
@@ -149,6 +173,7 @@ async def _start_demo_auto_exit_scheduler() -> None:
         _demo_auto_exit_scheduler_loop(),
         name="demo-auto-exit-scheduler",
     )
+    _log_task_state("demo_auto_exit_scheduler", "STARTED")
     logger.warning("demo_auto_exit_scheduler_task_started")
 
 
@@ -162,11 +187,43 @@ async def _stop_demo_auto_exit_scheduler() -> None:
             pass
     _demo_auto_exit_loop_task = None
     _demo_auto_exit_last_slot_marker = None
+    _log_task_state("demo_auto_exit_scheduler", "STOPPED")
     logger.warning("demo_auto_exit_scheduler_task_stopped")
 
 
 def _run_real_scan_only_and_persist() -> None:
-    scan_result = run_short_term_scan_batch(limit_symbols=0, exchange_scope="ALL")
+    mail_recommendations: list[dict[str, Any]] = []
+    try:
+        mail_out = run_mail_signal_pipeline()
+        raw_mail_items = mail_out.get("items") if isinstance(mail_out, dict) else []
+        if isinstance(raw_mail_items, list):
+            mail_recommendations = _normalize_real_recommendation_rows(raw_mail_items)
+        logger.warning(
+            "real_scan_only_mail_pipeline_completed",
+            extra={
+                "mail_success": bool(mail_out.get("success")),
+                "mail_count": int(mail_out.get("mail_count") or 0),
+                "items": len(mail_out.get("items") or []) if isinstance(mail_out.get("items"), list) else 0,
+            },
+        )
+    except Exception as exc:
+        logger.warning(
+            "real_scan_only_mail_pipeline_failed",
+            extra={"error": str(exc)},
+        )
+
+    try:
+        scan_result = run_short_term_scan_batch(limit_symbols=0, exchange_scope="ALL")
+    except Exception as exc:
+        fallback_cap = int(settings.automation_short_term_scan_fallback_light_max_symbols)
+        logger.warning(
+            "real_scan_only_full_scan_failed_fallback_light",
+            extra={
+                "error": str(exc),
+                "fallback_limit_symbols": fallback_cap,
+            },
+        )
+        scan_result = run_short_term_scan_batch_light(limit_symbols=fallback_cap, exchange_scope="ALL")
     raw_signals = scan_result.get("signals") or []
     recommendations: list[dict[str, Any]] = []
     for signal in raw_signals:
@@ -191,8 +248,18 @@ def _run_real_scan_only_and_persist() -> None:
         "scanned": int(scan_result.get("scanned") or 0),
         "recommendations": normalized,
         "count": len(normalized),
+        "short_term_recommendations": normalized,
+        "short_term_count": len(normalized),
+        "mail_signal_recommendations": mail_recommendations,
+        "mail_signal_count": len(mail_recommendations),
+        "scan_diagnostics": extract_short_term_scan_diagnostics(scan_result),
     }
     _redis_cache.set_json(_REAL_RECOMMENDATIONS_REDIS_KEY, payload, ttl_seconds=_REAL_RECOMMENDATIONS_TTL_SECONDS)
+    _redis_cache.set_json(
+        _real_recommendations_run_key(),
+        payload,
+        ttl_seconds=_REAL_RECOMMENDATIONS_TTL_SECONDS,
+    )
 
 
 def _is_backend_scheduler_supported(account_mode: AccountMode) -> bool:
@@ -564,10 +631,11 @@ def _run_short_term_scheduler_on_grid_batch(
     trigger_batch_id = str(uuid4())
     total = len(_SHORT_TERM_SCHEDULER_EXCHANGE_SCOPES)
     results: list[dict[str, Any]] = []
+    scheduler_limit_symbols = int(settings.automation_short_term_scheduler_limit_symbols)
     for idx, scope in enumerate(_SHORT_TERM_SCHEDULER_EXCHANGE_SCOPES, start=1):
         try:
             raw = run_short_term_production_cycle(
-                limit_symbols=0,
+                limit_symbols=scheduler_limit_symbols,
                 exchange_scope=scope,
                 account_mode=account_mode,
                 nav=_short_term_allocated_nav_for_mode(account_mode, demo_session_id),
@@ -578,6 +646,9 @@ def _run_short_term_scheduler_on_grid_batch(
                 scheduler_trigger_batch_id=trigger_batch_id,
                 scheduler_sequence_index=idx,
                 scheduler_sequence_total=total,
+                # Keep timeouts ON in scheduler so one stuck upstream call
+                # cannot starve the advisory lock for a whole grid.
+                scheduler_disable_timeouts=False,
             )
             results.append(raw)
         except Exception as exc:
@@ -642,6 +713,18 @@ async def _scheduler_loop(account_mode: AccountMode) -> None:
                 },
             )
             if on_grid:
+                now_local = grid["now_local"]
+                marker = _real_scan_only_slot_marker(now_local) if isinstance(now_local, datetime) else None
+                if marker and marker == _scheduler_last_slot_markers.get(account_mode):
+                    logger.warning(
+                        "short_term_scheduler_tick_skipped_duplicate_slot",
+                        extra={"account_mode": account_mode, "marker": marker},
+                    )
+                    await asyncio.sleep(poll_seconds)
+                    continue
+                if marker:
+                    _scheduler_last_slot_markers[account_mode] = marker
+
                 demo_session_id = _active_demo_session_id if account_mode == "DEMO" else None
                 trigger_batch_id, batch_results = await asyncio.to_thread(
                     _run_short_term_scheduler_on_grid_batch,
@@ -668,6 +751,12 @@ async def _scheduler_loop(account_mode: AccountMode) -> None:
                         "demo_session_id": demo_session_id,
                         "runs": run_summaries,
                     },
+                )
+                _log_task_state(
+                    f"short_term_scheduler_{account_mode.lower()}",
+                    "FINISHED",
+                    scheduler_trigger_batch_id=trigger_batch_id,
+                    demo_session_id=demo_session_id,
                 )
                 try:
                     _dispatch_scheduler_batch_notification(
@@ -699,6 +788,7 @@ async def _scheduler_loop(account_mode: AccountMode) -> None:
                     },
                 )
         except Exception as exc:
+            _log_task_state(f"short_term_scheduler_{account_mode.lower()}", "FAILED", error=str(exc))
             logger.warning(
                 "short_term_scheduler_tick_failed",
                 extra={"account_mode": account_mode, "error": str(exc)},
@@ -750,6 +840,7 @@ async def _cache_warm_loop() -> None:
                     "short_term_cache_warm_completed",
                     extra={"stats": stats},
                 )
+                _log_task_state("short_term_cache_warm_scheduler", "FINISHED", stage="warm")
 
             # Keep only today's markers to avoid in-memory growth over long uptime.
             today_prefix = f"{today.isoformat()}-"
@@ -778,7 +869,14 @@ async def _cache_warm_loop() -> None:
                         "news_stats": refresh_result.get("news_stats"),
                     },
                 )
+                _log_task_state(
+                    "short_term_cache_warm_scheduler",
+                    "FINISHED",
+                    stage="post_close_refresh",
+                    marker=current_slot_marker,
+                )
         except Exception as exc:
+            _log_task_state("short_term_cache_warm_scheduler", "FAILED", error=str(exc))
             logger.warning(
                 "short_term_cache_warm_failed",
                 extra={"error": str(exc)},
@@ -787,6 +885,8 @@ async def _cache_warm_loop() -> None:
 
 
 async def _real_scan_only_scheduler_loop() -> None:
+    global _real_scan_only_last_slot_marker
+
     poll_seconds = settings.automation_short_term_scheduler_poll_seconds
     logger.info(
         "real_scan_only_scheduler_started",
@@ -806,7 +906,9 @@ async def _real_scan_only_scheduler_loop() -> None:
                     if marker != _real_scan_only_last_slot_marker:
                         await asyncio.to_thread(_run_real_scan_only_and_persist)
                         _real_scan_only_last_slot_marker = marker
+                        _log_task_state("real_scan_only_scheduler", "FINISHED", marker=marker)
         except Exception as exc:
+            _log_task_state("real_scan_only_scheduler", "FAILED", error=str(exc))
             logger.warning(
                 "real_scan_only_scheduler_tick_failed",
                 extra={"error": str(exc)},
@@ -824,11 +926,13 @@ async def _start_real_scan_only_scheduler() -> None:
         _real_scan_only_scheduler_loop(),
         name="real-scan-only-scheduler",
     )
+    _log_task_state("real_scan_only_scheduler", "STARTED")
     logger.warning("real_scan_only_scheduler_task_started")
 
 
 async def _stop_real_scan_only_scheduler() -> None:
-    global _real_scan_only_loop_task
+    global _real_scan_only_last_slot_marker, _real_scan_only_loop_task
+
     if _real_scan_only_loop_task and not _real_scan_only_loop_task.done():
         _real_scan_only_loop_task.cancel()
         try:
@@ -837,6 +941,7 @@ async def _stop_real_scan_only_scheduler() -> None:
             pass
     _real_scan_only_loop_task = None
     _real_scan_only_last_slot_marker = None
+    _log_task_state("real_scan_only_scheduler", "STOPPED")
     logger.warning("real_scan_only_scheduler_task_stopped")
 
 
@@ -883,6 +988,16 @@ async def set_real_scan_only_scheduler_enabled(enabled: bool) -> dict:
 
 
 async def start_automation_scheduler() -> None:
+    try:
+        # This deployment runs a single backend scheduler instance. On startup,
+        # any RUNNING row older than the immediate boot window is orphaned by a
+        # previous process and should not stay visible as an active Automation Log.
+        marked_stale = await asyncio.to_thread(mark_stale_short_term_running_runs, older_than_minutes=1)
+        if marked_stale:
+            _log_task_state("short_term_scheduler_stale_recovery", "FINISHED", updated=marked_stale)
+    except Exception as exc:
+        logger.warning("short_term_scheduler_stale_recovery_failed", extra={"error": str(exc)})
+
     try:
         _load_runtime_enabled_from_db()
     except Exception as exc:
@@ -945,10 +1060,13 @@ async def _start_mode_scheduler(account_mode: AccountMode) -> None:
     )
     if account_mode == "DEMO":
         await _start_demo_auto_exit_scheduler()
+    _log_task_state(f"short_term_scheduler_{account_mode.lower()}", "STARTED")
     logger.warning("short_term_scheduler_task_started", extra={"account_mode": account_mode})
 
 
 async def _stop_mode_scheduler(account_mode: AccountMode) -> None:
+    global _scheduler_last_slot_markers
+
     task = _loop_tasks[account_mode]
     if task and not task.done():
         task.cancel()
@@ -957,8 +1075,10 @@ async def _stop_mode_scheduler(account_mode: AccountMode) -> None:
         except asyncio.CancelledError:
             pass
     _loop_tasks[account_mode] = None
+    _scheduler_last_slot_markers[account_mode] = None
     if account_mode == "DEMO":
         await _stop_demo_auto_exit_scheduler()
+    _log_task_state(f"short_term_scheduler_{account_mode.lower()}", "STOPPED")
     logger.warning("short_term_scheduler_task_stopped", extra={"account_mode": account_mode})
 
 
@@ -976,6 +1096,7 @@ async def _start_cache_warm_scheduler() -> None:
         _cache_warm_loop(),
         name="short-term-cache-warm-scheduler",
     )
+    _log_task_state("short_term_cache_warm_scheduler", "STARTED")
     logger.warning("short_term_cache_warm_scheduler_task_started")
 
 
@@ -988,6 +1109,7 @@ async def _stop_cache_warm_scheduler() -> None:
         except asyncio.CancelledError:
             pass
     _cache_warm_task = None
+    _log_task_state("short_term_cache_warm_scheduler", "STOPPED")
     logger.warning("short_term_cache_warm_scheduler_task_stopped")
 
 

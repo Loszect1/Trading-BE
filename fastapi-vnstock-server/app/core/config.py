@@ -123,24 +123,31 @@ class AppSettings(BaseSettings):
     automation_short_term_scheduler_enabled: bool = False
     #: Poll interval (seconds) for internal scheduler loop.
     automation_short_term_scheduler_poll_seconds: int = Field(default=30, ge=5, le=300)
+    #: Scheduler scan cap per exchange scope (HOSE/HNX/UPCOM). 0 means unlimited.
+    #: Keep this bounded so one grid slot doesn't hold the advisory lock too long.
+    automation_short_term_scheduler_limit_symbols: int = Field(default=60, ge=0, le=500)
     #: Hard timeout for one short-term scan batch to avoid lock starvation.
+    #: Set 0 to disable timeout (scheduler can choose to run without timeout).
     #: Default 15 minutes for full-universe scans across HOSE/HNX/UPCOM.
-    automation_short_term_scan_timeout_seconds: int = Field(default=900, ge=20, le=1800)
+    automation_short_term_scan_timeout_seconds: int = Field(default=900, ge=0, le=1800)
     #: Global throttle for vnstock calls per process to reduce upstream rate-limit bursts.
     vnstock_max_requests_per_minute: int = Field(default=48, ge=10, le=600)
     #: Cooldown in seconds between exchange phases for ALL-scope manual scan.
     automation_short_term_scan_exchange_cooldown_seconds: float = Field(default=5.0, ge=0.0, le=120.0)
     #: Hard timeout budget per exchange phase when scope=ALL (HOSE/HNX/UPCOM).
-    automation_short_term_scan_all_phase_timeout_seconds: int = Field(default=120, ge=30, le=900)
+    #: Set 0 to disable timeout budget for the phase.
+    automation_short_term_scan_all_phase_timeout_seconds: int = Field(default=120, ge=0, le=900)
     #: Retry attempts for full scan when upstream rate-limit is detected before falling back to light mode.
     automation_short_term_scan_rate_limit_retry_attempts: int = Field(default=1, ge=0, le=6)
     #: Base backoff delay (seconds) between full-scan retries after rate-limit.
     automation_short_term_scan_rate_limit_retry_backoff_seconds: float = Field(default=8.0, ge=1.0, le=120.0)
     #: Hard timeout for one BUY handling step (risk + place_order) to prevent post-scan hangs.
-    automation_short_term_buy_step_timeout_seconds: int = Field(default=25, ge=5, le=180)
+    #: Set 0 to disable timeout for one buy step.
+    automation_short_term_buy_step_timeout_seconds: int = Field(default=25, ge=0, le=180)
     #: Timeout for fallback light scan after full scan hits the hard timeout.
+    #: Set 0 to disable fallback timeout.
     #: Increased default for unlimited fallback scans.
-    automation_short_term_scan_fallback_light_timeout_seconds: int = Field(default=900, ge=30, le=1800)
+    automation_short_term_scan_fallback_light_timeout_seconds: int = Field(default=900, ge=0, le=1800)
     #: Max symbols processed in fallback light scan (4 per exchange x 3 = 12).
     automation_short_term_scan_fallback_light_max_symbols: int = Field(default=12, ge=4, le=20)
     #: Liquidity floor (average 20 sessions volume) to exclude illiquid/penny-like symbols from short-term analysis.

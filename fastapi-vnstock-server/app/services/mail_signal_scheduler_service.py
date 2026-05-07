@@ -29,6 +29,10 @@ _entry_task: asyncio.Task | None = None
 _run_markers: set[str] = set()
 
 
+def _log_task_state(task_name: str, status: str, **detail: Any) -> None:
+    logger.warning("scheduler_task_state | task=%s | status=%s | detail=%s", task_name, status, detail or {})
+
+
 class _SignalPick(BaseModel):
     symbol: str = Field(min_length=1, max_length=20)
     entry: float = Field(gt=0)
@@ -501,6 +505,13 @@ async def _scheduler_loop() -> None:
             if should_run:
                 result = await asyncio.to_thread(run_mail_signal_pipeline)
                 _run_markers.add(marker)
+                _log_task_state(
+                    "mail_signal_scheduler",
+                    "FINISHED",
+                    marker=marker,
+                    mail_count=int(result.get("mail_count", 0)),
+                    signal_count=len(result.get("items", [])),
+                )
                 logger.warning(
                     "mail_signal_scheduler_completed",
                     extra={
@@ -512,6 +523,7 @@ async def _scheduler_loop() -> None:
             if len(_run_markers) > 10:
                 _run_markers.clear()
         except Exception as exc:
+            _log_task_state("mail_signal_scheduler", "FAILED", error=str(exc))
             logger.warning("mail_signal_scheduler_failed", extra={"error": str(exc)})
         await asyncio.sleep(poll_seconds)
 
@@ -532,6 +544,13 @@ async def _entry_scheduler_loop() -> None:
             if on_grid and marker not in run_markers:
                 result = await asyncio.to_thread(run_prev_day_entry_auto_trading_once)
                 run_markers.add(marker)
+                _log_task_state(
+                    "mail_signal_entry_scheduler",
+                    "FINISHED",
+                    marker=marker,
+                    scanned=int(result.get("scanned", 0)),
+                    executed=len(result.get("executed", [])),
+                )
                 logger.warning(
                     "mail_signal_entry_scheduler_completed",
                     extra={
@@ -543,6 +562,7 @@ async def _entry_scheduler_loop() -> None:
             if len(run_markers) > 400:
                 run_markers.clear()
         except Exception as exc:
+            _log_task_state("mail_signal_entry_scheduler", "FAILED", error=str(exc))
             logger.warning("mail_signal_entry_scheduler_failed", extra={"error": str(exc)})
         await asyncio.sleep(poll_seconds)
 
@@ -555,10 +575,12 @@ async def start_mail_signal_scheduler() -> None:
     if _task and not _task.done():
         return
     _task = asyncio.create_task(_scheduler_loop(), name="mail-signal-scheduler")
+    _log_task_state("mail_signal_scheduler", "STARTED")
     logger.warning("mail_signal_scheduler_started")
     if bool(settings.mail_signal_entry_scheduler_enabled):
         if _entry_task is None or _entry_task.done():
             _entry_task = asyncio.create_task(_entry_scheduler_loop(), name="mail-signal-entry-scheduler")
+        _log_task_state("mail_signal_entry_scheduler", "STARTED")
         logger.warning("mail_signal_entry_scheduler_started")
 
 
@@ -578,4 +600,6 @@ async def stop_mail_signal_scheduler() -> None:
         except asyncio.CancelledError:
             pass
     _entry_task = None
+    _log_task_state("mail_signal_scheduler", "STOPPED")
+    _log_task_state("mail_signal_entry_scheduler", "STOPPED")
     logger.warning("mail_signal_scheduler_stopped")

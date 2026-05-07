@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from psycopg import connect
 from psycopg.rows import dict_row
+from psycopg.types.json import Json
 
 from app.core.config import settings
 from app.schemas.auto_trading import DEMO_INITIAL_BALANCE_VND, DemoTradeRequest
+from app.services.trading_core_service import roll_settlement
 from app.services.vn_market_holiday_calendar import add_vn_trading_days_live, vn_market_local_today
 from app.services.vnstock_api_service import VNStockApiService
 
@@ -239,6 +241,92 @@ def _ensure_demo_strategy_cash_rows(conn: Any, session_id: str, total_cash: floa
             )
 
 
+def _sync_demo_strategy_cash_from_orders(session_id: str) -> None:
+    sid = normalize_demo_session_id(session_id)
+    ensure_demo_trading_tables()
+    with connect(settings.database_url, row_factory=dict_row) as conn:
+        _ensure_demo_session_exists(conn, sid)
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT initial_balance, cash_balance
+                FROM demo_sessions
+                WHERE session_id = %(session_id)s
+                """,
+                {"session_id": sid},
+            )
+            session_row = cur.fetchone() or {}
+            initial_balance = float(session_row.get("initial_balance") or DEMO_INITIAL_BALANCE_VND)
+            total_cash = float(session_row.get("cash_balance") or 0.0)
+            _ensure_demo_strategy_cash_rows(conn, sid, initial_balance)
+
+        used = _strategy_used_notional_for_session(sid)
+        defaults = _strategy_alloc_defaults(initial_balance)
+        short_remaining = max(0.0, float(defaults.get("SHORT_TERM") or 0.0) - float(used.get("SHORT_TERM") or 0.0))
+        mail_remaining = max(0.0, float(defaults.get("MAIL_SIGNAL") or 0.0) - float(used.get("MAIL_SIGNAL") or 0.0))
+        unallocated_remaining = max(0.0, float(total_cash) - short_remaining - mail_remaining)
+
+        with conn.cursor() as cur:
+            for strategy_code, cash_value in {
+                "SHORT_TERM": short_remaining,
+                "MAIL_SIGNAL": mail_remaining,
+                "UNALLOCATED": unallocated_remaining,
+            }.items():
+                cur.execute(
+                    """
+                    UPDATE demo_strategy_cash
+                    SET cash_value = %(cash_value)s, updated_at = NOW()
+                    WHERE session_id = %(session_id)s AND strategy_code = %(strategy_code)s
+                    """,
+                    {
+                        "session_id": sid,
+                        "strategy_code": strategy_code,
+                        "cash_value": float(cash_value),
+                    },
+                )
+        conn.commit()
+
+
+def _normalize_strategy_code(raw: str | None) -> str:
+    code = str(raw or "").strip().upper()
+    if code in {"SHORT_TERM", "MAIL_SIGNAL", "UNALLOCATED"}:
+        return code
+    return "SHORT_TERM"
+
+
+def _get_strategy_cash_value(conn: Any, session_id: str, strategy_code: str) -> float:
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT cash_value
+            FROM demo_strategy_cash
+            WHERE session_id = %(session_id)s AND strategy_code = %(strategy_code)s
+            FOR UPDATE
+            """,
+            {"session_id": session_id, "strategy_code": strategy_code},
+        )
+        row = cur.fetchone() or {}
+    return max(0.0, float(row.get("cash_value") or 0.0))
+
+
+def _apply_strategy_cash_delta(conn: Any, session_id: str, strategy_code: str, delta: float) -> None:
+    current = _get_strategy_cash_value(conn, session_id, strategy_code)
+    next_value = max(0.0, current + float(delta))
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE demo_strategy_cash
+            SET cash_value = %(cash_value)s, updated_at = NOW()
+            WHERE session_id = %(session_id)s AND strategy_code = %(strategy_code)s
+            """,
+            {
+                "session_id": session_id,
+                "strategy_code": strategy_code,
+                "cash_value": next_value,
+            },
+        )
+
+
 def _strategy_used_notional_for_session(session_id: str) -> dict[str, float]:
     used: dict[str, float] = {"SHORT_TERM": 0.0, "MAIL_SIGNAL": 0.0}
     sid = normalize_demo_session_id(session_id)
@@ -388,6 +476,12 @@ def _get_demo_position_exit_levels_overrides(session_id: str) -> dict[str, tuple
 def _get_demo_symbol_settlement_snapshot(session_id: str) -> dict[str, dict[str, Any]]:
     sid = normalize_demo_session_id(session_id)
     out: dict[str, dict[str, Any]] = {}
+    # Keep `available_qty` current before reading settlement snapshot.
+    # Without this, `settled_quantity` may remain 0 even after `settle_date` has passed.
+    try:
+        roll_settlement("DEMO")
+    except Exception:
+        pass
     with connect(settings.database_url, row_factory=dict_row) as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
@@ -509,10 +603,10 @@ def get_demo_strategy_remaining_cash(session_id: str, strategy_code: str) -> flo
     with connect(settings.database_url, row_factory=dict_row) as conn:
         _ensure_demo_session_exists(conn, sid)
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("SELECT cash_balance FROM demo_sessions WHERE session_id = %(session_id)s", {"session_id": sid})
+            cur.execute("SELECT initial_balance FROM demo_sessions WHERE session_id = %(session_id)s", {"session_id": sid})
             session_row = cur.fetchone() or {}
-            total_cash = float(session_row.get("cash_balance") or 0.0)
-            _ensure_demo_strategy_cash_rows(conn, sid, total_cash)
+            initial_balance = float(session_row.get("initial_balance") or DEMO_INITIAL_BALANCE_VND)
+            _ensure_demo_strategy_cash_rows(conn, sid, initial_balance)
             cur.execute(
                 """
                 SELECT cash_value
@@ -523,9 +617,7 @@ def get_demo_strategy_remaining_cash(session_id: str, strategy_code: str) -> flo
             )
             alloc_row = cur.fetchone() or {}
         conn.commit()
-    allocated = max(0.0, float(alloc_row.get("cash_value") or 0.0))
-    used = float(_strategy_used_notional_for_session(sid).get(strategy) or 0.0)
-    return max(0.0, allocated - used)
+    return max(0.0, float(alloc_row.get("cash_value") or 0.0))
 
 
 def _clamp_demo_tp_slot_pct(value: float) -> float:
@@ -877,9 +969,10 @@ def _ensure_demo_session_exists(conn: Any, session_id: str) -> None:
 
 
 def _next_trade_id(conn: Any, session_id: str) -> str:
-    with conn.cursor() as cur:
+    with conn.cursor(row_factory=dict_row) as cur:
         cur.execute("SELECT COUNT(*)::int FROM demo_trades WHERE session_id = %(session_id)s", {"session_id": session_id})
-        count = int((cur.fetchone() or [0])[0])
+        row = cur.fetchone() or {}
+        count = int(row.get("count", 0))
     safe_session = session_id.replace("/", "_")
     return f"demo-{safe_session}-{count + 1}"
 
@@ -983,6 +1076,44 @@ def _append_trade_history(
         )
 
 
+def _append_orders_core_fill(
+    conn: Any,
+    *,
+    session_id: str,
+    trade_id: str,
+    side: str,
+    symbol: str,
+    quantity: int,
+    price: float,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    payload = dict(metadata or {})
+    payload["demo_session_id"] = session_id
+    if not payload.get("source"):
+        payload["source"] = "demo_trading_service"
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO orders_core (
+                id, account_mode, symbol, side, quantity, price, status, reason,
+                idempotency_key, order_metadata, created_at, updated_at
+            ) VALUES (
+                %(id)s, 'DEMO', %(symbol)s, %(side)s, %(quantity)s, %(price)s, 'FILLED', NULL,
+                %(idempotency_key)s, %(order_metadata)s::jsonb, NOW(), NOW()
+            )
+            """,
+            {
+                "id": uuid4(),
+                "symbol": symbol,
+                "side": side,
+                "quantity": quantity,
+                "price": price,
+                "idempotency_key": f"demo-trade:{session_id}:{trade_id}",
+                "order_metadata": Json(payload),
+            },
+        )
+
+
 def execute_demo_trade(session_id: str, body: DemoTradeRequest) -> DemoTradeExecutionResult:
     ensure_demo_trading_tables()
     symbol = body.symbol
@@ -1004,15 +1135,21 @@ def execute_demo_trade(session_id: str, body: DemoTradeRequest) -> DemoTradeExec
                 {"session_id": session_id},
             )
             session_row = cur.fetchone()
+            initial_balance = float((session_row or {}).get("initial_balance") or DEMO_INITIAL_BALANCE_VND)
+            _ensure_demo_strategy_cash_rows(conn, session_id, initial_balance)
         if not session_row:
             raise ValueError("DEMO_SESSION_NOT_FOUND")
         cash_balance = float(session_row["cash_balance"])
         realized_pnl_total = float(session_row["realized_pnl"])
         trade_id = _next_trade_id(conn, session_id)
+        strategy_code = _normalize_strategy_code(body.strategy_type)
 
         if side == "BUY":
             gross = qty * price
             if gross > cash_balance + 1e-9:
+                raise ValueError("INSUFFICIENT_CASH")
+            strategy_cash_before = _get_strategy_cash_value(conn, session_id, strategy_code)
+            if gross > strategy_cash_before + 1e-9:
                 raise ValueError("INSUFFICIENT_CASH")
 
             position = _load_position_with_lots(conn, session_id, symbol)
@@ -1048,6 +1185,7 @@ def execute_demo_trade(session_id: str, body: DemoTradeRequest) -> DemoTradeExec
                     },
                 )
             _upsert_position(conn, session_id, position)
+            _apply_strategy_cash_delta(conn, session_id, strategy_code, -gross)
             _append_trade_history(
                 conn,
                 trade_id=trade_id,
@@ -1059,6 +1197,22 @@ def execute_demo_trade(session_id: str, body: DemoTradeRequest) -> DemoTradeExec
                 notional=gross,
                 realized_pnl_on_trade=0.0,
                 cash_after=new_cash,
+            )
+            _append_orders_core_fill(
+                conn,
+                session_id=session_id,
+                trade_id=trade_id,
+                side=side,
+                symbol=symbol,
+                quantity=qty,
+                price=price,
+                metadata={
+                    "source": str((body.market_context or {}).get("source") or "demo_trading_service"),
+                    "strategy_code": str(body.strategy_type or "SHORT_TERM"),
+                    "entry_price": float(price),
+                    "take_profit_price": float((body.market_context or {}).get("take_profit_price") or 0.0),
+                    "stoploss_price": float((body.market_context or {}).get("stoploss_price") or 0.0),
+                },
             )
             conn.commit()
 
@@ -1085,13 +1239,24 @@ def execute_demo_trade(session_id: str, body: DemoTradeRequest) -> DemoTradeExec
         # SELL
         position = _load_position_with_lots(conn, session_id, symbol)
         if position is None or position.quantity < qty:
-            raise ValueError("INSUFFICIENT_POSITION")
+            core_qty = 0
+            core_avg = 0.0
+            for core_row in _get_demo_positions_from_core(session_id):
+                if str(core_row.get("symbol") or "").strip().upper() != symbol:
+                    continue
+                core_qty = int(core_row.get("total_qty") or 0)
+                core_avg = float(core_row.get("avg_price") or 0.0)
+                break
+            if core_qty < qty or core_avg <= 0:
+                raise ValueError("INSUFFICIENT_POSITION")
+            position = _DemoPosition(
+                symbol=symbol,
+                lots=[_OpenLot(id=str(uuid4()), quantity=core_qty, unit_cost=core_avg, opened_at=now - timedelta(days=7))],
+                opened_at=now - timedelta(days=7),
+            )
         today_local = vn_market_local_today()
-        settled_quantity = 0
-        for lot in position.lots:
-            settle_date = _demo_lot_settle_date(lot.opened_at)
-            if settle_date <= today_local:
-                settled_quantity += int(lot.quantity)
+        settlement_snapshot = _get_demo_symbol_settlement_snapshot(session_id).get(symbol, {})
+        settled_quantity = int(settlement_snapshot.get("settled_quantity") or 0)
         if settled_quantity < qty:
             raise ValueError("INSUFFICIENT_SETTLED_POSITION")
 
@@ -1148,6 +1313,7 @@ def execute_demo_trade(session_id: str, body: DemoTradeRequest) -> DemoTradeExec
                     },
                 )
         _upsert_position(conn, session_id, position)
+        _apply_strategy_cash_delta(conn, session_id, strategy_code, float(qty) * float(price))
         _append_trade_history(
             conn,
             trade_id=trade_id,
@@ -1159,6 +1325,24 @@ def execute_demo_trade(session_id: str, body: DemoTradeRequest) -> DemoTradeExec
             notional=qty * price,
             realized_pnl_on_trade=realized_on_trade,
             cash_after=new_cash,
+        )
+        _append_orders_core_fill(
+            conn,
+            session_id=session_id,
+            trade_id=trade_id,
+            side=side,
+            symbol=symbol,
+            quantity=qty,
+            price=price,
+            metadata={
+                "source": str((body.market_context or {}).get("source") or "demo_trading_service"),
+                "strategy_code": str(body.strategy_type or "SHORT_TERM"),
+                "trigger": (body.market_context or {}).get("trigger"),
+                "take_profit_price": float((body.market_context or {}).get("take_profit_price") or 0.0),
+                "stoploss_price": float((body.market_context or {}).get("stoploss_price") or 0.0),
+                "sell_mode": (body.market_context or {}).get("sell_mode"),
+                "sell_quantity": int(qty),
+            },
         )
         conn.commit()
 
@@ -1413,7 +1597,7 @@ def get_demo_session_overview(session_id: str) -> dict[str, Any]:
     strategy_used_notional = _strategy_used_notional_for_session(str(session_row["session_id"]))
     with connect(settings.database_url, row_factory=dict_row) as conn_alloc:
         with conn_alloc.cursor(row_factory=dict_row) as cur_alloc:
-            _ensure_demo_strategy_cash_rows(conn_alloc, str(session_row["session_id"]), cash_balance)
+            _ensure_demo_strategy_cash_rows(conn_alloc, str(session_row["session_id"]), float(session_row["initial_balance"]))
             cur_alloc.execute(
                 """
                 SELECT strategy_code, cash_value
@@ -1437,20 +1621,14 @@ def get_demo_session_overview(session_id: str) -> dict[str, Any]:
             "allocation_pct": alloc_short_term_pct,
             "cash_value": round(short_term_cash, 6),
             "used_cash_value": round(float(strategy_used_notional.get("SHORT_TERM") or 0.0), 6),
-            "remaining_cash_value": round(
-                max(0.0, float(short_term_cash) - float(strategy_used_notional.get("SHORT_TERM") or 0.0)),
-                6,
-            ),
+            "remaining_cash_value": round(short_term_cash, 6),
         },
         {
             "strategy_code": "MAIL_SIGNAL",
             "allocation_pct": alloc_mail_signal_pct,
             "cash_value": round(mail_signal_cash, 6),
             "used_cash_value": round(float(strategy_used_notional.get("MAIL_SIGNAL") or 0.0), 6),
-            "remaining_cash_value": round(
-                max(0.0, float(mail_signal_cash) - float(strategy_used_notional.get("MAIL_SIGNAL") or 0.0)),
-                6,
-            ),
+            "remaining_cash_value": round(mail_signal_cash, 6),
         },
     ]
     if unallocated_cash > 0:

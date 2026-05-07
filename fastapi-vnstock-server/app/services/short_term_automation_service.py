@@ -34,11 +34,14 @@ logger = logging.getLogger(__name__)
 
 # Distinct advisory lock keys (two-argument form); avoid collision with other features.
 _ADVISORY_LOCK_SPACE = 582_901
-_ADVISORY_LOCK_KEY_REAL = 771_002
-_ADVISORY_LOCK_KEY_DEMO = 771_003
+_ADVISORY_LOCK_KEY_REAL_SHORT_TERM = 771_002
+_ADVISORY_LOCK_KEY_DEMO_SHORT_TERM = 771_003
+_ADVISORY_LOCK_KEY_REAL_MAIL_SIGNAL = 771_004
+_ADVISORY_LOCK_KEY_DEMO_MAIL_SIGNAL = 771_005
 _ASYNC_RUNS_LOCK = threading.Lock()
 _ASYNC_RUNS: dict[str, dict[str, Any]] = {}
 _automation_claude_service = ClaudeService()
+_STALE_RUNNING_RUN_MINUTES = 45
 
 
 def _is_scanner_universe_empty_error(exc: Exception) -> bool:
@@ -46,11 +49,21 @@ def _is_scanner_universe_empty_error(exc: Exception) -> bool:
     return "scanner_universe_empty" in message
 
 
-def _resolve_advisory_lock_key(account_mode: str) -> int:
+def _resolve_advisory_lock_key(account_mode: str, strategy_code: str = "SHORT_TERM") -> int:
     mode = str(account_mode or "").strip().upper()
-    if mode == "DEMO":
-        return _ADVISORY_LOCK_KEY_DEMO
-    return _ADVISORY_LOCK_KEY_REAL
+    strategy = str(strategy_code or "").strip().upper() or "SHORT_TERM"
+    key_map: dict[tuple[str, str], int] = {
+        ("REAL", "SHORT_TERM"): _ADVISORY_LOCK_KEY_REAL_SHORT_TERM,
+        ("DEMO", "SHORT_TERM"): _ADVISORY_LOCK_KEY_DEMO_SHORT_TERM,
+        ("REAL", "MAIL_SIGNAL"): _ADVISORY_LOCK_KEY_REAL_MAIL_SIGNAL,
+        ("DEMO", "MAIL_SIGNAL"): _ADVISORY_LOCK_KEY_DEMO_MAIL_SIGNAL,
+    }
+    explicit = key_map.get((mode, strategy))
+    if explicit is not None:
+        return explicit
+    # Deterministic fallback for future strategies while preserving lock isolation by mode+strategy.
+    fallback_seed = sum(ord(ch) for ch in f"{mode}:{strategy}")
+    return 780_000 + (fallback_seed % 10_000)
 
 
 def _extract_json_object(raw_text: str) -> dict[str, Any] | None:
@@ -318,6 +331,31 @@ def _apply_claude_buy_decision(
         "selected": len(fallback_rows),
         "strategy_remaining_cash": float(strategy_remaining_cash),
     }
+
+
+def _call_with_thread_timeout(
+    *,
+    name: str,
+    timeout_seconds: int,
+    fn,
+) -> Any:
+    safe_timeout = int(timeout_seconds)
+    if safe_timeout <= 0:
+        return fn()
+
+    result_q: queue.Queue = queue.Queue(maxsize=1)
+
+    def _worker() -> None:
+        try:
+            result_q.put(("ok", fn()))
+        except Exception as exc:
+            result_q.put(("err", exc))
+
+    threading.Thread(target=_worker, name=name, daemon=True).start()
+    kind, payload = result_q.get(timeout=safe_timeout)
+    if kind == "err":
+        raise payload
+    return payload
 
 
 def _resolve_sell_trigger(*, last_price: float, take_profit: float, stoploss: float) -> str | None:
@@ -724,6 +762,11 @@ def _handle_one_buy_signal(
 
 def _scan_batch_worker(limit_symbols: int, exchange_scope: str, fallback_light: bool, out_queue: Any) -> None:
     """Worker process: run scan batch and return result/error via queue."""
+    import socket as _socket
+    # Bound every network call in this subprocess (vnstock HTTP, DB TCP, etc.).
+    # Without this, a single hung upstream API call blocks the entire batch until
+    # the parent's queue.get() timeout kills the process from outside.
+    _socket.setdefaulttimeout(30)
     try:
         if fallback_light:
             cap = int(settings.automation_short_term_scan_fallback_light_max_symbols)
@@ -744,6 +787,16 @@ def _scan_batch_worker(limit_symbols: int, exchange_scope: str, fallback_light: 
             )
         except Exception:
             # Last-resort: worker is about to exit and queue pipe may be broken.
+            pass
+    finally:
+        # Prevent Windows spawn deadlock: without cancel_join_thread(), the subprocess
+        # waits for the Queue feeder thread to flush the pipe before exiting. If the
+        # parent is blocked in proc.join() and not reading, the pipe buffer fills and
+        # the feeder thread blocks → deadlock. cancel_join_thread() lets the subprocess
+        # exit immediately; the parent reads the data independently via queue.get().
+        try:
+            out_queue.cancel_join_thread()
+        except Exception:
             pass
 
 
@@ -766,6 +819,12 @@ def _run_short_term_scan_batch_with_timeout(
     """
     Runs scan batch in isolated process with hard timeout.
     This prevents one stuck upstream API call from blocking scheduler lock forever.
+
+    Windows spawn deadlock fix: read from queue FIRST (with timeout), then join.
+    The old pattern (join → get) deadlocks when the subprocess puts a large result
+    into the Queue: the OS pipe buffer fills, the subprocess feeder thread blocks
+    waiting for the parent to read, but the parent is stuck in proc.join() → deadlock.
+    Reading first drains the pipe so the subprocess can exit, then join is fast.
     """
     safe_timeout = max(20, int(timeout_seconds))
     ctx = mp.get_context("spawn")
@@ -775,29 +834,29 @@ def _run_short_term_scan_batch_with_timeout(
         args=(limit_symbols, str(exchange_scope).upper(), fallback_light, out_queue),
     )
     proc.start()
-    proc.join(timeout=safe_timeout)
 
-    if proc.is_alive():
-        proc.terminate()
-        proc.join(timeout=5)
+    # Read result first — this unblocks the subprocess feeder thread so the process
+    # can exit cleanly. Timeout here is the hard budget for the entire scan.
+    try:
+        message = out_queue.get(timeout=safe_timeout)
+    except queue.Empty:
+        # Scan timed out — subprocess is still running (stuck upstream API call).
         if proc.is_alive():
-            proc.kill()
-            proc.join(timeout=2)
+            proc.terminate()
+            proc.join(timeout=5)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=2)
         _dispose_scan_worker_queue(out_queue)
         raise TimeoutError(f"short_term_scan_batch timed out after {safe_timeout}s")
 
-    try:
-        # get_nowait() is race-prone right after proc exit on Windows spawn.
-        # Allow a short grace window for feeder thread flush.
-        message = out_queue.get(timeout=3)
-    except queue.Empty as exc:
-        _dispose_scan_worker_queue(out_queue)
-        exit_code = proc.exitcode
-        raise RuntimeError(
-            "short_term_scan_batch exited without result payload "
-            f"(exit_code={exit_code}, possible_rate_limit_or_fatal_worker_exit)"
-        ) from exc
-
+    # Got result — process should exit quickly now that pipe is drained.
+    proc.join(timeout=10)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(timeout=3)
+        if proc.is_alive():
+            proc.kill()
     _dispose_scan_worker_queue(out_queue)
 
     if not isinstance(message, dict):
@@ -817,6 +876,23 @@ def _run_short_term_scan_batch_with_timeout(
     raise RuntimeError(f"{error_type}: {error_text}")
 
 
+def _run_short_term_scan_batch_no_timeout(
+    *,
+    limit_symbols: int,
+    exchange_scope: str = "ALL",
+    fallback_light: bool = False,
+) -> dict[str, Any]:
+    """
+    Runs scan batch in-process without hard timeout.
+    Intended for scheduler mode when timeout is explicitly disabled.
+    """
+    if fallback_light:
+        fallback_cap = int(settings.automation_short_term_scan_fallback_light_max_symbols)
+        safe_limit = fallback_cap if int(limit_symbols) <= 0 else min(int(limit_symbols), fallback_cap)
+        return run_short_term_scan_batch_light(limit_symbols=safe_limit, exchange_scope=str(exchange_scope).upper())
+    return run_short_term_scan_batch(limit_symbols=int(limit_symbols), exchange_scope=str(exchange_scope).upper())
+
+
 def _run_scan_with_timeout_fallback(
     *,
     run_id: UUID,
@@ -825,25 +901,32 @@ def _run_scan_with_timeout_fallback(
     timeout_seconds: int | None = None,
     fallback_timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
-    hard_timeout = (
-        max(20, int(timeout_seconds))
+    hard_timeout_raw = (
+        int(timeout_seconds)
         if timeout_seconds is not None
         else int(settings.automation_short_term_scan_timeout_seconds)
     )
-    hard_fallback_timeout = (
-        max(30, int(fallback_timeout_seconds))
+    hard_fallback_timeout_raw = (
+        int(fallback_timeout_seconds)
         if fallback_timeout_seconds is not None
         else int(settings.automation_short_term_scan_fallback_light_timeout_seconds)
     )
+    hard_timeout = max(20, hard_timeout_raw) if hard_timeout_raw > 0 else 0
+    hard_fallback_timeout = max(30, hard_fallback_timeout_raw) if hard_fallback_timeout_raw > 0 else 0
     retry_attempts = max(0, int(settings.automation_short_term_scan_rate_limit_retry_attempts))
     retry_backoff = max(1.0, float(settings.automation_short_term_scan_rate_limit_retry_backoff_seconds))
     attempt = 0
     while True:
         attempt += 1
         try:
-            return _run_short_term_scan_batch_with_timeout(
+            if hard_timeout > 0:
+                return _run_short_term_scan_batch_with_timeout(
+                    limit_symbols=limit_symbols,
+                    timeout_seconds=hard_timeout,
+                    exchange_scope=exchange_scope,
+                )
+            return _run_short_term_scan_batch_no_timeout(
                 limit_symbols=limit_symbols,
-                timeout_seconds=hard_timeout,
                 exchange_scope=exchange_scope,
             )
         except RuntimeError as exc:
@@ -880,9 +963,15 @@ def _run_scan_with_timeout_fallback(
             )
             fallback_cap = int(settings.automation_short_term_scan_fallback_light_max_symbols)
             fallback_limit = fallback_cap if int(limit_symbols) <= 0 else min(int(limit_symbols), fallback_cap)
-            return _run_short_term_scan_batch_with_timeout(
+            if hard_fallback_timeout > 0:
+                return _run_short_term_scan_batch_with_timeout(
+                    limit_symbols=fallback_limit,
+                    timeout_seconds=hard_fallback_timeout,
+                    exchange_scope=exchange_scope,
+                    fallback_light=True,
+                )
+            return _run_short_term_scan_batch_no_timeout(
                 limit_symbols=fallback_limit,
-                timeout_seconds=hard_fallback_timeout,
                 exchange_scope=exchange_scope,
                 fallback_light=True,
             )
@@ -903,9 +992,15 @@ def _run_scan_with_timeout_fallback(
         fallback_cap = int(settings.automation_short_term_scan_fallback_light_max_symbols)
         # Unlimited mode is too expensive for fallback: cap aggressively to guarantee completion.
         fallback_limit = fallback_cap if int(limit_symbols) <= 0 else min(int(limit_symbols), fallback_cap)
-        return _run_short_term_scan_batch_with_timeout(
+        if hard_fallback_timeout > 0:
+            return _run_short_term_scan_batch_with_timeout(
+                limit_symbols=fallback_limit,
+                timeout_seconds=hard_fallback_timeout,
+                exchange_scope=exchange_scope,
+                fallback_light=True,
+            )
+        return _run_short_term_scan_batch_no_timeout(
             limit_symbols=fallback_limit,
-            timeout_seconds=hard_fallback_timeout,
             exchange_scope=exchange_scope,
             fallback_light=True,
         )
@@ -989,6 +1084,17 @@ def _persist_run_row(
                     %(id)s, %(started_at)s, %(finished_at)s, %(run_status)s,
                     %(scanned)s, %(buy_candidates)s, %(risk_rejected)s, %(executed)s, %(execution_rejected)s, %(errors)s, %(detail)s
                 )
+                ON CONFLICT (id) DO UPDATE
+                SET started_at = EXCLUDED.started_at,
+                    finished_at = EXCLUDED.finished_at,
+                    run_status = EXCLUDED.run_status,
+                    scanned = EXCLUDED.scanned,
+                    buy_candidates = EXCLUDED.buy_candidates,
+                    risk_rejected = EXCLUDED.risk_rejected,
+                    executed = EXCLUDED.executed,
+                    execution_rejected = EXCLUDED.execution_rejected,
+                    errors = EXCLUDED.errors,
+                    detail = EXCLUDED.detail
                 """,
                 {
                     "id": run_id,
@@ -1005,6 +1111,48 @@ def _persist_run_row(
                 },
             )
         conn.commit()
+
+
+def mark_stale_short_term_running_runs(*, older_than_minutes: int = _STALE_RUNNING_RUN_MINUTES) -> int:
+    """
+    Mark RUNNING automation rows left behind by a prior process death/restart.
+
+    A live cycle holds only an in-process call stack plus a DB advisory-lock session;
+    after the process exits there is no owner that can finish its RUNNING row.
+    """
+    ensure_short_term_automation_runs_table()
+    safe_minutes = max(5, int(older_than_minutes))
+    with connect(settings.database_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE short_term_automation_runs
+                SET run_status = 'FAILED_STALE',
+                    finished_at = NOW(),
+                    errors = GREATEST(errors, 1),
+                    detail = detail || %(patch)s::jsonb
+                WHERE run_status = 'RUNNING'
+                  AND started_at < NOW() - (%(minutes)s::text || ' minutes')::interval
+                """,
+                {
+                    "minutes": safe_minutes,
+                    "patch": Json(
+                        {
+                            "stale_recovery": True,
+                            "stale_reason": "backend_startup_found_orphan_running_run",
+                            "stale_after_minutes": safe_minutes,
+                        }
+                    ),
+                },
+            )
+            updated = int(cur.rowcount or 0)
+        conn.commit()
+    if updated:
+        logger.warning(
+            "short_term_stale_running_runs_marked",
+            extra={"updated": updated, "older_than_minutes": safe_minutes},
+        )
+    return updated
 
 
 def get_last_short_term_automation_run() -> Optional[dict[str, Any]]:
@@ -1075,6 +1223,8 @@ def run_short_term_production_cycle(
     scheduler_sequence_total: int | None = None,
     manual_trigger_id: str | None = None,
     demo_session_id: str | None = None,
+    scheduler_disable_timeouts: bool = False,
+    strategy_code: str = "SHORT_TERM",
 ) -> dict[str, Any]:
     """
     One full cycle under a single DB advisory lock.
@@ -1083,13 +1233,16 @@ def run_short_term_production_cycle(
     configured interval grid within VN regular sessions (weekdays; configured market holidays excluded).
     """
     normalized_account_mode = str(account_mode or "").strip().upper()
+    normalized_strategy_code = str(strategy_code or "").strip().upper() or "SHORT_TERM"
     started_at = _utc_now()
     run_id = uuid4()
     base_detail: dict[str, Any] = {
         "account_mode": normalized_account_mode,
+        "strategy_code": normalized_strategy_code,
         "limit_symbols": limit_symbols,
         "exchange_scope": str(exchange_scope).upper(),
         "enforce_vn_scan_schedule": enforce_vn_scan_schedule,
+        "scheduler_disable_timeouts": bool(scheduler_disable_timeouts),
     }
     if scheduler_trigger_batch_id:
         base_detail["scheduler_trigger_batch_id"] = str(scheduler_trigger_batch_id)
@@ -1099,14 +1252,16 @@ def run_short_term_production_cycle(
         base_detail["scheduler_sequence_total"] = int(scheduler_sequence_total)
     if manual_trigger_id:
         base_detail["manual_trigger_id"] = str(manual_trigger_id)
-    if normalized_account_mode == "DEMO" and demo_session_id:
-        base_detail["demo_session_id"] = str(demo_session_id).strip()
-    advisory_lock_key = _resolve_advisory_lock_key(normalized_account_mode)
+    if normalized_account_mode == "DEMO":
+        # Always persist (even null) so FE can filter / explain missing logs vs session mismatch.
+        base_detail["demo_session_id"] = str(demo_session_id).strip() if demo_session_id else None
+    advisory_lock_key = _resolve_advisory_lock_key(normalized_account_mode, normalized_strategy_code)
     logger.warning(
         "short_term_cycle_started",
         extra={
             "run_id": str(run_id),
             "account_mode": normalized_account_mode,
+            "strategy_code": normalized_strategy_code,
             "limit_symbols": limit_symbols,
             "exchange_scope": str(exchange_scope).upper(),
             "risk_per_trade": risk_per_trade,
@@ -1158,6 +1313,21 @@ def run_short_term_production_cycle(
             }
 
         try:
+            # Persist an in-progress heartbeat row as soon as lock is acquired so
+            # operators can see the cycle during long scans (not only after finish).
+            _persist_run_row(
+                run_id=run_id,
+                started_at=started_at,
+                finished_at=started_at,
+                run_status="RUNNING",
+                scanned=0,
+                buy_candidates=0,
+                risk_rejected=0,
+                executed=0,
+                execution_rejected=0,
+                errors=0,
+                detail={**base_detail, "lifecycle": "running"},
+            )
             if enforce_vn_scan_schedule:
                 batch_continuation = bool(
                     scheduler_trigger_batch_id
@@ -1252,6 +1422,9 @@ def run_short_term_production_cycle(
                             int(settings.automation_short_term_scan_all_phase_timeout_seconds),
                         ),
                     )
+                    if scheduler_disable_timeouts:
+                        phase_timeout = 0
+                        phase_fallback_timeout = 0
                     for idx, scope_name in enumerate(phased_scopes):
                         try:
                             scoped_batch = _run_scan_with_timeout_fallback(
@@ -1317,10 +1490,20 @@ def run_short_term_production_cycle(
                 else:
                     scoped_timeout = int(settings.automation_short_term_scan_timeout_seconds)
                     scoped_fallback_timeout = int(settings.automation_short_term_scan_fallback_light_timeout_seconds)
-                    # Single-exchange runs should fail fast enough for operations visibility.
-                    if int(limit_symbols) > 0:
-                        scoped_timeout = min(scoped_timeout, 180)
-                        scoped_fallback_timeout = min(scoped_fallback_timeout, 120)
+                    if scheduler_disable_timeouts:
+                        scoped_timeout = 0
+                        scoped_fallback_timeout = 0
+                    # Single-exchange runs must always be capped regardless of limit_symbols.
+                    # Without this cap, unlimited (limit_symbols=0) single-exchange manual
+                    # runs used the full 900s timeout, hiding hangs for up to 30 minutes.
+                    # Capped values: 300s full / 180s fallback for unlimited; 180s/120s for bounded.
+                    if not scheduler_disable_timeouts:
+                        if int(limit_symbols) > 0:
+                            scoped_timeout = min(scoped_timeout, 180)
+                            scoped_fallback_timeout = min(scoped_fallback_timeout, 120)
+                        else:
+                            scoped_timeout = min(scoped_timeout, 300)
+                            scoped_fallback_timeout = min(scoped_fallback_timeout, 180)
                     batch = _run_scan_with_timeout_fallback(
                         run_id=run_id,
                         limit_symbols=limit_symbols,
@@ -1401,13 +1584,38 @@ def run_short_term_production_cycle(
             execution_rejected = 0
             errors = 0
             executions_detail: list[dict[str, Any]] = []
-            buy_step_timeout_seconds = max(
-                5,
-                int(settings.automation_short_term_buy_step_timeout_seconds),
+            buy_step_timeout_seconds = (
+                0 if scheduler_disable_timeouts else max(5, int(settings.automation_short_term_buy_step_timeout_seconds))
             )
 
             daily_new_orders = _count_short_term_new_orders_today(account_mode)
-            sell_candidates = _build_sell_candidates_from_positions(account_mode)
+            sell_candidates_error: str | None = None
+            try:
+                sell_candidates = _call_with_thread_timeout(
+                    name=f"short-term-sell-candidate-scan-{normalized_account_mode.lower()}",
+                    timeout_seconds=buy_step_timeout_seconds,
+                    fn=lambda: _build_sell_candidates_from_positions(account_mode),
+                )
+            except queue.Empty:
+                sell_candidates = []
+                errors += 1
+                sell_candidates_error = f"sell_candidate_scan_timeout:{buy_step_timeout_seconds}s"
+                logger.warning(
+                    "short_term_sell_candidate_scan_timeout",
+                    extra={
+                        "run_id": str(run_id),
+                        "account_mode": account_mode,
+                        "timeout_seconds": buy_step_timeout_seconds,
+                    },
+                )
+            except Exception as exc:
+                sell_candidates = []
+                errors += 1
+                sell_candidates_error = str(exc)
+                logger.warning(
+                    "short_term_sell_candidate_scan_failed",
+                    extra={"run_id": str(run_id), "account_mode": account_mode, "error": str(exc)},
+                )
             remaining_cash_runtime = max(0.0, float(nav))
             buy_rows_all = [s for s in signals if str(s.get("action", "")).upper() == "BUY"]
             sell_trigger_symbols = {str(row.get("symbol") or "").strip().upper() for row in sell_candidates}
@@ -1415,11 +1623,47 @@ def run_short_term_production_cycle(
                 row for row in buy_rows_all if str(row.get("symbol") or "").strip().upper() not in sell_trigger_symbols
             ]
             strategy_remaining_cash = float(remaining_cash_runtime)
-            buy_rows_decided, planned_qty_by_signal_id, decision_meta = _apply_claude_buy_decision(
-                buy_rows=buy_rows_filtered,
-                strategy_remaining_cash=strategy_remaining_cash,
-                lot_size=100,
-            )
+            try:
+                buy_rows_decided, planned_qty_by_signal_id, decision_meta = _call_with_thread_timeout(
+                    name=f"short-term-buy-decision-{normalized_account_mode.lower()}",
+                    timeout_seconds=buy_step_timeout_seconds,
+                    fn=lambda: _apply_claude_buy_decision(
+                        buy_rows=buy_rows_filtered,
+                        strategy_remaining_cash=strategy_remaining_cash,
+                        lot_size=100,
+                    ),
+                )
+            except queue.Empty:
+                planned_qty_by_signal_id = _allocate_quantities_by_score(
+                    buy_rows_filtered,
+                    strategy_remaining_cash,
+                    lot_size=100,
+                )
+                buy_rows_decided = [dict(row) for row in buy_rows_filtered]
+                decision_meta = {
+                    "source": "score_weighted_fallback",
+                    "selected": len(buy_rows_decided),
+                    "strategy_remaining_cash": strategy_remaining_cash,
+                    "fallback_reason": f"claude_buy_decision_timeout:{buy_step_timeout_seconds}s",
+                }
+                logger.warning(
+                    "short_term_claude_buy_decision_timeout",
+                    extra={"run_id": str(run_id), "timeout_seconds": buy_step_timeout_seconds},
+                )
+            except Exception as exc:
+                planned_qty_by_signal_id = _allocate_quantities_by_score(
+                    buy_rows_filtered,
+                    strategy_remaining_cash,
+                    lot_size=100,
+                )
+                buy_rows_decided = [dict(row) for row in buy_rows_filtered]
+                decision_meta = {
+                    "source": "score_weighted_fallback",
+                    "selected": len(buy_rows_decided),
+                    "strategy_remaining_cash": strategy_remaining_cash,
+                    "fallback_reason": str(exc),
+                }
+                logger.warning("short_term_buy_decision_failed", extra={"run_id": str(run_id), "error": str(exc)})
             buy_rows: list[dict[str, Any]] = []
             for row in buy_rows_decided:
                 sid = str(row.get("id") or "")
@@ -1451,10 +1695,14 @@ def run_short_term_production_cycle(
 
             for sell_candidate in sell_candidates:
                 try:
-                    one = _handle_one_sell_candidate(
-                        candidate=sell_candidate,
-                        account_mode=account_mode,
-                        run_id=run_id,
+                    one = _call_with_thread_timeout(
+                        name=f"short-term-sell-step-{str(sell_candidate.get('symbol') or 'unknown').strip().upper()}",
+                        timeout_seconds=buy_step_timeout_seconds,
+                        fn=lambda sell_candidate=sell_candidate: _handle_one_sell_candidate(
+                            candidate=sell_candidate,
+                            account_mode=account_mode,
+                            run_id=run_id,
+                        ),
                     )
                     executed += int(one.get("executed") or 0)
                     execution_rejected += int(one.get("execution_rejected") or 0)
@@ -1462,6 +1710,26 @@ def run_short_term_production_cycle(
                     detail_row = one.get("detail")
                     if isinstance(detail_row, dict):
                         executions_detail.append(detail_row)
+                except queue.Empty:
+                    errors += 1
+                    execution_rejected += 1
+                    symbol = str(sell_candidate.get("symbol") or "").strip().upper()
+                    logger.warning(
+                        "short_term_sell_handling_timeout",
+                        extra={
+                            "run_id": str(run_id),
+                            "symbol": symbol,
+                            "timeout_seconds": buy_step_timeout_seconds,
+                        },
+                    )
+                    executions_detail.append(
+                        {
+                            "symbol": symbol,
+                            "side": "SELL",
+                            "outcome": "error",
+                            "error": f"sell_step_timeout:{buy_step_timeout_seconds}s",
+                        }
+                    )
                 except Exception as exc:
                     errors += 1
                     execution_rejected += 1
@@ -1503,7 +1771,10 @@ def run_short_term_production_cycle(
                         name=f"short-term-buy-step-{symbol or 'unknown'}",
                         daemon=True,
                     ).start()
-                    kind, payload = result_q.get(timeout=buy_step_timeout_seconds)
+                    if buy_step_timeout_seconds > 0:
+                        kind, payload = result_q.get(timeout=buy_step_timeout_seconds)
+                    else:
+                        kind, payload = result_q.get()
                     if kind == "err":
                         raise payload
                     one = payload
@@ -1570,6 +1841,8 @@ def run_short_term_production_cycle(
                 "buy_decision_meta": decision_meta_enriched,
                 "sell_candidates": len(sell_candidates),
             }
+            if sell_candidates_error:
+                detail["sell_candidates_error"] = sell_candidates_error
             for obs_key in (
                 "listing_target_symbols",
                 "listing_candidates_total",
