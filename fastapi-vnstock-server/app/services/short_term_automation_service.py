@@ -408,14 +408,56 @@ def _get_position_exit_levels(*, account_mode: str, symbol: str, avg_price: floa
         return fallback_tp, fallback_sl
 
 
+def _fetch_real_dnse_holdings_symbols() -> set[str] | None:
+    """Returns symbols DNSE confirms as held (qty > 0) for the REAL account, or None on failure."""
+    try:
+        from app.services.execution.factory import get_execution_adapter
+        adapter = get_execution_adapter("REAL")
+        fn = getattr(adapter, "readonly_list_holdings", None)
+        if not callable(fn):
+            return None
+        rows = fn()
+        symbols: set[str] = set()
+        for row in rows:
+            sym = str(
+                row.get("symbol") or row.get("stockSymbol") or
+                row.get("instrumentSymbol") or row.get("stockCode") or ""
+            ).strip().upper()
+            try:
+                qty = int(row.get("totalQty") or row.get("quantity") or row.get("qty") or 0)
+            except (TypeError, ValueError):
+                qty = 0
+            if sym and qty > 0:
+                symbols.add(sym)
+        return symbols
+    except Exception as exc:
+        logger.warning("dnse_holdings_fetch_failed | error=%s", exc)
+        return None
+
+
 def _build_sell_candidates_from_positions(account_mode: str) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
+    # For REAL accounts, validate against live DNSE holdings.
+    # Fail-open: if DNSE is unreachable, fall back to DB-only with a warning.
+    dnse_confirmed: set[str] | None = None
+    if account_mode == "REAL":
+        dnse_confirmed = _fetch_real_dnse_holdings_symbols()
+        if dnse_confirmed is not None:
+            logger.info("dnse_holdings_guard_active | confirmed_symbols=%s", sorted(dnse_confirmed))
+        else:
+            logger.warning("dnse_holdings_guard_skipped | sell_candidates_built_from_db_only")
     for pos in get_positions(account_mode):
         symbol = str(pos.get("symbol") or "").strip().upper()
         available_qty = int(pos.get("available_qty") or 0)
         avg_price = float(pos.get("avg_price") or 0.0)
         qty = (available_qty // 100) * 100
         if not symbol or qty <= 0 or avg_price <= 0:
+            continue
+        if dnse_confirmed is not None and symbol not in dnse_confirmed:
+            logger.warning(
+                "sell_blocked_not_in_dnse | symbol=%s | account_mode=%s | db_qty=%d",
+                symbol, account_mode, qty,
+            )
             continue
         closes, _ = _get_close_and_volume(symbol=symbol, bars=3, exchange="")
         if not closes:

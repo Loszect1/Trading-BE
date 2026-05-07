@@ -143,6 +143,32 @@ class DnseLiveExecutionAdapter:
         df = self._call_with_timeout(_do, timeout)
         return self._dataframe_rows_dicts(df)
 
+    def readonly_list_holdings(self) -> list[dict[str, Any]]:
+        """Live read-only call: fetch DNSE stock portfolio holdings for the configured sub-account."""
+        gate = self._token_gate()
+        if gate:
+            raise RuntimeError(gate.reason or "dnse_tokens_invalid")
+        sub = self._sub_account()
+        if not sub:
+            raise RuntimeError("dnse_sub_account_missing")
+        token = (self._settings.dnse_access_token or "").strip()
+        timeout = float(self._settings.dnse_execution_timeout_seconds)
+        url = f"https://api.dnse.com.vn/order-service/portfolio?accountNo={sub}"
+        headers = {"Authorization": f"Bearer {token}"}
+
+        def _do() -> list[dict[str, Any]]:
+            import requests as _req
+            resp = _req.get(url, headers=headers, timeout=max(5.0, timeout))
+            if resp.status_code == 200:
+                body = resp.json()
+                rows = body if isinstance(body, list) else body.get("data", [])
+                if not isinstance(rows, list):
+                    rows = []
+                return [{str(k): v for k, v in row.items()} for row in rows if isinstance(row, dict)]
+            raise RuntimeError(f"dnse_portfolio_http_{resp.status_code}")
+
+        return self._call_with_timeout(_do, timeout)
+
     def _place_order(self, trade: Any, ctx: OrderExecutionContext) -> dict[str, Any]:
         side = "buy" if str(ctx.side).upper() == "BUY" else "sell"
         timeout = float(self._settings.dnse_execution_timeout_seconds)
