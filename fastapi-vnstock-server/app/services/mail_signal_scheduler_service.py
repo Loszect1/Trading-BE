@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
+import unicodedata
 from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -170,6 +172,123 @@ def _parse_claude_json(raw_text: str) -> list[dict[str, Any]]:
     return parsed
 
 
+def _strip_markdown_cell(text: str) -> str:
+    value = str(text or "").strip()
+    value = value.replace("**", "").replace("`", "")
+    value = re.sub(r"<[^>]+>", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _ascii_upper(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", str(text or ""))
+    ascii_text = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return ascii_text.upper()
+
+
+def _first_number(text: str) -> float | None:
+    match = re.search(r"-?\d+(?:[.,]\d+)?", str(text or ""))
+    if not match:
+        return None
+    try:
+        return float(match.group(0).replace(",", "."))
+    except ValueError:
+        return None
+
+
+def _rr_value(text: str) -> float:
+    raw = str(text or "")
+    match = re.search(r"1\s*:\s*(-?\d+(?:[.,]\d+)?)", raw)
+    if match:
+        try:
+            return float(match.group(1).replace(",", "."))
+        except ValueError:
+            return 0.0
+    value = _first_number(raw)
+    return float(value or 0.0)
+
+
+def _fallback_confidence(*, rr: float, recommendation: str, setup_type: str) -> float:
+    score = 0.45
+    score += min(0.25, max(0.0, rr) / 20.0)
+    rec = _ascii_upper(recommendation)
+    setup = _ascii_upper(setup_type)
+    if "MUA" in rec:
+        score += 0.15
+    if "CAN CUNG" in setup or "BREAKOUT" in setup:
+        score += 0.05
+    return round(max(0.0, min(0.9, score)), 4)
+
+
+def _parse_markdown_recommendation_table(text: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line.startswith("|") or "**" not in line:
+            continue
+        cells = [_strip_markdown_cell(cell) for cell in line.strip("|").split("|")]
+        if len(cells) < 8:
+            continue
+        symbol = re.sub(r"[^A-Za-z0-9]", "", cells[0]).upper()
+        if not symbol or symbol in seen or symbol in {"MA", "CODE"}:
+            continue
+        setup_type = cells[1]
+        entry = _first_number(cells[2])
+        take_profit = _first_number(cells[3])
+        stop_loss = _first_number(cells[5])
+        rr = _rr_value(cells[6])
+        recommendation = cells[7]
+        rec_norm = _ascii_upper(recommendation)
+        if "TRANH" in rec_norm:
+            continue
+        if "MUA" not in rec_norm:
+            continue
+        if entry is None or take_profit is None or stop_loss is None:
+            continue
+        if rr < 1.5:
+            continue
+        if stop_loss >= entry or take_profit <= entry:
+            continue
+        reason_parts = [
+            f"fallback_mail_parser",
+            f"type={setup_type}",
+            f"rr_tp1={rr:g}",
+            f"recommendation={recommendation}",
+        ]
+        rows.append(
+            {
+                "symbol": symbol,
+                "entry": _normalize_vn_price_unit(entry),
+                "take_profit": _normalize_vn_price_unit(take_profit),
+                "stop_loss": _normalize_vn_price_unit(stop_loss),
+                "confidence": _fallback_confidence(rr=rr, recommendation=recommendation, setup_type=setup_type),
+                "reason": " | ".join(reason_parts),
+            }
+        )
+        seen.add(symbol)
+    return rows
+
+
+def _fallback_parse_mail_signal_items(mail_rows: list[dict[str, str]]) -> list[dict[str, Any]]:
+    parsed: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in mail_rows:
+        text = "\n".join([str(row.get("subject", "")), str(row.get("text", ""))])
+        for item in _parse_markdown_recommendation_table(text):
+            symbol = str(item.get("symbol") or "").strip().upper()
+            if not symbol or symbol in seen:
+                continue
+            try:
+                validated = _SignalPick.model_validate(item)
+            except ValidationError:
+                continue
+            if float(validated.stop_loss) >= float(validated.entry) or float(validated.take_profit) <= float(validated.entry):
+                continue
+            parsed.append(validated.model_dump())
+            seen.add(symbol)
+    return parsed
+
+
 def run_mail_signal_pipeline() -> dict[str, Any]:
     query = str(settings.mail_signal_gmail_query or "").strip() or "Tín hiệu Cạn Cung"
     max_results = int(settings.mail_signal_gmail_max_results)
@@ -190,25 +309,36 @@ def run_mail_signal_pipeline() -> dict[str, Any]:
         )
         return result
 
-    prompt = _build_prompt(mail_rows)
-    response_text = _claude.generate_text_with_resilience(
-        prompt=prompt,
-        system_prompt="Ban la chuyen gia swing trading VN, output chuan JSON va uu tien quan tri rui ro.",
-        model=settings.claude_model,
-        max_tokens=900,
-        temperature=0.1,
-        cache_namespace="mail_signal_daily",
-        cache_ttl_seconds=900,
-    )
-    items = _parse_claude_json(response_text)
+    source = "claude"
+    fallback_error = ""
+    try:
+        prompt = _build_prompt(mail_rows)
+        response_text = _claude.generate_text_with_resilience(
+            prompt=prompt,
+            system_prompt="Ban la chuyen gia swing trading VN, output chuan JSON va uu tien quan tri rui ro.",
+            model=settings.claude_model,
+            max_tokens=900,
+            temperature=0.1,
+            cache_namespace="mail_signal_daily",
+            cache_ttl_seconds=900,
+        )
+        items = _parse_claude_json(response_text)
+    except Exception as exc:
+        logger.warning("mail_signal_claude_failed_using_fallback", extra={"error": str(exc)})
+        items = _fallback_parse_mail_signal_items(mail_rows)
+        source = "deterministic_fallback"
+        fallback_error = str(exc)
     result = {
         "success": True,
         "query": query,
         "mail_count": len(mail_rows),
         "items": items,
+        "source": source,
         "generated_at": datetime.now(tz=ZoneInfo(settings.mail_signal_scheduler_timezone)).isoformat(),
         "source_message_ids": [row.get("gmail_message_id", "") for row in mail_rows],
     }
+    if fallback_error:
+        result["fallback_error"] = fallback_error
     _redis.set_json(
         _daily_key(),
         result,
@@ -408,6 +538,10 @@ def run_prev_day_entry_auto_trading_once(
                         "risk_per_trade": risk_per_trade,
                         "daily_new_orders": 0,
                         "max_daily_new_orders": 10_000,
+                        "take_profit_price": float(item.take_profit),
+                        "side": "BUY",
+                        "min_reward_risk": 1.5,
+                        "board_lot_size": 100,
                     }
                 )
                 raw_qty = min(max_qty, int(risk.get("suggested_size") or 0))

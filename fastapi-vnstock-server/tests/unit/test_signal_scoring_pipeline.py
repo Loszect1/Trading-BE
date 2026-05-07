@@ -163,6 +163,33 @@ def test_short_term_technical_score_bounds():
         volumes=[100.0, 100.0, 200.0],
     )
     assert 0 <= tech["score_0_100"] <= 100
+    assert "rsi14" in tech["detail"]
+    assert "stretch_penalty" in tech["detail"]
+
+
+def test_short_term_technical_penalizes_overstretched_chase():
+    base = score_short_term_technical(
+        spike=2.5,
+        last_close=105.0,
+        ema20_proxy=100.0,
+        closes=[100.0 + i * 0.1 for i in range(30)],
+        volumes=[100.0] * 29 + [220.0],
+        momentum_5d_pct=2.0,
+        rsi14=62.0,
+        distance_from_ema20_pct=5.0,
+    )
+    stretched = score_short_term_technical(
+        spike=2.5,
+        last_close=118.0,
+        ema20_proxy=100.0,
+        closes=[100.0 + i * 0.1 for i in range(30)],
+        volumes=[100.0] * 29 + [220.0],
+        momentum_5d_pct=8.0,
+        rsi14=84.0,
+        distance_from_ema20_pct=18.0,
+    )
+    assert stretched["detail"]["stretch_penalty"] > 0
+    assert stretched["score_0_100"] < base["score_0_100"]
 
 
 def test_long_term_technical():

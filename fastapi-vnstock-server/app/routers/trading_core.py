@@ -74,6 +74,7 @@ def execution_place(payload: ExecutionPlaceRequest) -> dict:
                     "risk_per_trade": payload.risk_per_trade,
                     "entry_price": payload.price,
                     "stoploss_price": stoploss,
+                    "side": "BUY",
                     "daily_new_orders": 0,
                     "max_daily_new_orders": 10,
                 }

@@ -37,6 +37,9 @@ class ClaudeService:
         max_tokens: Optional[int] = None,
         temperature: float = 0.2,
     ) -> str:
+        if not settings.use_claude:
+            raise RuntimeError("claude_disabled")
+
         token = (settings.claude_token or "").strip()
         if not token:
             raise ValueError("Missing CLAUDE_TOKEN in environment.")

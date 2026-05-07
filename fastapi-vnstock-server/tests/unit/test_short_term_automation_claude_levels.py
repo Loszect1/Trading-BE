@@ -4,7 +4,7 @@ import app.services.short_term_automation_service as auto_svc
 
 
 def test_refine_buy_levels_with_claude_parses_valid_json(monkeypatch) -> None:
-    monkeypatch.setattr(auto_svc.settings, "ai_claude_automation_levels_enabled", True)
+    monkeypatch.setattr(auto_svc.settings, "use_claude", True)
     monkeypatch.setattr(
         auto_svc._automation_claude_service,
         "generate_text_with_resilience",
@@ -22,7 +22,7 @@ def test_refine_buy_levels_with_claude_parses_valid_json(monkeypatch) -> None:
 
 
 def test_refine_buy_levels_with_claude_rejects_invalid_constraints(monkeypatch) -> None:
-    monkeypatch.setattr(auto_svc.settings, "ai_claude_automation_levels_enabled", True)
+    monkeypatch.setattr(auto_svc.settings, "use_claude", True)
     monkeypatch.setattr(
         auto_svc._automation_claude_service,
         "generate_text_with_resilience",

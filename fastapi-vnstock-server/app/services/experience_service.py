@@ -46,18 +46,40 @@ def _utc_now() -> datetime:
     return datetime.now(tz=timezone.utc)
 
 
+def _context_float(ctx: dict[str, Any], key: str, default: float) -> float:
+    try:
+        value = ctx.get(key, default)
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _guess_root_cause(record: ExperienceRecord) -> tuple[str, list[str], str]:
     tags: list[str] = []
     root_cause = "execution_noise"
     improvement_action = "Giam khoi luong lenh, tang nguong xac nhan volume truoc khi vao lenh."
 
     trend = str(record.market_context.get("trend", "")).lower()
+    market_regime = str(record.market_context.get("market_regime", "")).lower()
     sentiment = str(record.market_context.get("sentiment", "")).lower()
-    volume_spike = float(record.market_context.get("volume_spike", 1.0))
-    rr_realized = float(record.market_context.get("rr_realized", 0.0))
+    volume_spike = _context_float(record.market_context, "volume_spike", 1.0)
+    rsi14 = _context_float(record.market_context, "rsi14", 50.0)
+    distance_from_ema20_pct = _context_float(record.market_context, "distance_from_ema20_pct", 0.0)
+    liquidity_value = _context_float(
+        record.market_context,
+        "liquidity_value",
+        _context_float(record.market_context, "avg_value_20d", 0.0),
+    )
+    rr_realized = _context_float(record.market_context, "rr_realized", 0.0)
 
     if record.pnl_percent <= -2:
         tags.append("stoploss_hit")
+    if market_regime == "risk_off":
+        tags.append("market_regime_risk_off")
+        root_cause = "market_regime_filter_missed"
+        improvement_action = "Khi VNINDEX risk-off, tang nguong composite va chi mua setup co breakout kem volume/RS ro rang."
     if volume_spike < 1.2:
         tags.append("weak_volume_confirmation")
         root_cause = "false_breakout"
@@ -70,6 +92,18 @@ def _guess_root_cause(record: ExperienceRecord) -> tuple[str, list[str], str]:
         tags.append("news_risk_missed")
         root_cause = "news_filter_missed"
         improvement_action = "Tang trong so news filter va loai bo ma co sentiment am trong 24h."
+    if rsi14 >= 78:
+        tags.append("overbought_chase")
+        root_cause = "late_entry_after_momentum"
+        improvement_action = "Khong mua duoi khi RSI >= 78; doi pullback ve EMA20 hoac nen tich luy vol giam."
+    if distance_from_ema20_pct >= 10:
+        tags.append("overextended_from_ema20")
+        root_cause = "overextended_entry"
+        improvement_action = "Gioi han khoang cach gia voi EMA20 duoi 8% truoc khi mo lenh moi."
+    if 0 < liquidity_value < 5_000_000_000:
+        tags.append("thin_liquidity")
+        root_cause = "liquidity_risk"
+        improvement_action = "Loai bo ma co gia tri giao dich 20 phien duoi 5 ty hoac giam ty trong vi the."
     if rr_realized < 1.0:
         tags.append("low_rr")
         if root_cause == "execution_noise":
@@ -80,6 +114,51 @@ def _guess_root_cause(record: ExperienceRecord) -> tuple[str, list[str], str]:
         tags.append("unclassified")
 
     return root_cause, tags, improvement_action
+
+
+def _heuristic_market_adaptation(tags: list[str], market_context: dict[str, Any]) -> dict[str, Any]:
+    """
+    Deterministic fallback for entry-gate adaptation when Claude is disabled or unavailable.
+    Values mirror the scan gate fields consumed by signal_engine_service.
+    """
+    tag_set = {str(tag).strip().lower() for tag in tags if str(tag).strip()}
+    rollup = market_context.get("experience_rollup") if isinstance(market_context, dict) else None
+    stoploss_hits = int((rollup or {}).get("stoploss_hits") or 0) if isinstance(rollup, dict) else 0
+    samples = int((rollup or {}).get("samples") or 1) if isinstance(rollup, dict) else 1
+    stoploss_ratio = float(stoploss_hits) / float(max(1, samples))
+
+    min_spike = 1.8
+    min_momentum = 1.0
+    max_distance = 8.0
+    if stoploss_ratio >= 0.5 or {"weak_volume_confirmation", "false_breakout"} & tag_set:
+        min_spike = 2.2
+        min_momentum = 1.5
+        max_distance = 6.5
+    if {"overbought_chase", "overextended_from_ema20", "late_entry_after_momentum", "overextended_entry"} & tag_set:
+        max_distance = min(max_distance, 5.0)
+        min_momentum = max(min_momentum, 1.8)
+    if "market_regime_risk_off" in tag_set:
+        min_spike = max(min_spike, 2.4)
+        min_momentum = max(min_momentum, 2.0)
+        max_distance = min(max_distance, 5.0)
+
+    return {
+        "risk_on": {
+            "min_spike_ratio": round(max(1.6, min_spike - 0.2), 4),
+            "min_momentum_5d_pct": round(max(0.8, min_momentum - 0.3), 4),
+            "max_distance_from_ema20_pct": round(min(8.0, max_distance + 1.0), 4),
+        },
+        "neutral": {
+            "min_spike_ratio": round(min_spike, 4),
+            "min_momentum_5d_pct": round(min_momentum, 4),
+            "max_distance_from_ema20_pct": round(max_distance, 4),
+        },
+        "risk_off": {
+            "min_spike_ratio": round(max(2.2, min_spike + 0.2), 4),
+            "min_momentum_5d_pct": round(max(1.8, min_momentum + 0.4), 4),
+            "max_distance_from_ema20_pct": round(min(5.0, max_distance), 4),
+        },
+    }
 
 
 def _extract_json_object(raw_text: str) -> dict[str, Any] | None:
@@ -100,7 +179,7 @@ def _extract_json_object(raw_text: str) -> dict[str, Any] | None:
 
 
 def _analyze_experience_with_claude(record: ExperienceRecord) -> tuple[str, list[str], str, float, dict[str, Any]]:
-    if not settings.ai_claude_experience_enabled:
+    if not settings.use_claude:
         raise RuntimeError("claude_experience_disabled")
 
     prompt = (
@@ -298,17 +377,26 @@ def create_experience_from_trade(payload: dict[str, Any]) -> dict[str, Any]:
 
     root_cause, tags, improvement_action = _guess_root_cause(record)
     confidence_after_review = record.confidence_after_review
-    claude_market_adaptation: dict[str, Any] = {}
+    market_adaptation = _heuristic_market_adaptation(tags, record.market_context)
+    analysis_source = "heuristic_fallback"
+    analysis_error = ""
     try:
         root_cause, tags, improvement_action, confidence_after_review, claude_market_adaptation = _analyze_experience_with_claude(
             record
         )
-    except Exception:
-        # Keep heuristic fallback to avoid blocking trade-close pipeline.
-        pass
-    if isinstance(record.market_context, dict):
         if claude_market_adaptation:
-            record.market_context["claude_market_adaptation"] = claude_market_adaptation
+            market_adaptation = claude_market_adaptation
+        analysis_source = "claude"
+    except Exception as exc:
+        # Keep heuristic fallback to avoid blocking trade-close pipeline.
+        analysis_error = str(exc)
+    if isinstance(record.market_context, dict):
+        record.market_context["experience_analysis_source"] = analysis_source
+        if analysis_error:
+            record.market_context["experience_analysis_error"] = analysis_error
+        if market_adaptation:
+            record.market_context["claude_market_adaptation"] = market_adaptation
+            record.market_context["experience_market_adaptation"] = market_adaptation
 
     with connect(settings.database_url, row_factory=dict_row) as conn:
         with conn.cursor() as cur:

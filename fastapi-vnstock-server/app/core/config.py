@@ -23,20 +23,16 @@ class AppSettings(BaseSettings):
     claude_fallback_model: str = "claude-3-5-haiku-latest"
     claude_max_tokens: int = 1024
     claude_max_retries: int = 3
-    #: Enable Claude-based enrichment for signal scoring metadata.
-    ai_claude_signal_scoring_enabled: bool = False
+    #: Single global switch for all Claude-backed features.
+    use_claude: bool = False
     #: Max tokens for Claude scoring enrichment responses.
     ai_claude_signal_scoring_max_tokens: int = Field(default=500, ge=128, le=2048)
     #: Redis cache TTL (seconds) for Claude scoring enrichment responses.
     ai_claude_signal_scoring_cache_ttl_seconds: int = Field(default=1800, ge=30, le=86_400)
-    #: Enable Claude-based analysis for experience root cause/action.
-    ai_claude_experience_enabled: bool = False
     #: Max tokens for Claude experience analysis responses.
     ai_claude_experience_max_tokens: int = Field(default=400, ge=128, le=2048)
     #: Redis cache TTL (seconds) for Claude experience analysis responses.
     ai_claude_experience_cache_ttl_seconds: int = Field(default=3600, ge=30, le=86_400)
-    #: Enable Claude refinement of BUY levels (entry/tp/sl) before automation execution.
-    ai_claude_automation_levels_enabled: bool = False
     #: Max tokens for Claude automation level refinement responses.
     ai_claude_automation_levels_max_tokens: int = Field(default=350, ge=128, le=2048)
     #: Redis cache TTL (seconds) for Claude automation level refinement.
@@ -172,7 +168,7 @@ class AppSettings(BaseSettings):
     #: When provided, this overrides `automation_short_term_post_close_refresh_hour`.
     automation_short_term_post_close_refresh_hours_csv: str = ""
     #: Retention window (days) for market_symbol_daily_volume writes.
-    market_symbol_daily_volume_retention_days: int = Field(default=30, ge=5, le=120)
+    market_symbol_daily_volume_retention_days: int = Field(default=90, ge=5, le=120)
     #: Optional CSV list of VN market holidays: YYYY-MM-DD,YYYY-MM-DD
     vn_market_holidays_csv: str = ""
     #: When true, merge packaged `app/data/vn_market_holidays_builtin.json` into the holiday set.

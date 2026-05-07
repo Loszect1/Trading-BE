@@ -79,7 +79,7 @@ def _extract_json_object(raw_text: str) -> dict[str, Any] | None:
 
 
 def _refine_buy_levels_with_claude(sig: dict[str, Any]) -> dict[str, Any] | None:
-    if not bool(settings.ai_claude_automation_levels_enabled):
+    if not settings.use_claude:
         return None
     symbol = str(sig.get("symbol") or "").strip().upper()
     entry = float(sig.get("entry_price") or 0.0)
@@ -251,6 +251,14 @@ def _apply_claude_buy_decision(
     safe_lot = max(1, int(lot_size))
     fallback_qty = _allocate_quantities_by_score(buy_rows, float(strategy_remaining_cash), lot_size=safe_lot)
     fallback_rows = [dict(row) for row in buy_rows]
+    if not settings.use_claude:
+        return fallback_rows, fallback_qty, {
+            "source": "score_weighted_fallback",
+            "selected": len(fallback_rows),
+            "strategy_remaining_cash": float(strategy_remaining_cash),
+            "fallback_reason": "claude_disabled",
+        }
+
     prompt = _build_claude_buy_decision_prompt(
         buy_rows=buy_rows,
         strategy_remaining_cash=float(strategy_remaining_cash),
@@ -600,6 +608,10 @@ def _handle_one_buy_signal(
         "risk_per_trade": float(risk_per_trade),
         "daily_new_orders": int(daily_new_orders),
         "max_daily_new_orders": int(max_daily_new_orders),
+        "take_profit_price": tp,
+        "side": "BUY",
+        "min_reward_risk": 1.5,
+        "board_lot_size": 100,
     }
     risk_result = evaluate_risk(risk_payload)
     if not risk_result.get("pass"):

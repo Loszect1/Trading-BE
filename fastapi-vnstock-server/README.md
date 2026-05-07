@@ -169,6 +169,7 @@ Example AI symbol analysis payload (POST `/ai/analyze-symbol`):
 Note:
 - Do not send `"model": "string"` from API docs default examples.
 - If `model` is missing or invalid placeholder, backend now auto-falls back to `CLAUDE_MODEL`.
+- All Claude-backed features are gated by one env flag: `USE_CLAUDE=false` disables them.
 
 ## DNSE Trading API
 

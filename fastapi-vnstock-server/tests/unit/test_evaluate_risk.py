@@ -26,12 +26,13 @@ def test_evaluate_risk_ok_suggested_size():
     assert r["reason"] == "ok"
     # distance 10, risk 1% of 1M = 10_000 / 10 = 1000
     assert r["suggested_size"] == 1000
+    assert r["suggested_lot_size"] == 1000
 
 
 def test_evaluate_risk_zero_stop_distance_rejected():
     r = evaluate_risk(_base_payload(stoploss_price=100.0, entry_price=100.0))
     assert r["pass"] is False
-    assert r["reason"] == "invalid_stoploss_distance"
+    assert r["reason"] == "invalid_buy_stoploss_geometry"
     assert r["suggested_size"] == 0
 
 
@@ -53,16 +54,27 @@ def test_evaluate_risk_size_too_small_rounds_to_zero():
     )
     assert r["suggested_size"] == 0
     assert r["pass"] is False
-    assert r["reason"] == "size_too_small"
+    assert r["reason"] == "size_below_board_lot"
 
 
-@pytest.mark.parametrize(
-    "entry,stop,expected",
-    [
-        (100.0, 110.0, 1000),
-        (100.0, 90.0, 1000),
-    ],
-)
-def test_evaluate_risk_symmetric_distance(entry, stop, expected):
-    r = evaluate_risk(_base_payload(entry_price=entry, stoploss_price=stop))
-    assert r["suggested_size"] == expected
+def test_evaluate_risk_rejects_buy_stop_above_entry():
+    r = evaluate_risk(_base_payload(entry_price=100.0, stoploss_price=110.0))
+    assert r["pass"] is False
+    assert r["reason"] == "invalid_buy_stoploss_geometry"
+
+
+def test_evaluate_risk_validates_reward_risk_when_take_profit_present():
+    weak = evaluate_risk(_base_payload(entry_price=100.0, stoploss_price=90.0, take_profit_price=110.0))
+    assert weak["pass"] is False
+    assert weak["reason"] == "reward_risk_below_min"
+    assert weak["reward_risk"] == pytest.approx(1.0)
+
+    good = evaluate_risk(_base_payload(entry_price=100.0, stoploss_price=90.0, take_profit_price=120.0))
+    assert good["pass"] is True
+    assert good["reward_risk"] == pytest.approx(2.0)
+
+
+def test_evaluate_risk_sell_geometry_is_directional():
+    r = evaluate_risk(_base_payload(entry_price=100.0, stoploss_price=110.0, side="SELL", take_profit_price=80.0))
+    assert r["pass"] is True
+    assert r["reward_risk"] == pytest.approx(2.0)

@@ -814,7 +814,67 @@ def _get_scan_symbol_exchange_pairs_from_liquidity_cache(
     return picked
 
 
-def _get_close_and_volume(symbol: str, bars: int = 120, exchange: str = "") -> tuple[list[float], list[float]]:
+def _get_close_and_volume_from_db(symbol: str, bars: int = 120, exchange: str = "") -> tuple[list[float], list[float]]:
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return [], []
+    safe_bars = max(1, min(int(bars), 500))
+    params: dict[str, Any] = {"symbol": sym, "bars": safe_bars}
+    exchange_filter = ""
+    ex = str(exchange or "").strip().upper()
+    if ex:
+        exchange_filter = "AND exchange = %(exchange)s"
+        params["exchange"] = ex
+    try:
+        _ensure_market_symbol_tables_once()
+        with connect(settings.database_url, row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    WITH last_rows AS (
+                        SELECT close_price, volume, trading_date
+                        FROM market_symbol_daily_volume
+                        WHERE UPPER(symbol) = %(symbol)s
+                          {exchange_filter}
+                          AND close_price IS NOT NULL
+                          AND close_price > 0
+                          AND volume >= 0
+                        ORDER BY trading_date DESC
+                        LIMIT %(bars)s
+                    )
+                    SELECT close_price, volume
+                    FROM last_rows
+                    ORDER BY trading_date ASC
+                    """,
+                    params,
+                )
+                rows = cur.fetchall()
+    except Exception:
+        return [], []
+
+    closes: list[float] = []
+    volumes: list[float] = []
+    for row in rows:
+        close = _to_float(row.get("close_price"))
+        volume = _to_float(row.get("volume"))
+        if close > 0 and volume >= 0:
+            closes.append(close)
+            volumes.append(volume)
+    return closes, volumes
+
+
+def _get_close_and_volume_with_source(
+    symbol: str,
+    bars: int = 120,
+    exchange: str = "",
+    *,
+    min_cached_bars: int | None = None,
+) -> tuple[list[float], list[float], str]:
+    cached_closes, cached_volumes = _get_close_and_volume_from_db(symbol=symbol, bars=bars, exchange=exchange)
+    required_cached_bars = int(min_cached_bars) if min_cached_bars is not None else int(bars)
+    if len(cached_closes) >= required_cached_bars and len(cached_volumes) >= required_cached_bars:
+        return cached_closes, cached_volumes, "db_cache"
+
     try:
         rows = vnstock_api_service.call_quote(
             "history",
@@ -824,7 +884,9 @@ def _get_close_and_volume(symbol: str, bars: int = 120, exchange: str = "") -> t
         )
     except Exception:
         # Skip symbol-level data-source failures; do not fail entire scan batch.
-        return [], []
+        if cached_closes and cached_volumes:
+            return cached_closes, cached_volumes, "db_cache_partial_after_vnstock_error"
+        return [], [], "missing"
     closes: list[float] = []
     volumes: list[float] = []
     raw_rows: list[dict[str, Any]] = []
@@ -851,6 +913,11 @@ def _get_close_and_volume(symbol: str, bars: int = 120, exchange: str = "") -> t
                 "persist_symbol_daily_volume_rows_failed",
                 extra={"symbol": symbol, "exchange": str(exchange).upper(), "error": str(exc)},
             )
+    return closes, volumes, "vnstock"
+
+
+def _get_close_and_volume(symbol: str, bars: int = 120, exchange: str = "") -> tuple[list[float], list[float]]:
+    closes, volumes, _source = _get_close_and_volume_with_source(symbol=symbol, bars=bars, exchange=exchange)
     return closes, volumes
 
 
@@ -1214,7 +1281,7 @@ def _claude_scoring_analysis(
     reason: str,
     metadata: dict[str, Any],
 ) -> dict[str, Any] | None:
-    if not settings.ai_claude_signal_scoring_enabled:
+    if not settings.use_claude:
         return None
     prompt = (
         "Ban la risk analyst cho scoring trading bot. "
@@ -1280,10 +1347,22 @@ def _experience_confidence_adjustment(symbol: str, action: str) -> tuple[float, 
     wins = 0
     losses = 0
     loss_abs_sum = 0.0
+    rollup_samples = 0
+    rollup_stoploss_hits = 0
+    rollup_total_pnl = 0.0
+    rollup_avg_pnl_percent: float | None = None
     for row in samples:
         pnl = float(row.get("pnl_percent") or 0.0)
         tags = row.get("mistake_tags") or []
         tags_norm = {str(t).strip().lower() for t in tags} if isinstance(tags, list) else set()
+        ctx = row.get("market_context") if isinstance(row.get("market_context"), dict) else {}
+        rollup = ctx.get("experience_rollup") if isinstance(ctx, dict) else None
+        if isinstance(rollup, dict):
+            rollup_samples = max(rollup_samples, int(rollup.get("samples") or 0))
+            rollup_stoploss_hits = max(rollup_stoploss_hits, int(rollup.get("stoploss_hits") or 0))
+            rollup_total_pnl = float(rollup.get("total_pnl_value") or rollup_total_pnl)
+            if rollup.get("average_pnl_percent") is not None:
+                rollup_avg_pnl_percent = float(rollup.get("average_pnl_percent") or 0.0)
         if pnl < 0:
             losses += 1
             loss_abs_sum += abs(pnl)
@@ -1291,7 +1370,14 @@ def _experience_confidence_adjustment(symbol: str, action: str) -> tuple[float, 
                 stoploss_hits += 1
         elif pnl > 0:
             wins += 1
-    n = len(samples)
+    n = max(len(samples), rollup_samples)
+    if rollup_samples > len(samples):
+        stoploss_hits = max(stoploss_hits, rollup_stoploss_hits)
+        if rollup_avg_pnl_percent is not None and rollup_avg_pnl_percent < 0:
+            losses = max(losses, min(n, max(1, rollup_stoploss_hits)))
+            loss_abs_sum = max(loss_abs_sum, abs(rollup_avg_pnl_percent) * float(losses))
+        elif rollup_total_pnl > 0:
+            wins = max(wins, max(1, n - rollup_stoploss_hits))
     stoploss_ratio = float(stoploss_hits) / float(n)
     win_ratio = float(wins) / float(n)
     avg_loss_percent_abs = (loss_abs_sum / float(losses)) if losses > 0 else 0.0
@@ -1332,6 +1418,9 @@ def extract_short_term_scan_diagnostics(scan_result: dict[str, Any]) -> dict[str
         "skipped_entry_gate",
         "skipped_experience_cooldown",
         "skipped_dynamic_buy_floor",
+        "price_history_cache_hits",
+        "price_history_vnstock_calls",
+        "price_history_missing",
     )
     out: dict[str, Any] = {k: int(scan_result.get(k) or 0) for k in keys}
     floor = scan_result.get("dynamic_buy_composite_floor")
@@ -1360,6 +1449,9 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
     skipped_dynamic_buy_floor = 0
     experience_threshold_source_claude = 0
     experience_threshold_source_heuristic = 0
+    price_history_cache_hits = 0
+    price_history_vnstock_calls = 0
+    price_history_missing = 0
     scan_started_at = time.perf_counter()
     step_stats: dict[str, dict[str, float | int]] = {}
 
@@ -1401,7 +1493,18 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
                 skipped_no_volume_spike += 1
                 continue
         cv_t0 = time.perf_counter()
-        closes, volumes = _get_close_and_volume(symbol, bars=50, exchange=symbol_exchange)
+        closes, volumes, price_source = _get_close_and_volume_with_source(
+            symbol,
+            bars=60,
+            exchange=symbol_exchange,
+            min_cached_bars=55,
+        )
+        if price_source.startswith("db_cache"):
+            price_history_cache_hits += 1
+        elif price_source == "vnstock":
+            price_history_vnstock_calls += 1
+        else:
+            price_history_missing += 1
         _track_step("_get_close_and_volume", cv_t0)
         if len(closes) < 25 or len(volumes) < 25:
             skipped_insufficient_data += 1
@@ -1475,7 +1578,12 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
             ema20_proxy=ema20_proxy,
             closes=closes,
             volumes=volumes,
+            momentum_5d_pct=float(gate_meta.get("momentum_5d_pct") or 0.0),
+            rsi14=float(gate_meta.get("rsi14") or 50.0),
+            distance_from_ema20_pct=float(gate_meta.get("distance_from_ema20_pct") or 0.0),
         )
+        if not gate_pass:
+            continue
         news_fetch_t0 = time.perf_counter()
         news_items = get_symbol_news_for_scoring(symbol, symbol_exchange, limit=30)
         _track_step("get_symbol_news_for_scoring", news_fetch_t0)
@@ -1586,6 +1694,9 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
             "dynamic_buy_composite_floor": dynamic_buy_floor,
             "experience_threshold_source_claude": experience_threshold_source_claude,
             "experience_threshold_source_heuristic": experience_threshold_source_heuristic,
+            "price_history_cache_hits": price_history_cache_hits,
+            "price_history_vnstock_calls": price_history_vnstock_calls,
+            "price_history_missing": price_history_missing,
             "steps": step_rows,
         },
     )
@@ -1602,6 +1713,9 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
         "dynamic_buy_composite_floor": dynamic_buy_floor,
         "experience_threshold_source_claude": experience_threshold_source_claude,
         "experience_threshold_source_heuristic": experience_threshold_source_heuristic,
+        "price_history_cache_hits": price_history_cache_hits,
+        "price_history_vnstock_calls": price_history_vnstock_calls,
+        "price_history_missing": price_history_missing,
         "exchange_scope": normalized_scope,
         "scan_finished_at": datetime.now(tz=tz).isoformat(),
     }
@@ -1625,6 +1739,9 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
     skipped_dynamic_buy_floor = 0
     experience_threshold_source_claude = 0
     experience_threshold_source_heuristic = 0
+    price_history_cache_hits = 0
+    price_history_vnstock_calls = 0
+    price_history_missing = 0
     scan_started_at = time.perf_counter()
     step_stats: dict[str, dict[str, float | int]] = {}
 
@@ -1679,7 +1796,18 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
                 skipped_no_volume_spike += 1
                 continue
         cv_t0 = time.perf_counter()
-        closes, volumes = _get_close_and_volume(symbol, bars=35, exchange=symbol_exchange)
+        closes, volumes, price_source = _get_close_and_volume_with_source(
+            symbol,
+            bars=60,
+            exchange=symbol_exchange,
+            min_cached_bars=55,
+        )
+        if price_source.startswith("db_cache"):
+            price_history_cache_hits += 1
+        elif price_source == "vnstock":
+            price_history_vnstock_calls += 1
+        else:
+            price_history_missing += 1
         _track_step("_get_close_and_volume", cv_t0)
         if len(closes) < 22 or len(volumes) < 22:
             skipped_insufficient_data += 1
@@ -1753,7 +1881,12 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
             ema20_proxy=ema20_proxy,
             closes=closes,
             volumes=volumes,
+            momentum_5d_pct=float(gate_meta.get("momentum_5d_pct") or 0.0),
+            rsi14=float(gate_meta.get("rsi14") or 50.0),
+            distance_from_ema20_pct=float(gate_meta.get("distance_from_ema20_pct") or 0.0),
         )
+        if not gate_pass:
+            continue
         news_fetch_t0 = time.perf_counter()
         news_items = get_symbol_news_for_scoring(symbol, symbol_exchange, limit=30)
         _track_step("get_symbol_news_for_scoring", news_fetch_t0)
@@ -1843,6 +1976,9 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
             "dynamic_buy_composite_floor": dynamic_buy_floor,
             "experience_threshold_source_claude": experience_threshold_source_claude,
             "experience_threshold_source_heuristic": experience_threshold_source_heuristic,
+            "price_history_cache_hits": price_history_cache_hits,
+            "price_history_vnstock_calls": price_history_vnstock_calls,
+            "price_history_missing": price_history_missing,
             "steps": step_rows,
         },
     )
@@ -1858,6 +1994,9 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
         "dynamic_buy_composite_floor": dynamic_buy_floor,
         "experience_threshold_source_claude": experience_threshold_source_claude,
         "experience_threshold_source_heuristic": experience_threshold_source_heuristic,
+        "price_history_cache_hits": price_history_cache_hits,
+        "price_history_vnstock_calls": price_history_vnstock_calls,
+        "price_history_missing": price_history_missing,
         "scan_mode": "fallback_light",
         "exchange_scope": normalized_scope,
         "listing_target_symbols": listing_target_symbols if listing_target_symbols is not None else scanned,
@@ -2139,7 +2278,9 @@ def warm_daily_volume_for_saved_symbols(days: int = 30) -> dict[str, Any]:
     """
     retention_days = max(5, int(settings.market_symbol_daily_volume_retention_days))
     safe_days = max(5, min(int(days), retention_days))
-    cutoff_date = date.today() - timedelta(days=safe_days - 1)
+    tz = ZoneInfo(settings.short_term_scan_timezone)
+    today_local = datetime.now(tz=tz).date()
+    cutoff_date = today_local - timedelta(days=safe_days - 1)
     _ensure_market_symbol_tables_once()
     with connect(settings.database_url, row_factory=dict_row) as conn:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -2164,6 +2305,7 @@ def warm_daily_volume_for_saved_symbols(days: int = 30) -> dict[str, Any]:
         conn.commit()
 
     existing_dates_by_symbol: dict[str, set[date]] = {}
+    latest_date_by_symbol: dict[str, date] = {}
     for row in existing_symbol_rows:
         symbol = str(row.get("symbol", "")).strip().upper()
         if not symbol:
@@ -2177,6 +2319,8 @@ def warm_daily_volume_for_saved_symbols(days: int = 30) -> dict[str, Any]:
                 elif isinstance(value, date):
                     dates_set.add(value)
         existing_dates_by_symbol[symbol] = dates_set
+        if dates_set:
+            latest_date_by_symbol[symbol] = max(dates_set)
 
     scanned = 0
     warmed = 0
@@ -2189,6 +2333,10 @@ def warm_daily_volume_for_saved_symbols(days: int = 30) -> dict[str, Any]:
         if not symbol:
             continue
         scanned += 1
+        latest_cached_date = latest_date_by_symbol.get(symbol)
+        if latest_cached_date is not None and latest_cached_date >= today_local:
+            skipped_up_to_date += 1
+            continue
         try:
             rows = vnstock_api_service.call_quote(
                 "history",

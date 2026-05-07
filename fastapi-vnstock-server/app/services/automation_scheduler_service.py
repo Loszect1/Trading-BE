@@ -406,7 +406,7 @@ def run_short_term_post_close_refresh_once() -> dict[str, Any]:
     Run one post-close refresh cycle on demand.
     Shared by scheduler slot (e.g. 16:00) and manual trigger endpoint.
     """
-    volume_stats = warm_daily_volume_for_saved_symbols(30)
+    volume_stats = warm_daily_volume_for_saved_symbols(70)
     redis_stats = refresh_short_term_liquidity_cache_from_db(30, "ALL")
     news_stats = scan_and_persist_symbol_news_from_liquidity_cache(
         exchange_scope="ALL",

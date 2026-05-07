@@ -1,4 +1,7 @@
-from app.services.experience_service import _merge_experience_context
+from datetime import datetime, timezone
+from uuid import uuid4
+
+from app.services.experience_service import ExperienceRecord, _guess_root_cause, _heuristic_market_adaptation, _merge_experience_context
 
 
 def test_merge_experience_context_rollup() -> None:
@@ -28,3 +31,43 @@ def test_merge_experience_context_rollup() -> None:
     rollup = merged_ctx.get("experience_rollup") or {}
     assert rollup.get("samples") == 3
     assert rollup.get("stoploss_hits") == 2
+
+
+def test_guess_root_cause_flags_late_overextended_entry() -> None:
+    record = ExperienceRecord(
+        id=uuid4(),
+        trade_id="TST-1",
+        account_mode="DEMO",
+        symbol="AAA",
+        strategy_type="SHORT_TERM",
+        entry_time=datetime.now(tz=timezone.utc),
+        exit_time=datetime.now(tz=timezone.utc),
+        pnl_value=-1_000_000.0,
+        pnl_percent=-3.0,
+        market_context={
+            "rsi14": 82,
+            "distance_from_ema20_pct": 12,
+            "volume_spike": 2.0,
+            "rr_realized": 0.5,
+        },
+        root_cause="pending",
+        mistake_tags=[],
+        improvement_action="pending",
+        confidence_after_review=70.0,
+    )
+    root_cause, tags, action = _guess_root_cause(record)
+    assert root_cause in {"overextended_entry", "risk_reward_unfavorable", "late_entry_after_momentum"}
+    assert "overbought_chase" in tags
+    assert "overextended_from_ema20" in tags
+    assert "stoploss_hit" in tags
+    assert action
+
+
+def test_heuristic_market_adaptation_tightens_after_stoploss_rollup() -> None:
+    adaptation = _heuristic_market_adaptation(
+        ["stoploss_hit", "weak_volume_confirmation", "overextended_from_ema20"],
+        {"experience_rollup": {"samples": 4, "stoploss_hits": 3}},
+    )
+    assert adaptation["neutral"]["min_spike_ratio"] >= 2.2
+    assert adaptation["neutral"]["max_distance_from_ema20_pct"] <= 5.0
+    assert adaptation["risk_off"]["min_momentum_5d_pct"] >= adaptation["neutral"]["min_momentum_5d_pct"]

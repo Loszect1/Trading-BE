@@ -17,7 +17,7 @@ from psycopg import connect
 
 from app.core.config import settings
 
-SCORING_PIPELINE_VERSION = "1.2.2"
+SCORING_PIPELINE_VERSION = "1.3.0"
 
 # Deterministic post-lexical sentiment shaping (no external APIs).
 SENTIMENT_INTERPRETATION_LAYER_VERSION = "1.1.0"
@@ -1213,23 +1213,73 @@ def score_short_term_technical(
     ema20_proxy: float,
     closes: Sequence[float],
     volumes: Sequence[float],
+    momentum_5d_pct: float | None = None,
+    rsi14: float | None = None,
+    distance_from_ema20_pct: float | None = None,
 ) -> dict[str, Any]:
-    """0-100 technical module aligned with existing spike + EMA20 proxy gate."""
+    """0-100 CMT-style short-term technical score: participation, trend, momentum, RSI, and stretch."""
     spike_c = _clamp(spike, 0.0, 8.0)
-    spike_component = _clamp((spike_c - 1.0) / 2.0 * 45.0, 0.0, 55.0)  # 1x -> 0, ~3x -> cap
-    trend_component = 35.0 if last_close > ema20_proxy and ema20_proxy > 0 else 12.0
+    spike_component = _clamp((spike_c - 1.0) / 2.0 * 35.0, 0.0, 40.0)  # 1x -> 0, ~3x -> strong
+    trend_component = 25.0 if last_close > ema20_proxy and ema20_proxy > 0 else 8.0
     vol_confirm = 0.0
     if len(volumes) >= 2 and len(closes) >= 2:
         v_prev = float(volumes[-2]) if volumes[-2] > 0 else 0.0
         if v_prev > 0 and volumes[-1] >= v_prev:
-            vol_confirm = 10.0
-    technical = _clamp(spike_component + trend_component + vol_confirm, 0.0, 100.0)
+            vol_confirm = 5.0
+
+    if momentum_5d_pct is None:
+        momentum_5d_pct = _pct_return_slice([float(v) for v in closes], 6)
+    mom = float(momentum_5d_pct) if momentum_5d_pct is not None else 0.0
+    momentum_component = _clamp(7.0 + mom * 1.6, 0.0, 18.0)
+
+    if rsi14 is None:
+        deltas = [float(closes[i] - closes[i - 1]) for i in range(1, len(closes))]
+        recent = deltas[-14:]
+        gains = [d for d in recent if d > 0]
+        losses = [abs(d) for d in recent if d < 0]
+        avg_gain = (sum(gains) / 14.0) if recent else 0.0
+        avg_loss = (sum(losses) / 14.0) if recent else 0.0
+        if avg_loss <= 0:
+            rsi14 = 100.0 if avg_gain > 0 else 50.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi14 = 100.0 - (100.0 / (1.0 + rs))
+    rsi_value = float(rsi14)
+    if 50.0 <= rsi_value <= 75.0:
+        rsi_component = 12.0
+    elif 40.0 <= rsi_value < 50.0 or 75.0 < rsi_value <= 80.0:
+        rsi_component = 6.0
+    elif rsi_value < 30.0:
+        rsi_component = 3.0
+    else:
+        rsi_component = 0.0
+
+    if distance_from_ema20_pct is None:
+        distance_from_ema20_pct = ((last_close / ema20_proxy) - 1.0) * 100.0 if ema20_proxy > 0 else 0.0
+    distance = float(distance_from_ema20_pct)
+    stretch_penalty = 0.0
+    if distance > 10.0:
+        stretch_penalty = min(18.0, (distance - 10.0) * 1.5)
+    elif distance < -6.0:
+        stretch_penalty = min(10.0, abs(distance + 6.0))
+
+    technical = _clamp(
+        spike_component + trend_component + vol_confirm + momentum_component + rsi_component - stretch_penalty,
+        0.0,
+        100.0,
+    )
     return {
         "score_0_100": round(technical, 2),
         "detail": {
             "spike_component": round(spike_component, 2),
             "trend_component": round(trend_component, 2),
             "volume_confirmation": round(vol_confirm, 2),
+            "momentum_5d_component": round(momentum_component, 2),
+            "momentum_5d_pct": round(mom, 4),
+            "rsi_component": round(rsi_component, 2),
+            "rsi14": round(rsi_value, 4),
+            "stretch_penalty": round(stretch_penalty, 2),
+            "distance_from_ema20_pct": round(distance, 4),
             "volume_spike_ratio": round(spike, 4),
             "ema20_proxy": round(ema20_proxy, 4),
             "last_close": round(last_close, 4),

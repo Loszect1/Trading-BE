@@ -254,17 +254,85 @@ def evaluate_risk(payload: dict[str, Any]) -> dict[str, Any]:
     risk_per_trade = float(payload["risk_per_trade"])
     daily_new_orders = int(payload["daily_new_orders"])
     max_daily_new_orders = int(payload["max_daily_new_orders"])
+    side = str(payload.get("side") or "BUY").strip().upper()
+    take_profit_raw = payload.get("take_profit_price")
+    take_profit = float(take_profit_raw) if take_profit_raw is not None else None
+    min_reward_risk = float(payload.get("min_reward_risk") or (1.5 if take_profit is not None else 0.0))
+    lot_size = max(1, int(payload.get("board_lot_size") or 100))
     if max_daily_new_orders > 0 and daily_new_orders >= max_daily_new_orders:
         return {
             "pass": False,
             "reason": "max_daily_new_orders_reached",
             "suggested_size": 0,
+            "suggested_lot_size": 0,
+        }
+    if entry <= 0 or stoploss <= 0 or nav <= 0 or risk_per_trade <= 0:
+        return {
+            "pass": False,
+            "reason": "invalid_risk_inputs",
+            "suggested_size": 0,
+            "suggested_lot_size": 0,
+        }
+    if side == "BUY" and stoploss >= entry:
+        return {
+            "pass": False,
+            "reason": "invalid_buy_stoploss_geometry",
+            "suggested_size": 0,
+            "suggested_lot_size": 0,
+            "entry_price": entry,
+            "stoploss_price": stoploss,
+        }
+    if side == "SELL" and stoploss <= entry:
+        return {
+            "pass": False,
+            "reason": "invalid_sell_stoploss_geometry",
+            "suggested_size": 0,
+            "suggested_lot_size": 0,
+            "entry_price": entry,
+            "stoploss_price": stoploss,
         }
     distance = abs(entry - stoploss)
     if distance <= 0:
-        return {"pass": False, "reason": "invalid_stoploss_distance", "suggested_size": 0}
+        return {"pass": False, "reason": "invalid_stoploss_distance", "suggested_size": 0, "suggested_lot_size": 0}
+    reward_risk: float | None = None
+    if take_profit is not None:
+        reward = (take_profit - entry) if side == "BUY" else (entry - take_profit)
+        if reward <= 0:
+            return {
+                "pass": False,
+                "reason": "invalid_take_profit_geometry",
+                "suggested_size": 0,
+                "suggested_lot_size": 0,
+                "entry_price": entry,
+                "take_profit_price": take_profit,
+                "stoploss_price": stoploss,
+            }
+        reward_risk = reward / distance
+        if min_reward_risk > 0 and reward_risk < min_reward_risk:
+            return {
+                "pass": False,
+                "reason": "reward_risk_below_min",
+                "suggested_size": 0,
+                "suggested_lot_size": 0,
+                "reward_risk": round(reward_risk, 4),
+                "min_reward_risk": round(min_reward_risk, 4),
+            }
     suggested_size = int((nav * risk_per_trade) / distance)
-    return {"pass": suggested_size > 0, "reason": "ok" if suggested_size > 0 else "size_too_small", "suggested_size": max(0, suggested_size)}
+    suggested_lot_size = (max(0, suggested_size) // lot_size) * lot_size
+    passed = suggested_lot_size > 0
+    out = {
+        "pass": passed,
+        "reason": "ok" if passed else "size_below_board_lot",
+        "suggested_size": max(0, suggested_size),
+        "suggested_lot_size": suggested_lot_size,
+        "board_lot_size": lot_size,
+        "risk_amount": round(nav * risk_per_trade, 6),
+        "risk_per_share": round(distance, 6),
+    }
+    if reward_risk is not None:
+        out["reward_risk"] = round(reward_risk, 4)
+        out["min_reward_risk"] = round(min_reward_risk, 4)
+    return out
 
 
 def check_settlement(account_mode: str, symbol: str, quantity: int) -> dict[str, Any]:

@@ -710,10 +710,22 @@ def post_real_recommendations_action_buy(body: RealRecommendationBuyRequest) -> 
                 "risk_per_trade": float(settings.strategy_risk_per_trade),
                 "entry_price": entry,
                 "stoploss_price": stop_loss,
+                "take_profit_price": float(body.take_profit),
+                "side": "BUY",
+                "min_reward_risk": 1.5,
                 "daily_new_orders": 0,
                 "max_daily_new_orders": 10,
             }
         )
+        if not risk_result.get("pass"):
+            return {
+                "success": False,
+                "data": {
+                    "status": "REJECTED",
+                    "reason": f"risk_reject:{risk_result.get('reason')}",
+                    "risk_result": risk_result,
+                },
+            }
         suggested_size = int(risk_result.get("suggested_size") or 0)
         max_affordable_size = int(available_cash // entry) if entry > 0 else 0
         raw_quantity = max(0, min(suggested_size, max_affordable_size))
