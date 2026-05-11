@@ -34,6 +34,11 @@ from app.services.signal_engine_service import (
     warm_daily_volume_for_saved_symbols,
     warm_short_term_liquidity_cache,
 )
+from app.services.real_recommendation_service import (
+    build_recommendation_from_signal,
+    normalize_real_recommendation_rows,
+    preflight_real_recommendations,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +54,8 @@ _scheduler_last_slot_markers: dict[AccountMode, str | None] = {mode: None for mo
 _cache_warm_task: asyncio.Task | None = None
 _last_cache_warm_local_date: date | None = None
 _post_close_refresh_run_markers: set[str] = set()
+_POST_CLOSE_REFRESH_LOCK_KEY = "lock:short-term:post-close-refresh"
+_POST_CLOSE_REFRESH_LOCK_TTL_SECONDS = 1800
 
 # REAL scan-only scheduler persistence + execution.
 _REAL_RECOMMENDATIONS_REDIS_KEY = "signals:real:short-term:recommendations:latest"
@@ -78,26 +85,7 @@ def _to_float(value: Any) -> float | None:
 
 
 def _normalize_real_recommendation_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    for row in rows:
-        symbol = str(row.get("symbol") or "").strip().upper()
-        entry = _to_float(row.get("entry"))
-        take_profit = _to_float(row.get("take_profit"))
-        stop_loss = _to_float(row.get("stop_loss"))
-        confidence = _to_float(row.get("confidence"))
-        if not symbol or entry is None or take_profit is None or stop_loss is None:
-            continue
-        out.append(
-            {
-                "symbol": symbol,
-                "entry": entry,
-                "take_profit": take_profit,
-                "stop_loss": stop_loss,
-                "confidence": max(0.0, min(100.0, confidence if confidence is not None else 50.0)),
-                "reason": str(row.get("reason") or "").strip(),
-            }
-        )
-    return out
+    return normalize_real_recommendation_rows(rows)
 
 
 def _real_scan_only_slot_marker(now_local: datetime) -> str:
@@ -225,22 +213,13 @@ def _run_real_scan_only_and_persist() -> None:
         )
         scan_result = run_short_term_scan_batch_light(limit_symbols=fallback_cap, exchange_scope="ALL")
     raw_signals = scan_result.get("signals") or []
-    recommendations: list[dict[str, Any]] = []
+    raw_recommendations: list[dict[str, Any]] = []
     for signal in raw_signals:
         if not isinstance(signal, dict) or str(signal.get("action") or "").upper() != "BUY":
             continue
-        recommendations.append(
-            {
-                "symbol": str(signal.get("symbol") or "").strip().upper(),
-                "entry": signal.get("entry_price"),
-                "take_profit": signal.get("take_profit_price"),
-                "stop_loss": signal.get("stoploss_price"),
-                "confidence": signal.get("confidence"),
-                "reason": signal.get("reason"),
-            }
-        )
+        raw_recommendations.append(build_recommendation_from_signal(signal))
 
-    normalized = _normalize_real_recommendation_rows(recommendations)
+    normalized, rejected_recommendations = preflight_real_recommendations(raw_recommendations)
     payload = {
         "generated_at": scan_result.get("scan_finished_at"),
         "exchange_scope": "ALL",
@@ -250,6 +229,9 @@ def _run_real_scan_only_and_persist() -> None:
         "count": len(normalized),
         "short_term_recommendations": normalized,
         "short_term_count": len(normalized),
+        "all_short_term_recommendations": normalized + rejected_recommendations,
+        "rejected_recommendations": rejected_recommendations,
+        "rejected_count": len(rejected_recommendations),
         "mail_signal_recommendations": mail_recommendations,
         "mail_signal_count": len(mail_recommendations),
         "scan_diagnostics": extract_short_term_scan_diagnostics(scan_result),
@@ -406,18 +388,33 @@ def run_short_term_post_close_refresh_once() -> dict[str, Any]:
     Run one post-close refresh cycle on demand.
     Shared by scheduler slot (e.g. 16:00) and manual trigger endpoint.
     """
-    volume_stats = warm_daily_volume_for_saved_symbols(70)
-    redis_stats = refresh_short_term_liquidity_cache_from_db(30, "ALL")
-    news_stats = scan_and_persist_symbol_news_from_liquidity_cache(
-        exchange_scope="ALL",
-        max_symbols=0,
-        per_symbol_news_limit=20,
-    )
-    return {
-        "volume_stats": volume_stats,
-        "redis_stats": redis_stats,
-        "news_stats": news_stats,
-    }
+    token = str(uuid4())
+    if not _redis_cache.acquire_lock(
+        _POST_CLOSE_REFRESH_LOCK_KEY,
+        token,
+        ttl_seconds=_POST_CLOSE_REFRESH_LOCK_TTL_SECONDS,
+    ):
+        return {
+            "skipped": True,
+            "reason": "post_close_refresh_already_running",
+            "lock_key": _POST_CLOSE_REFRESH_LOCK_KEY,
+        }
+    try:
+        volume_stats = warm_daily_volume_for_saved_symbols(70)
+        redis_stats = refresh_short_term_liquidity_cache_from_db(30, "ALL")
+        news_stats = scan_and_persist_symbol_news_from_liquidity_cache(
+            exchange_scope="ALL",
+            max_symbols=0,
+            per_symbol_news_limit=20,
+        )
+        return {
+            "skipped": False,
+            "volume_stats": volume_stats,
+            "redis_stats": redis_stats,
+            "news_stats": news_stats,
+        }
+    finally:
+        _redis_cache.release_lock(_POST_CLOSE_REFRESH_LOCK_KEY, token)
 
 
 def _ensure_automation_scheduler_state_table() -> None:

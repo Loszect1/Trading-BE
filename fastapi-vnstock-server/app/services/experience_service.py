@@ -9,13 +9,14 @@ from uuid import UUID, uuid4
 
 from psycopg import connect
 from psycopg.rows import dict_row
+from psycopg.types.json import Json
 
 from app.core.config import settings
 from app.services.claude_service import ClaudeService
 
 
 TradeMode = Literal["REAL", "DEMO"]
-StrategyType = Literal["SHORT_TERM", "LONG_TERM", "TECHNICAL"]
+StrategyType = Literal["SHORT_TERM", "LONG_TERM", "TECHNICAL", "MAIL_SIGNAL"]
 _claude_service = ClaudeService()
 
 
@@ -73,8 +74,9 @@ def _guess_root_cause(record: ExperienceRecord) -> tuple[str, list[str], str]:
         _context_float(record.market_context, "avg_value_20d", 0.0),
     )
     rr_realized = _context_float(record.market_context, "rr_realized", 0.0)
+    trigger = str(record.market_context.get("trigger") or "").strip().lower()
 
-    if record.pnl_percent <= -2:
+    if trigger == "stoploss_hit" or record.pnl_percent <= -2:
         tags.append("stoploss_hit")
     if market_regime == "risk_off":
         tags.append("market_regime_risk_off")
@@ -114,6 +116,75 @@ def _guess_root_cause(record: ExperienceRecord) -> tuple[str, list[str], str]:
         tags.append("unclassified")
 
     return root_cause, tags, improvement_action
+
+
+def _cmt_stoploss_playbook(record: ExperienceRecord, tags: list[str]) -> dict[str, Any]:
+    """
+    CMT-style deterministic lessons for a stop-loss close.
+    These fields are consumed later as market_context evidence by signal_engine_service.
+    """
+    ctx = record.market_context if isinstance(record.market_context, dict) else {}
+    tag_set = {str(tag).strip().lower() for tag in tags if str(tag).strip()}
+    entry_price = _context_float(ctx, "entry_price", _context_float(ctx, "entry_proxy_price", 0.0))
+    exit_price = _context_float(ctx, "exit_price", 0.0)
+    stoploss_price = _context_float(ctx, "stoploss_price", 0.0)
+    take_profit_price = _context_float(ctx, "take_profit_price", 0.0)
+    rsi14 = _context_float(ctx, "rsi14", 50.0)
+    volume_spike = _context_float(ctx, "volume_spike", 1.0)
+    distance_from_ema20_pct = _context_float(ctx, "distance_from_ema20_pct", 0.0)
+    rr_planned = ((take_profit_price - entry_price) / max(1e-9, entry_price - stoploss_price)) if (
+        take_profit_price > entry_price > stoploss_price > 0
+    ) else 0.0
+
+    lessons: list[str] = [
+        "Sau stop-loss, khong re-enter cung ma neu chua co confirm moi ve xu huong, volume va relative strength.",
+        "Dung stop-loss nhu invalidation cua thesis, khong coi la nhieu gia re de mua lai ngay.",
+    ]
+    next_buy_filters: dict[str, Any] = {
+        "cooldown_days": 3,
+        "require_price_reclaim_entry_zone": True,
+        "require_close_above_stoploss": True,
+        "require_volume_confirmation": True,
+        "min_volume_spike_ratio": 1.8,
+        "min_reward_risk": 2.0,
+        "max_distance_from_ema20_pct": 8.0,
+        "position_size_multiplier": 0.5,
+    }
+
+    if {"weak_volume_confirmation", "false_breakout"} & tag_set or volume_spike < 1.2:
+        lessons.append("Breakout/can cung that bai khi thieu participation; lan sau can volume xac nhan ro hon.")
+        next_buy_filters["min_volume_spike_ratio"] = 2.2
+    if {"overbought_chase", "overextended_from_ema20", "late_entry_after_momentum", "overextended_entry"} & tag_set:
+        lessons.append("Stoploss sau entry qua extended: doi pullback/tich luy thay vi chase momentum.")
+        next_buy_filters["max_distance_from_ema20_pct"] = 5.0
+        next_buy_filters["avoid_rsi_above"] = 78
+    if "market_regime_risk_off" in tag_set:
+        lessons.append("Trong regime risk-off, chi mua setup co RS va volume manh, giam size mac dinh.")
+        next_buy_filters["min_volume_spike_ratio"] = max(float(next_buy_filters["min_volume_spike_ratio"]), 2.4)
+        next_buy_filters["position_size_multiplier"] = 0.35
+        next_buy_filters["require_market_regime_not_risk_off"] = True
+    if rr_planned and rr_planned < 2.0:
+        lessons.append("R/R planned khong du dem; lan sau nang nguong RR truoc khi vao lenh.")
+        next_buy_filters["min_reward_risk"] = 2.2
+    if record.pnl_percent <= -5.0:
+        lessons.append("Loss lon hon muc tactical thong thuong; lan sau giam size va yeu cau confirmation nhieu hon.")
+        next_buy_filters["cooldown_days"] = 5
+        next_buy_filters["position_size_multiplier"] = min(float(next_buy_filters["position_size_multiplier"]), 0.35)
+
+    return {
+        "framework": "CMT_price_volume_risk_review",
+        "trigger": str(ctx.get("trigger") or "stoploss_hit"),
+        "entry_price": entry_price,
+        "exit_price": exit_price,
+        "stoploss_price": stoploss_price,
+        "take_profit_price": take_profit_price,
+        "planned_reward_risk": round(rr_planned, 4) if rr_planned else None,
+        "observed_rsi14": rsi14,
+        "observed_volume_spike": volume_spike,
+        "observed_distance_from_ema20_pct": distance_from_ema20_pct,
+        "lessons": lessons,
+        "next_buy_filters": next_buy_filters,
+    }
 
 
 def _heuristic_market_adaptation(tags: list[str], market_context: dict[str, Any]) -> dict[str, Any]:
@@ -322,6 +393,14 @@ def ensure_experience_table() -> None:
     with connect(settings.database_url) as conn:
         with conn.cursor() as cur:
             cur.execute(query)
+            cur.execute("ALTER TABLE experience DROP CONSTRAINT IF EXISTS experience_strategy_type_check")
+            cur.execute(
+                """
+                ALTER TABLE experience
+                ADD CONSTRAINT experience_strategy_type_check
+                CHECK (strategy_type IN ('SHORT_TERM', 'LONG_TERM', 'TECHNICAL', 'MAIL_SIGNAL'))
+                """
+            )
         conn.commit()
 
 
@@ -390,6 +469,7 @@ def create_experience_from_trade(payload: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         # Keep heuristic fallback to avoid blocking trade-close pipeline.
         analysis_error = str(exc)
+    cmt_playbook = _cmt_stoploss_playbook(record, tags) if "stoploss_hit" in {str(t).lower() for t in tags} else {}
     if isinstance(record.market_context, dict):
         record.market_context["experience_analysis_source"] = analysis_source
         if analysis_error:
@@ -397,6 +477,8 @@ def create_experience_from_trade(payload: dict[str, Any]) -> dict[str, Any]:
         if market_adaptation:
             record.market_context["claude_market_adaptation"] = market_adaptation
             record.market_context["experience_market_adaptation"] = market_adaptation
+        if cmt_playbook:
+            record.market_context["cmt_stoploss_playbook"] = cmt_playbook
 
     with connect(settings.database_url, row_factory=dict_row) as conn:
         with conn.cursor() as cur:
@@ -437,7 +519,7 @@ def create_experience_from_trade(payload: dict[str, Any]) -> dict[str, Any]:
                     "exit_time": record.exit_time,
                     "pnl_value": record.pnl_value,
                     "pnl_percent": record.pnl_percent,
-                    "market_context": record.market_context,
+                    "market_context": Json(record.market_context),
                     "root_cause": root_cause,
                     "mistake_tags": tags,
                     "improvement_action": improvement_action,

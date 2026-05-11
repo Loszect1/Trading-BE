@@ -19,6 +19,7 @@ from app.services.demo_trading_service import (
     get_demo_strategy_remaining_cash,
 )
 from app.services.gmail_service import GmailFetchService
+from app.services.price_unit_service import normalize_vn_price_to_vnd
 from app.services.redis_cache import RedisCacheService
 from app.services.short_term_scan_schedule import is_instant_on_short_term_scan_grid
 from app.services.trading_core_service import evaluate_risk, place_order
@@ -55,13 +56,7 @@ def _normalize_vn_price_unit(price: float) -> float:
     Normalize Vietnam stock price unit to VND.
     Business rule: many signal sources return prices in "ngan dong" (e.g. 2.8 => 2,800 VND).
     """
-    value = float(price)
-    if value <= 0:
-        return value
-    # Heuristic: values below 1000 are interpreted as "thousand VND" unit.
-    if value < 1000:
-        return value * 1000.0
-    return value
+    return normalize_vn_price_to_vnd(price)
 
 
 def _normalize_board_lot_qty(quantity: int, lot_size: int = 100) -> int:
@@ -372,11 +367,23 @@ def get_latest_mail_signals() -> dict[str, Any] | None:
     if not dated:
         return None
     dated.sort(key=lambda row: row[0], reverse=True)
-    latest_key = dated[0][1]
-    payload = _redis.get_json(latest_key)
-    if payload is None:
-        return None
-    return {"redis_key": latest_key, **payload}
+    newest_empty: dict[str, Any] | None = None
+    for _, key in dated:
+        payload = _redis.get_json(key)
+        if payload is None:
+            continue
+        row = {"redis_key": key, **payload}
+        mail_count = int(row.get("mail_count") or 0)
+        items = row.get("items") if isinstance(row.get("items"), list) else []
+        if mail_count > 0 or items:
+            if newest_empty is not None:
+                row["latest_empty_redis_key"] = newest_empty.get("redis_key")
+                row["latest_empty_note"] = newest_empty.get("note")
+                row["latest_empty_generated_at"] = newest_empty.get("generated_at")
+            return row
+        if newest_empty is None:
+            newest_empty = row
+    return newest_empty
 
 
 def get_latest_mail_signal_entry_run() -> dict[str, Any] | None:
@@ -436,7 +443,7 @@ def _extract_latest_price(symbol: str) -> float | None:
                     value = row.get(key)
                     if value is None:
                         continue
-                    price = float(value)
+                    price = normalize_vn_price_to_vnd(value)
                     if price > 0:
                         return price
     except Exception:
@@ -457,7 +464,7 @@ def _extract_latest_price(symbol: str) -> float | None:
                     value = row.get(key)
                     if value is None:
                         continue
-                    price = float(value)
+                    price = normalize_vn_price_to_vnd(value)
                     if price > 0:
                         return price
     except Exception:
@@ -526,19 +533,34 @@ def run_prev_day_entry_auto_trading_once(
                 if market_price is None or market_price <= 0:
                     skipped.append({"symbol": symbol, "reason": "missing_market_price"})
                     continue
-                if not _entry_hit("BUY", market_price, float(item.entry)):
-                    skipped.append({"symbol": symbol, "reason": "entry_not_hit", "market_price": market_price, "entry": item.entry})
+                entry_price = normalize_vn_price_to_vnd(item.entry)
+                take_profit_price = normalize_vn_price_to_vnd(item.take_profit)
+                stop_loss_price = normalize_vn_price_to_vnd(item.stop_loss)
+                if not _entry_hit("BUY", market_price, entry_price):
+                    skipped.append({"symbol": symbol, "reason": "entry_not_hit", "market_price": market_price, "entry": entry_price})
+                    continue
+                if stop_loss_price >= market_price or take_profit_price <= market_price:
+                    skipped.append(
+                        {
+                            "symbol": symbol,
+                            "reason": "invalid_market_price_risk_geometry",
+                            "market_price": market_price,
+                            "entry": entry_price,
+                            "stop_loss": stop_loss_price,
+                            "take_profit": take_profit_price,
+                        }
+                    )
                     continue
 
                 risk = evaluate_risk(
                     {
-                        "stoploss_price": float(item.stop_loss),
-                        "entry_price": float(item.entry),
+                        "stoploss_price": stop_loss_price,
+                        "entry_price": market_price,
                         "nav": nav,
                         "risk_per_trade": risk_per_trade,
                         "daily_new_orders": 0,
                         "max_daily_new_orders": 10_000,
-                        "take_profit_price": float(item.take_profit),
+                        "take_profit_price": take_profit_price,
                         "side": "BUY",
                         "min_reward_risk": 1.5,
                         "board_lot_size": 100,
@@ -547,7 +569,22 @@ def run_prev_day_entry_auto_trading_once(
                 raw_qty = min(max_qty, int(risk.get("suggested_size") or 0))
                 qty = _normalize_board_lot_qty(raw_qty, lot_size=100)
                 if qty < 100:
-                    skipped.append({"symbol": symbol, "reason": "risk_size_zero"})
+                    skipped.append(
+                        {
+                            "symbol": symbol,
+                            "reason": "risk_size_zero",
+                            "entry": entry_price,
+                            "market_price": market_price,
+                            "stop_loss": stop_loss_price,
+                            "take_profit": take_profit_price,
+                            "nav": float(nav),
+                            "risk_per_trade": float(risk_per_trade),
+                            "suggested_size": int(risk.get("suggested_size") or 0),
+                            "suggested_lot_size": int(risk.get("suggested_lot_size") or 0),
+                            "risk_per_share": risk.get("risk_per_share"),
+                            "risk_amount": risk.get("risk_amount"),
+                        }
+                    )
                     continue
 
                 idem_key = f"mail-entry-{prev_day.strftime('%Y%m%d')}-{account_mode}-{symbol}"
@@ -557,7 +594,7 @@ def run_prev_day_entry_auto_trading_once(
                         "symbol": symbol,
                         "side": "BUY",
                         "quantity": qty,
-                        "price": float(item.entry),
+                        "price": market_price,
                         "auto_process": True,
                         "idempotency_key": idem_key,
                         "metadata": {
@@ -566,10 +603,12 @@ def run_prev_day_entry_auto_trading_once(
                             "demo_session_id": active_demo_session_id if account_mode == "DEMO" else None,
                             "signal_day": prev_day.strftime("%Y-%m-%d"),
                             "confidence": float(item.confidence),
-                            "take_profit": float(item.take_profit),
-                            "stop_loss": float(item.stop_loss),
+                            "entry_price": entry_price,
+                            "take_profit": take_profit_price,
+                            "stop_loss": stop_loss_price,
                             "reason": item.reason,
                             "market_price_at_check": market_price,
+                            "execution_price_source": "latest_market_price",
                         },
                     }
                 )

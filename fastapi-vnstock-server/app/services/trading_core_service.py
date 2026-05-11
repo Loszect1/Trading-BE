@@ -15,6 +15,7 @@ from app.core.config import get_vn_market_holiday_dates, settings
 from app.services.execution import get_execution_adapter
 from app.services.execution.broker_status import build_dnse_reconcile_metadata_snapshot
 from app.services.execution.types import OrderExecutionContext
+from app.services.price_unit_service import normalize_price_fields_to_vnd, normalize_vn_price_to_vnd
 from app.services.vn_market_holiday_calendar import add_vn_trading_days, add_vn_trading_days_live, vn_market_local_today
 
 logger = logging.getLogger(__name__)
@@ -248,15 +249,15 @@ def _roll_settlement(conn, account_mode: str) -> None:
 
 
 def evaluate_risk(payload: dict[str, Any]) -> dict[str, Any]:
-    stoploss = float(payload["stoploss_price"])
-    entry = float(payload["entry_price"])
+    stoploss = normalize_vn_price_to_vnd(payload["stoploss_price"])
+    entry = normalize_vn_price_to_vnd(payload["entry_price"])
     nav = float(payload["nav"])
     risk_per_trade = float(payload["risk_per_trade"])
     daily_new_orders = int(payload["daily_new_orders"])
     max_daily_new_orders = int(payload["max_daily_new_orders"])
     side = str(payload.get("side") or "BUY").strip().upper()
     take_profit_raw = payload.get("take_profit_price")
-    take_profit = float(take_profit_raw) if take_profit_raw is not None else None
+    take_profit = normalize_vn_price_to_vnd(take_profit_raw) if take_profit_raw is not None else None
     min_reward_risk = float(payload.get("min_reward_risk") or (1.5 if take_profit is not None else 0.0))
     lot_size = max(1, int(payload.get("board_lot_size") or 100))
     if max_daily_new_orders > 0 and daily_new_orders >= max_daily_new_orders:
@@ -335,19 +336,44 @@ def evaluate_risk(payload: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def check_settlement(account_mode: str, symbol: str, quantity: int) -> dict[str, Any]:
+def check_settlement(
+    account_mode: str,
+    symbol: str,
+    quantity: int,
+    *,
+    demo_session_id: str | None = None,
+) -> dict[str, Any]:
     ensure_trading_core_tables()
+    mode = str(account_mode).upper()
+    session_id = str(demo_session_id or "").strip()
     with connect(settings.database_url, row_factory=dict_row) as conn:
-        _roll_settlement(conn, account_mode)
+        _roll_settlement(conn, mode)
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT COALESCE(SUM(available_qty), 0) AS available_qty, COALESCE(SUM(qty - available_qty), 0) AS pending_settlement_qty
-                FROM position_lots
-                WHERE account_mode = %(account_mode)s AND symbol = %(symbol)s AND qty > 0
-                """,
-                {"account_mode": account_mode, "symbol": symbol},
-            )
+            if mode == "DEMO" and session_id:
+                cur.execute(
+                    """
+                    SELECT
+                        COALESCE(SUM(pl.available_qty), 0) AS available_qty,
+                        COALESCE(SUM(pl.qty - pl.available_qty), 0) AS pending_settlement_qty
+                    FROM position_lots pl
+                    JOIN orders_core o ON o.id = pl.buy_order_id
+                    WHERE pl.account_mode = %(account_mode)s
+                      AND pl.symbol = %(symbol)s
+                      AND pl.qty > 0
+                      AND o.account_mode = %(account_mode)s
+                      AND COALESCE(o.order_metadata->>'demo_session_id', '') = %(demo_session_id)s
+                    """,
+                    {"account_mode": mode, "symbol": symbol, "demo_session_id": session_id},
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT COALESCE(SUM(available_qty), 0) AS available_qty, COALESCE(SUM(qty - available_qty), 0) AS pending_settlement_qty
+                    FROM position_lots
+                    WHERE account_mode = %(account_mode)s AND symbol = %(symbol)s AND qty > 0
+                    """,
+                    {"account_mode": mode, "symbol": symbol},
+                )
             row = cur.fetchone() or {}
     available_qty = int(row.get("available_qty", 0))
     pending_qty = int(row.get("pending_settlement_qty", 0))
@@ -485,12 +511,30 @@ def place_order(payload: dict[str, Any]) -> dict[str, Any]:
     symbol = str(payload["symbol"]).upper()
     side = str(payload["side"]).upper()
     quantity = int(payload["quantity"])
-    price = float(payload["price"])
+    price = normalize_vn_price_to_vnd(payload["price"])
     idempotency_key = (payload.get("idempotency_key") or "").strip() or None
     auto_process = bool(payload.get("auto_process", True))
     order_metadata = payload.get("metadata") or {}
     if not isinstance(order_metadata, dict):
         order_metadata = {}
+    order_metadata = normalize_price_fields_to_vnd(
+        order_metadata,
+        (
+            "price",
+            "entry",
+            "entry_price",
+            "take_profit",
+            "take_profit_price",
+            "tp",
+            "stop_loss",
+            "stoploss",
+            "stoploss_price",
+            "sl",
+            "market_price",
+            "market_price_snapshot",
+            "average_price_snapshot",
+        ),
+    )
     with connect(settings.database_url, row_factory=dict_row) as conn:
         with conn.cursor() as cur:
             if idempotency_key:
@@ -746,31 +790,79 @@ def process_order(order_id: str) -> dict[str, Any]:
             # position_lots inside conn's open transaction, then check_settlement tries to
             # acquire the same lock via a second connection: self-deadlock (conn idle-in-
             # transaction forever, second conn blocked, PostgreSQL cannot detect it).
-            settlement_result = check_settlement(account_mode, symbol, quantity)
+            demo_session_id = None
+            if account_mode == "DEMO" and isinstance(meta, dict):
+                demo_session_id = str(meta.get("demo_session_id") or "").strip() or None
+            settlement_result = check_settlement(
+                account_mode,
+                symbol,
+                quantity,
+                demo_session_id=demo_session_id,
+            )
             if not settlement_result["pass"]:
                 final_status = "REJECTED"
                 final_reason = "settlement_guard_failed"
             else:
                 remaining = quantity
                 with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        SELECT id, available_qty FROM position_lots
-                        WHERE account_mode = %(account_mode)s AND symbol = %(symbol)s AND available_qty > 0
-                        ORDER BY buy_trade_date ASC, created_at ASC
-                        """,
-                        {"account_mode": account_mode, "symbol": symbol},
-                    )
+                    if account_mode == "DEMO" and demo_session_id:
+                        cur.execute(
+                            """
+                            SELECT pl.id, pl.qty, pl.available_qty
+                            FROM position_lots pl
+                            JOIN orders_core o ON o.id = pl.buy_order_id
+                            WHERE pl.account_mode = %(account_mode)s
+                              AND pl.symbol = %(symbol)s
+                              AND pl.available_qty > 0
+                              AND o.account_mode = %(account_mode)s
+                              AND COALESCE(o.order_metadata->>'demo_session_id', '') = %(demo_session_id)s
+                            ORDER BY pl.buy_trade_date ASC, pl.created_at ASC
+                            FOR UPDATE OF pl
+                            """,
+                            {"account_mode": account_mode, "symbol": symbol, "demo_session_id": demo_session_id},
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            SELECT id, qty, available_qty FROM position_lots
+                            WHERE account_mode = %(account_mode)s AND symbol = %(symbol)s AND available_qty > 0
+                            ORDER BY buy_trade_date ASC, created_at ASC
+                            FOR UPDATE
+                            """,
+                            {"account_mode": account_mode, "symbol": symbol},
+                        )
                     lots = cur.fetchall()
                     for lot in lots:
                         if remaining <= 0:
                             break
                         consume = min(int(lot["available_qty"]), remaining)
-                        cur.execute(
-                            "UPDATE position_lots SET available_qty = available_qty - %(consume)s, updated_at = NOW() WHERE id = %(lot_id)s",
-                            {"consume": consume, "lot_id": lot["id"]},
-                        )
-                        remaining -= consume
+                        lot_qty = int(lot["qty"])
+                        if consume >= lot_qty:
+                            cur.execute(
+                                """
+                                DELETE FROM position_lots
+                                WHERE id = %(lot_id)s
+                                  AND qty = %(lot_qty)s
+                                  AND available_qty >= %(consume)s
+                                """,
+                                {"consume": consume, "lot_qty": lot_qty, "lot_id": lot["id"]},
+                            )
+                        else:
+                            cur.execute(
+                                """
+                                UPDATE position_lots
+                                SET
+                                    qty = qty - %(consume)s,
+                                    available_qty = available_qty - %(consume)s,
+                                    updated_at = NOW()
+                                WHERE id = %(lot_id)s
+                                  AND qty > %(consume)s
+                                  AND available_qty >= %(consume)s
+                                """,
+                                {"consume": consume, "lot_id": lot["id"]},
+                            )
+                        if cur.rowcount > 0:
+                            remaining -= consume
                 if remaining > 0:
                     final_status = "REJECTED"
                     final_reason = "sell_fifo_consume_failed"

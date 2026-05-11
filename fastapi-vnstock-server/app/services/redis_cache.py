@@ -39,6 +39,33 @@ class RedisCacheService:
         except (RedisError, json.JSONDecodeError):
             return None
 
+    def get_many_json(self, keys: list[str]) -> dict[str, dict[str, Any]]:
+        client = self._get_client()
+        if client is None or not keys:
+            return {}
+        safe_keys = [str(key) for key in keys[:200_000]]
+        out: dict[str, dict[str, Any]] = {}
+        chunk_size = 1000
+        for offset in range(0, len(safe_keys), chunk_size):
+            chunk = safe_keys[offset : offset + chunk_size]
+            try:
+                pipe = client.pipeline(transaction=False)
+                for key in chunk:
+                    pipe.get(key)
+                raw_values = pipe.execute()
+            except RedisError:
+                continue
+            for key, raw in zip(chunk, raw_values, strict=False):
+                if not raw:
+                    continue
+                try:
+                    parsed = json.loads(str(raw))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if isinstance(parsed, dict):
+                    out[key] = parsed
+        return out
+
     def set_json(self, key: str, value: dict[str, Any], ttl_seconds: int) -> None:
         client = self._get_client()
         if client is None:
@@ -48,6 +75,30 @@ class RedisCacheService:
             client.setex(key, ttl_seconds, payload)
         except (RedisError, TypeError, ValueError):
             return
+
+    def acquire_lock(self, key: str, token: str, ttl_seconds: int) -> bool:
+        client = self._get_client()
+        if client is None:
+            return False
+        try:
+            return bool(client.set(str(key), str(token), nx=True, ex=max(1, int(ttl_seconds))))
+        except RedisError:
+            return False
+
+    def release_lock(self, key: str, token: str) -> bool:
+        client = self._get_client()
+        if client is None:
+            return False
+        script = """
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("del", KEYS[1])
+        end
+        return 0
+        """
+        try:
+            return bool(client.eval(script, 1, str(key), str(token)))
+        except RedisError:
+            return False
 
     def scan_keys(self, pattern: str, *, limit: int = 10_000) -> list[str]:
         client = self._get_client()

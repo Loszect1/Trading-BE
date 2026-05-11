@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import json
+import os
 import queue
 import threading
 import time
@@ -26,9 +27,11 @@ from psycopg.types.json import Json
 from app.core.config import get_vn_market_holiday_dates, settings
 from app.services.claude_service import ClaudeService
 from app.services.experience_service import create_experience_from_trade, ensure_experience_table
+from app.services.price_unit_service import normalize_vn_price_to_vnd
 from app.services.short_term_scan_schedule import is_now_on_short_term_scan_grid
 from app.services.signal_engine_service import _get_close_and_volume, run_short_term_scan_batch, run_short_term_scan_batch_light
-from app.services.trading_core_service import ensure_trading_core_tables, evaluate_risk, get_positions, place_order
+from app.services.trading_core_service import ensure_trading_core_tables, evaluate_risk, get_positions, place_order, roll_settlement
+from app.services.vnstock_api_service import VNStockApiService
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +44,7 @@ _ADVISORY_LOCK_KEY_DEMO_MAIL_SIGNAL = 771_005
 _ASYNC_RUNS_LOCK = threading.Lock()
 _ASYNC_RUNS: dict[str, dict[str, Any]] = {}
 _automation_claude_service = ClaudeService()
+_vnstock_api = VNStockApiService()
 _STALE_RUNNING_RUN_MINUTES = 45
 
 
@@ -158,7 +162,7 @@ def _allocate_quantities_by_score(
     scored: list[tuple[str, float, float]] = []
     for sig in buy_rows:
         sid = str(sig.get("id") or "").strip()
-        entry = float(sig.get("entry_price") or 0.0)
+        entry = normalize_vn_price_to_vnd(sig.get("entry_price"))
         if not sid or entry <= 0:
             continue
         scored.append((sid, entry, _buy_score(sig)))
@@ -202,8 +206,8 @@ def _build_claude_buy_decision_prompt(
                 "signal_id": str(row.get("id") or "").strip(),
                 "symbol": str(row.get("symbol") or "").strip().upper(),
                 "entry_price": float(row.get("entry_price") or 0.0),
-                "take_profit_price": float(row.get("take_profit_price") or 0.0),
-                "stoploss_price": float(row.get("stoploss_price") or 0.0),
+                "take_profit_price": normalize_vn_price_to_vnd(row.get("take_profit_price")),
+                "stoploss_price": normalize_vn_price_to_vnd(row.get("stoploss_price")),
                 "confidence": float(row.get("confidence") or 0.0),
                 "metadata": row.get("metadata") if isinstance(row.get("metadata"), dict) else {},
             }
@@ -302,9 +306,9 @@ def _apply_claude_buy_decision(
                 continue
             try:
                 qty = int(item.get("quantity") or 0)
-                entry = float(item.get("entry_price") or base_row.get("entry_price") or 0.0)
-                tp = float(item.get("take_profit_price") or base_row.get("take_profit_price") or 0.0)
-                sl = float(item.get("stoploss_price") or base_row.get("stoploss_price") or 0.0)
+                entry = normalize_vn_price_to_vnd(item.get("entry_price") or base_row.get("entry_price") or 0.0)
+                tp = normalize_vn_price_to_vnd(item.get("take_profit_price") or base_row.get("take_profit_price") or 0.0)
+                sl = normalize_vn_price_to_vnd(item.get("stoploss_price") or base_row.get("stoploss_price") or 0.0)
             except (TypeError, ValueError):
                 continue
             if entry <= 0 or sl <= 0 or sl >= entry or tp < entry:
@@ -376,31 +380,90 @@ def _resolve_sell_trigger(*, last_price: float, take_profit: float, stoploss: fl
     return None
 
 
-def _get_position_exit_levels(*, account_mode: str, symbol: str, avg_price: float) -> tuple[float, float]:
+def _extract_latest_market_price(symbol: str) -> float | None:
+    symbol_norm = str(symbol or "").strip().upper()
+    if not symbol_norm:
+        return None
+    try:
+        rows = _vnstock_api.call_quote(
+            "intraday",
+            source="VCI",
+            symbol=symbol_norm,
+            method_kwargs={},
+        )
+        if isinstance(rows, list):
+            for row in reversed(rows):
+                if not isinstance(row, dict):
+                    continue
+                for key in ("match_price", "price", "close", "last_price"):
+                    value = row.get(key)
+                    if value is None:
+                        continue
+                    price = normalize_vn_price_to_vnd(value)
+                    if price > 0:
+                        return price
+    except Exception:
+        logger.debug("short_term_latest_intraday_price_failed", exc_info=True, extra={"symbol": symbol_norm})
+
+    try:
+        closes, _volumes = _get_close_and_volume(symbol_norm, count=3)
+        for close in reversed(closes or []):
+            price = normalize_vn_price_to_vnd(close)
+            if price > 0:
+                return price
+    except Exception:
+        logger.debug("short_term_latest_history_price_failed", exc_info=True, extra={"symbol": symbol_norm})
+    return None
+
+
+def _get_position_exit_levels(
+    *,
+    account_mode: str,
+    symbol: str,
+    avg_price: float,
+    demo_session_id: str | None = None,
+) -> tuple[float, float]:
     fallback_tp = float(avg_price) * 1.04 if avg_price > 0 else 0.0
     fallback_sl = float(avg_price) * 0.97 if avg_price > 0 else 0.0
+    session_id = str(demo_session_id or "").strip()
     try:
         with connect(settings.database_url, row_factory=dict_row) as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT order_metadata
-                    FROM orders_core
-                    WHERE account_mode = %(account_mode)s
-                      AND symbol = %(symbol)s
-                      AND side = 'BUY'
-                      AND status = 'FILLED'
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                    """,
-                    {"account_mode": account_mode, "symbol": symbol},
-                )
+                if account_mode == "DEMO" and session_id:
+                    cur.execute(
+                        """
+                        SELECT order_metadata
+                        FROM orders_core
+                        WHERE account_mode = %(account_mode)s
+                          AND symbol = %(symbol)s
+                          AND side = 'BUY'
+                          AND status = 'FILLED'
+                          AND COALESCE(order_metadata->>'demo_session_id', '') = %(demo_session_id)s
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                        """,
+                        {"account_mode": account_mode, "symbol": symbol, "demo_session_id": session_id},
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT order_metadata
+                        FROM orders_core
+                        WHERE account_mode = %(account_mode)s
+                          AND symbol = %(symbol)s
+                          AND side = 'BUY'
+                          AND status = 'FILLED'
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                        """,
+                        {"account_mode": account_mode, "symbol": symbol},
+                    )
                 row = cur.fetchone() or {}
         meta = row.get("order_metadata") if isinstance(row, dict) else {}
         if not isinstance(meta, dict):
             return fallback_tp, fallback_sl
-        tp = float(meta.get("take_profit_price") or fallback_tp)
-        sl = float(meta.get("stoploss_price") or fallback_sl)
+        tp = normalize_vn_price_to_vnd(meta.get("take_profit_price") or fallback_tp)
+        sl = normalize_vn_price_to_vnd(meta.get("stoploss_price") or fallback_sl)
         if tp <= 0 or sl <= 0:
             return fallback_tp, fallback_sl
         return tp, sl
@@ -435,8 +498,52 @@ def _fetch_real_dnse_holdings_symbols() -> set[str] | None:
         return None
 
 
-def _build_sell_candidates_from_positions(account_mode: str) -> list[dict[str, Any]]:
+def _get_demo_positions_for_session(demo_session_id: str) -> list[dict[str, Any]]:
+    session_id = str(demo_session_id or "").strip()
+    if not session_id:
+        return []
+    roll_settlement("DEMO")
+    with connect(settings.database_url, row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    pl.symbol,
+                    SUM(pl.qty)::int AS total_qty,
+                    SUM(pl.available_qty)::int AS available_qty,
+                    SUM(pl.qty - pl.available_qty)::int AS pending_settlement_qty,
+                    AVG(pl.avg_price)::float8 AS avg_price,
+                    MIN(
+                        CASE
+                            WHEN COALESCE(o.order_metadata->>'strategy_code', '') IN ('SHORT_TERM', 'MAIL_SIGNAL')
+                                THEN COALESCE(o.order_metadata->>'strategy_code', '')
+                            WHEN COALESCE(o.order_metadata->>'source', '') LIKE 'mail_signal_%%'
+                                THEN 'MAIL_SIGNAL'
+                            ELSE 'SHORT_TERM'
+                        END
+                    ) AS strategy_code
+                FROM position_lots pl
+                JOIN orders_core o ON o.id = pl.buy_order_id
+                WHERE pl.account_mode = 'DEMO'
+                  AND o.account_mode = 'DEMO'
+                  AND o.status = 'FILLED'
+                  AND COALESCE(o.order_metadata->>'demo_session_id', '') = %(demo_session_id)s
+                GROUP BY pl.symbol
+                HAVING SUM(pl.qty) > 0
+                ORDER BY pl.symbol
+                """,
+                {"demo_session_id": session_id},
+            )
+            rows = cur.fetchall()
+    return [dict(row) for row in rows]
+
+
+def _build_sell_candidates_from_positions(account_mode: str, demo_session_id: str | None = None) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
+    session_id = str(demo_session_id or "").strip()
+    if account_mode == "DEMO" and not session_id:
+        logger.warning("demo_sell_candidates_skipped_missing_session")
+        return []
     # For REAL accounts, validate against live DNSE holdings.
     # Fail-open: if DNSE is unreachable, fall back to DB-only with a warning.
     dnse_confirmed: set[str] | None = None
@@ -446,7 +553,8 @@ def _build_sell_candidates_from_positions(account_mode: str) -> list[dict[str, A
             logger.info("dnse_holdings_guard_active | confirmed_symbols=%s", sorted(dnse_confirmed))
         else:
             logger.warning("dnse_holdings_guard_skipped | sell_candidates_built_from_db_only")
-    for pos in get_positions(account_mode):
+    positions = _get_demo_positions_for_session(session_id) if account_mode == "DEMO" else get_positions(account_mode)
+    for pos in positions:
         symbol = str(pos.get("symbol") or "").strip().upper()
         available_qty = int(pos.get("available_qty") or 0)
         avg_price = float(pos.get("avg_price") or 0.0)
@@ -465,7 +573,13 @@ def _build_sell_candidates_from_positions(account_mode: str) -> list[dict[str, A
         last_price = float(closes[-1] or 0.0)
         if last_price <= 0:
             continue
-        take_profit, stoploss = _get_position_exit_levels(account_mode=account_mode, symbol=symbol, avg_price=avg_price)
+        last_price = normalize_vn_price_to_vnd(last_price)
+        take_profit, stoploss = _get_position_exit_levels(
+            account_mode=account_mode,
+            symbol=symbol,
+            avg_price=avg_price,
+            demo_session_id=session_id if account_mode == "DEMO" else None,
+        )
         trigger = _resolve_sell_trigger(last_price=last_price, take_profit=take_profit, stoploss=stoploss)
         if not trigger:
             continue
@@ -478,12 +592,19 @@ def _build_sell_candidates_from_positions(account_mode: str) -> list[dict[str, A
                 "trigger": trigger,
                 "take_profit_price": take_profit,
                 "stoploss_price": stoploss,
+                "strategy_code": str(pos.get("strategy_code") or "SHORT_TERM").strip().upper(),
             }
         )
     return candidates
 
 
-def _handle_one_sell_candidate(*, candidate: dict[str, Any], account_mode: str, run_id: UUID) -> dict[str, Any]:
+def _handle_one_sell_candidate(
+    *,
+    candidate: dict[str, Any],
+    account_mode: str,
+    run_id: UUID,
+    demo_session_id: str | None = None,
+) -> dict[str, Any]:
     symbol = str(candidate.get("symbol") or "").strip().upper()
     qty = int(candidate.get("quantity") or 0)
     price = float(candidate.get("price") or 0.0)
@@ -495,7 +616,19 @@ def _handle_one_sell_candidate(*, candidate: dict[str, Any], account_mode: str, 
             "errors": 0,
             "detail": {"symbol": symbol, "outcome": "execution_rejected", "reason": "invalid_sell_payload"},
         }
-    idempotency_key = f"short-term-sell:{symbol}:{trigger}:{str(run_id)}"
+    session_id = str(demo_session_id or "").strip()
+    idempotency_key_parts = ["short-term-sell", symbol, trigger, str(run_id)]
+    if account_mode == "DEMO" and session_id:
+        idempotency_key_parts.append(session_id)
+    order_metadata = {
+        "source": "short_term_schedule_exit",
+        "strategy_code": str(candidate.get("strategy_code") or "SHORT_TERM").strip().upper(),
+        "trigger": trigger,
+        "take_profit_price": normalize_vn_price_to_vnd(candidate.get("take_profit_price")),
+        "stoploss_price": normalize_vn_price_to_vnd(candidate.get("stoploss_price")),
+    }
+    if account_mode == "DEMO" and session_id:
+        order_metadata["demo_session_id"] = session_id
     order_row = place_order(
         {
             "account_mode": account_mode,
@@ -503,15 +636,9 @@ def _handle_one_sell_candidate(*, candidate: dict[str, Any], account_mode: str, 
             "side": "SELL",
             "quantity": qty,
             "price": price,
-            "idempotency_key": idempotency_key,
+            "idempotency_key": ":".join(idempotency_key_parts),
             "auto_process": True,
-            "metadata": {
-                "source": "short_term_schedule_exit",
-                "strategy_code": "SHORT_TERM",
-                "trigger": trigger,
-                "take_profit_price": float(candidate.get("take_profit_price") or 0.0),
-                "stoploss_price": float(candidate.get("stoploss_price") or 0.0),
-            },
+            "metadata": order_metadata,
         }
     )
     resolved_order = order_row.get("order") if isinstance(order_row.get("order"), dict) else order_row
@@ -528,16 +655,21 @@ def _handle_one_sell_candidate(*, candidate: dict[str, Any], account_mode: str, 
                         "trade_id": str((resolved_order or {}).get("id") or f"short-term-stoploss:{symbol}:{str(run_id)}"),
                         "account_mode": account_mode,
                         "symbol": symbol,
-                        "strategy_type": "SHORT_TERM",
+                        "strategy_type": str(candidate.get("strategy_code") or "SHORT_TERM").strip().upper(),
                         "pnl_value": pnl_value,
                         "pnl_percent": pnl_percent,
                         "market_context": {
                             "trigger": trigger,
                             "exit_price": price,
+                            "entry_price": avg_price,
                             "entry_proxy_price": avg_price,
                             "quantity": qty,
                             "take_profit_price": float(candidate.get("take_profit_price") or 0.0),
                             "stoploss_price": float(candidate.get("stoploss_price") or 0.0),
+                            "rr_realized": abs((price - avg_price) / max(1e-9, avg_price - float(candidate.get("stoploss_price") or 0.0)))
+                            if avg_price > 0
+                            else 0.0,
+                            "prediction_outcome": "wrong",
                             "source": "short_term_schedule_exit",
                         },
                     }
@@ -586,12 +718,13 @@ def _handle_one_buy_signal(
     max_daily_new_orders: int,
     daily_new_orders: int,
     planned_quantity: int = 0,
+    demo_session_id: str | None = None,
 ) -> dict[str, Any]:
     symbol = str(sig.get("symbol", "")).strip().upper()
     sid = str(sig.get("id", ""))
-    entry = float(sig.get("entry_price") or 0.0)
-    tp = float(sig.get("take_profit_price") or 0.0)
-    stoploss = float(sig.get("stoploss_price") or 0.0)
+    entry = normalize_vn_price_to_vnd(sig.get("entry_price"))
+    tp = normalize_vn_price_to_vnd(sig.get("take_profit_price"))
+    stoploss = normalize_vn_price_to_vnd(sig.get("stoploss_price"))
     level_source = "signal"
     try:
         refined = _refine_buy_levels_with_claude(sig)
@@ -599,9 +732,9 @@ def _handle_one_buy_signal(
         logger.warning("short_term_claude_levels_failed", extra={"symbol": symbol, "error": str(exc)})
         refined = None
     if isinstance(refined, dict):
-        entry = float(refined.get("entry_price") or entry)
-        tp = float(refined.get("take_profit_price") or tp)
-        stoploss = float(refined.get("stoploss_price") or stoploss)
+        entry = normalize_vn_price_to_vnd(refined.get("entry_price") or entry)
+        tp = normalize_vn_price_to_vnd(refined.get("take_profit_price") or tp)
+        stoploss = normalize_vn_price_to_vnd(refined.get("stoploss_price") or stoploss)
         level_source = "claude"
     if entry <= 0 or stoploss <= 0:
         return {
@@ -621,8 +754,67 @@ def _handle_one_buy_signal(
                 "level_source": level_source,
             },
         }
+    market_price = _extract_latest_market_price(symbol)
+    if market_price is None or market_price <= 0:
+        return {
+            "risk_rejected": 0,
+            "executed": 0,
+            "execution_rejected": 1,
+            "errors": 0,
+            "daily_new_orders_delta": 0,
+            "cash_spent": 0.0,
+            "detail": {
+                "symbol": symbol,
+                "outcome": "rejected",
+                "reason": "missing_market_price",
+                "entry_price": entry,
+                "take_profit_price": tp,
+                "stoploss_price": stoploss,
+                "level_source": level_source,
+            },
+        }
+    execution_price = normalize_vn_price_to_vnd(market_price)
+    if execution_price > entry:
+        return {
+            "risk_rejected": 1,
+            "executed": 0,
+            "execution_rejected": 0,
+            "errors": 0,
+            "daily_new_orders_delta": 0,
+            "cash_spent": 0.0,
+            "detail": {
+                "symbol": symbol,
+                "outcome": "risk_rejected",
+                "reason": "market_price_above_entry",
+                "entry_price": entry,
+                "market_price": execution_price,
+                "take_profit_price": tp,
+                "stoploss_price": stoploss,
+                "level_source": level_source,
+            },
+        }
+    if stoploss >= execution_price or tp <= execution_price:
+        return {
+            "risk_rejected": 1,
+            "executed": 0,
+            "execution_rejected": 0,
+            "errors": 0,
+            "daily_new_orders_delta": 0,
+            "cash_spent": 0.0,
+            "detail": {
+                "symbol": symbol,
+                "outcome": "risk_rejected",
+                "reason": "invalid_market_price_risk_geometry",
+                "entry_price": entry,
+                "market_price": execution_price,
+                "take_profit_price": tp,
+                "stoploss_price": stoploss,
+                "level_source": level_source,
+            },
+        }
+    risk_entry_price = execution_price
     safe_available_cash = max(0.0, float(available_cash))
-    if safe_available_cash < (entry * 100.0):
+    if safe_available_cash < (risk_entry_price * 100.0):
         return {
             "risk_rejected": 1,
             "executed": 0,
@@ -635,17 +827,18 @@ def _handle_one_buy_signal(
                 "outcome": "risk_rejected",
                 "reason": "insufficient_cash_for_lot100_runtime",
                 "entry_price": entry,
+                "market_price": execution_price,
                 "take_profit_price": tp,
                 "stoploss_price": stoploss,
                 "level_source": level_source,
                 "available_cash": safe_available_cash,
-                "required_cash_for_lot100": round(entry * 100.0, 6),
+                "required_cash_for_lot100": round(risk_entry_price * 100.0, 6),
             },
         }
 
     risk_payload = {
         "stoploss_price": stoploss,
-        "entry_price": entry,
+        "entry_price": risk_entry_price,
         "nav": safe_available_cash,
         "risk_per_trade": float(risk_per_trade),
         "daily_new_orders": int(daily_new_orders),
@@ -702,7 +895,7 @@ def _handle_one_buy_signal(
                 "risk_cap_quantity": risk_cap_lot_qty,
             },
         }
-    max_cash_lot_qty = int((safe_available_cash / entry) // 100) * 100 if entry > 0 else 0
+    max_cash_lot_qty = int((safe_available_cash / risk_entry_price) // 100) * 100 if risk_entry_price > 0 else 0
     if qty > max_cash_lot_qty:
         qty = max_cash_lot_qty
     if qty <= 0:
@@ -718,6 +911,7 @@ def _handle_one_buy_signal(
                 "outcome": "risk_rejected",
                 "reason": "insufficient_cash_after_risk_sizing",
                 "entry_price": entry,
+                "market_price": execution_price,
                 "take_profit_price": tp,
                 "stoploss_price": stoploss,
                 "level_source": level_source,
@@ -727,24 +921,32 @@ def _handle_one_buy_signal(
             },
         }
 
+    session_id = str(demo_session_id or "").strip()
     idempotency_key = f"short-term:{sid}"
+    if account_mode == "DEMO" and session_id:
+        idempotency_key = f"{idempotency_key}:{session_id}"
+    order_metadata = {
+        "source": "short_term_schedule_entry",
+        "strategy_code": "SHORT_TERM",
+        "entry_price": entry,
+        "market_price_at_check": execution_price,
+        "execution_price_source": "latest_market_price",
+        "take_profit_price": tp,
+        "stoploss_price": stoploss,
+        "level_source": level_source,
+    }
+    if account_mode == "DEMO" and session_id:
+        order_metadata["demo_session_id"] = session_id
     order_row = place_order(
         {
             "account_mode": account_mode,
             "symbol": symbol,
             "side": "BUY",
             "quantity": qty,
-            "price": entry,
+            "price": execution_price,
             "idempotency_key": idempotency_key,
             "auto_process": True,
-            "metadata": {
-                "source": "short_term_schedule_entry",
-                "strategy_code": "SHORT_TERM",
-                "entry_price": entry,
-                "take_profit_price": tp,
-                "stoploss_price": stoploss,
-                "level_source": level_source,
-            },
+            "metadata": order_metadata,
         }
     )
     resolved_order = order_row.get("order") if isinstance(order_row.get("order"), dict) else order_row
@@ -764,6 +966,8 @@ def _handle_one_buy_signal(
                 "outcome": "executed",
                 "order_id": (resolved_order or {}).get("id"),
                 "entry_price": entry,
+                "market_price": execution_price,
+                "filled_price": filled_price,
                 "take_profit_price": tp,
                 "stoploss_price": stoploss,
                 "level_source": level_source,
@@ -785,6 +989,7 @@ def _handle_one_buy_signal(
                 "outcome": "execution_rejected",
                 "reason": (resolved_order or {}).get("reason"),
                 "entry_price": entry,
+                "market_price": execution_price,
                 "take_profit_price": tp,
                 "stoploss_price": stoploss,
                 "level_source": level_source,
@@ -805,6 +1010,7 @@ def _handle_one_buy_signal(
             "reason": f"unexpected_order_status:{status}",
             "order_id": (resolved_order or {}).get("id"),
             "entry_price": entry,
+            "market_price": execution_price,
             "take_profit_price": tp,
             "stoploss_price": stoploss,
             "level_source": level_source,
@@ -821,6 +1027,17 @@ def _scan_batch_worker(limit_symbols: int, exchange_scope: str, fallback_light: 
     # Without this, a single hung upstream API call blocks the entire batch until
     # the parent's queue.get() timeout kills the process from outside.
     _socket.setdefaulttimeout(30)
+    started = time.monotonic()
+    worker_pid = os.getpid()
+    logger.warning(
+        "short_term_scan_worker_started",
+        extra={
+            "worker_pid": worker_pid,
+            "limit_symbols": int(limit_symbols),
+            "exchange_scope": str(exchange_scope).upper(),
+            "fallback_light": bool(fallback_light),
+        },
+    )
     try:
         if fallback_light:
             cap = int(settings.automation_short_term_scan_fallback_light_max_symbols)
@@ -828,37 +1045,84 @@ def _scan_batch_worker(limit_symbols: int, exchange_scope: str, fallback_light: 
             batch = run_short_term_scan_batch_light(limit_symbols=safe_limit, exchange_scope=exchange_scope)
         else:
             batch = run_short_term_scan_batch(limit_symbols, exchange_scope=exchange_scope)
+        logger.warning(
+            "short_term_scan_worker_finished",
+            extra={
+                "worker_pid": worker_pid,
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+                "limit_symbols": int(limit_symbols),
+                "exchange_scope": str(exchange_scope).upper(),
+                "fallback_light": bool(fallback_light),
+                "scanned": int(batch.get("scanned") or 0) if isinstance(batch, dict) else None,
+                "signals": len(batch.get("signals") or []) if isinstance(batch, dict) else None,
+                "scan_mode": str(batch.get("scan_mode") or "") if isinstance(batch, dict) else None,
+            },
+        )
         out_queue.put({"ok": True, "batch": batch})
     except BaseException as exc:
+        tb = traceback.format_exc()
+        logger.error(
+            "short_term_scan_worker_failed",
+            extra={
+                "worker_pid": worker_pid,
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+                "limit_symbols": int(limit_symbols),
+                "exchange_scope": str(exchange_scope).upper(),
+                "fallback_light": bool(fallback_light),
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+        )
+        logger.error("short_term_scan_worker_failed_traceback\n%s", tb)
         try:
             out_queue.put(
                 {
                     "ok": False,
                     "error": str(exc),
                     "error_type": type(exc).__name__,
-                    "traceback": traceback.format_exc(),
+                    "traceback": tb,
                 }
             )
         except Exception:
             # Last-resort: worker is about to exit and queue pipe may be broken.
+            logger.exception(
+                "short_term_scan_worker_error_payload_put_failed",
+                extra={
+                    "worker_pid": worker_pid,
+                    "limit_symbols": int(limit_symbols),
+                    "exchange_scope": str(exchange_scope).upper(),
+                    "fallback_light": bool(fallback_light),
+                },
+            )
             pass
     finally:
-        # Prevent Windows spawn deadlock: without cancel_join_thread(), the subprocess
+        # Let the child Queue feeder flush; cancel_join_thread() can drop payload.
         # waits for the Queue feeder thread to flush the pipe before exiting. If the
         # parent is blocked in proc.join() and not reading, the pipe buffer fills and
         # the feeder thread blocks → deadlock. cancel_join_thread() lets the subprocess
         # exit immediately; the parent reads the data independently via queue.get().
-        try:
-            out_queue.cancel_join_thread()
-        except Exception:
-            pass
+        pass
 
 
-def _dispose_scan_worker_queue(out_queue: Any) -> None:
-    """Always drain feeder threads for ctx.Queue on Windows spawn to avoid deadlocks on reuse."""
+def _scan_worker_exit_detail(proc: Any) -> dict[str, Any]:
+    exitcode = getattr(proc, "exitcode", None)
+    detail: dict[str, Any] = {
+        "worker_pid": getattr(proc, "pid", None),
+        "worker_exitcode": exitcode,
+    }
+    if isinstance(exitcode, int) and exitcode < 0:
+        detail["worker_signal"] = -exitcode
+    return detail
+
+
+def _dispose_scan_worker_queue(out_queue: Any, *, join_thread: bool = True) -> None:
+    """Close scan worker queue without letting Queue feeder cleanup hold the scheduler lock."""
     try:
+        if not join_thread:
+            out_queue.cancel_join_thread()
         out_queue.close()
-        out_queue.join_thread()
+        if join_thread:
+            out_queue.join_thread()
     except Exception:
         logger.warning("scan_worker_queue_dispose_failed", exc_info=True)
 
@@ -888,30 +1152,133 @@ def _run_short_term_scan_batch_with_timeout(
         args=(limit_symbols, str(exchange_scope).upper(), fallback_light, out_queue),
     )
     proc.start()
+    parent_started = time.monotonic()
+    logger.warning(
+        "short_term_scan_worker_parent_started",
+        extra={
+            **_scan_worker_exit_detail(proc),
+            "limit_symbols": int(limit_symbols),
+            "exchange_scope": str(exchange_scope).upper(),
+            "fallback_light": bool(fallback_light),
+            "timeout_seconds": safe_timeout,
+        },
+    )
 
     # Read result first — this unblocks the subprocess feeder thread so the process
-    # can exit cleanly. Timeout here is the hard budget for the entire scan.
+    # can exit cleanly. Also poll the process so an early worker crash without a
+    # queue payload does not leave the parent waiting until the full timeout.
+    deadline = time.monotonic() + float(safe_timeout)
     try:
-        message = out_queue.get(timeout=safe_timeout)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise queue.Empty
+            try:
+                message = out_queue.get(timeout=min(1.0, remaining))
+                break
+            except queue.Empty:
+                if proc.is_alive():
+                    continue
+                proc.join(timeout=2)
+                try:
+                    message = out_queue.get_nowait()
+                    break
+                except queue.Empty as exc:
+                    logger.error(
+                        "short_term_scan_worker_exited_without_payload",
+                        extra={
+                            **_scan_worker_exit_detail(proc),
+                            "elapsed_seconds": round(time.monotonic() - parent_started, 3),
+                            "limit_symbols": int(limit_symbols),
+                            "exchange_scope": str(exchange_scope).upper(),
+                            "fallback_light": bool(fallback_light),
+                            "timeout_seconds": safe_timeout,
+                        },
+                    )
+                    _dispose_scan_worker_queue(out_queue, join_thread=False)
+                    raise RuntimeError(
+                        "short_term_scan_batch worker exited without result payload "
+                        f"(pid={getattr(proc, 'pid', None)}, exitcode={getattr(proc, 'exitcode', None)})"
+                    ) from exc
     except queue.Empty:
         # Scan timed out — subprocess is still running (stuck upstream API call).
+        logger.error(
+            "short_term_scan_worker_timeout",
+            extra={
+                **_scan_worker_exit_detail(proc),
+                "elapsed_seconds": round(time.monotonic() - parent_started, 3),
+                "limit_symbols": int(limit_symbols),
+                "exchange_scope": str(exchange_scope).upper(),
+                "fallback_light": bool(fallback_light),
+                "timeout_seconds": safe_timeout,
+            },
+        )
         if proc.is_alive():
             proc.terminate()
             proc.join(timeout=5)
+            logger.warning(
+                "short_term_scan_worker_terminated_after_timeout",
+                extra={
+                    **_scan_worker_exit_detail(proc),
+                    "limit_symbols": int(limit_symbols),
+                    "exchange_scope": str(exchange_scope).upper(),
+                    "fallback_light": bool(fallback_light),
+                },
+            )
             if proc.is_alive():
                 proc.kill()
                 proc.join(timeout=2)
-        _dispose_scan_worker_queue(out_queue)
+                logger.error(
+                    "short_term_scan_worker_killed_after_timeout",
+                    extra={
+                        **_scan_worker_exit_detail(proc),
+                        "limit_symbols": int(limit_symbols),
+                        "exchange_scope": str(exchange_scope).upper(),
+                        "fallback_light": bool(fallback_light),
+                    },
+                )
+        _dispose_scan_worker_queue(out_queue, join_thread=False)
         raise TimeoutError(f"short_term_scan_batch timed out after {safe_timeout}s")
 
     # Got result — process should exit quickly now that pipe is drained.
     proc.join(timeout=10)
     if proc.is_alive():
+        logger.warning(
+            "short_term_scan_worker_still_alive_after_payload",
+            extra={
+                **_scan_worker_exit_detail(proc),
+                "elapsed_seconds": round(time.monotonic() - parent_started, 3),
+                "limit_symbols": int(limit_symbols),
+                "exchange_scope": str(exchange_scope).upper(),
+                "fallback_light": bool(fallback_light),
+            },
+        )
         proc.terminate()
         proc.join(timeout=3)
         if proc.is_alive():
             proc.kill()
+            logger.error(
+                "short_term_scan_worker_killed_after_payload",
+                extra={
+                    **_scan_worker_exit_detail(proc),
+                    "limit_symbols": int(limit_symbols),
+                    "exchange_scope": str(exchange_scope).upper(),
+                    "fallback_light": bool(fallback_light),
+                },
+            )
     _dispose_scan_worker_queue(out_queue)
+    logger.warning(
+        "short_term_scan_worker_parent_received_payload",
+        extra={
+            **_scan_worker_exit_detail(proc),
+            "elapsed_seconds": round(time.monotonic() - parent_started, 3),
+            "limit_symbols": int(limit_symbols),
+            "exchange_scope": str(exchange_scope).upper(),
+            "fallback_light": bool(fallback_light),
+            "payload_ok": message.get("ok") if isinstance(message, dict) else None,
+            "payload_type": type(message).__name__,
+        },
+    )
 
     if not isinstance(message, dict):
         raise RuntimeError("short_term_scan_batch returned invalid payload")
@@ -1648,7 +2015,10 @@ def run_short_term_production_cycle(
                 sell_candidates = _call_with_thread_timeout(
                     name=f"short-term-sell-candidate-scan-{normalized_account_mode.lower()}",
                     timeout_seconds=buy_step_timeout_seconds,
-                    fn=lambda: _build_sell_candidates_from_positions(account_mode),
+                    fn=lambda: _build_sell_candidates_from_positions(
+                        account_mode,
+                        demo_session_id=demo_session_id if account_mode == "DEMO" else None,
+                    ),
                 )
             except queue.Empty:
                 sell_candidates = []
@@ -1722,7 +2092,7 @@ def run_short_term_production_cycle(
             for row in buy_rows_decided:
                 sid = str(row.get("id") or "")
                 symbol = str(row.get("symbol") or "").strip().upper()
-                entry_price = float(row.get("entry_price") or 0.0)
+                entry_price = normalize_vn_price_to_vnd(row.get("entry_price"))
                 planned_qty = int(planned_qty_by_signal_id.get(sid, 0))
                 if entry_price <= 0 or planned_qty < 100:
                     executions_detail.append(
@@ -1741,7 +2111,7 @@ def run_short_term_production_cycle(
             planned_spent_total = 0.0
             for row in buy_rows:
                 sid = str(row.get("id") or "")
-                entry_price = float(row.get("entry_price") or 0.0)
+                entry_price = normalize_vn_price_to_vnd(row.get("entry_price"))
                 planned_qty = int(planned_qty_by_signal_id.get(sid, 0))
                 if entry_price > 0 and planned_qty > 0:
                     planned_spent_total += float(entry_price) * float(planned_qty)
@@ -1756,6 +2126,7 @@ def run_short_term_production_cycle(
                             candidate=sell_candidate,
                             account_mode=account_mode,
                             run_id=run_id,
+                            demo_session_id=demo_session_id if account_mode == "DEMO" else None,
                         ),
                     )
                     executed += int(one.get("executed") or 0)
@@ -1814,6 +2185,7 @@ def run_short_term_production_cycle(
                                         max_daily_new_orders=int(max_daily_new_orders),
                                         daily_new_orders=int(daily_new_orders),
                                         planned_quantity=int(planned_qty_by_signal_id.get(str(sig.get("id") or ""), 0)),
+                                        demo_session_id=demo_session_id if account_mode == "DEMO" else None,
                                     ),
                                 )
                             )

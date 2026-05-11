@@ -5,7 +5,14 @@ without calling the real vnstock network.
 
 from __future__ import annotations
 
+from datetime import date, timedelta
 from typing import Any
+
+
+def _recent_iso_dates(bars: int) -> list[str]:
+    end = date.today()
+    start = end - timedelta(days=bars - 1)
+    return [(start + timedelta(days=i)).isoformat() for i in range(bars)]
 
 
 def ohlcv_rows_short_term_buy_spike(*, bars: int = 50) -> list[dict[str, Any]]:
@@ -20,9 +27,10 @@ def ohlcv_rows_short_term_buy_spike(*, bars: int = 50) -> list[dict[str, Any]]:
         raise ValueError("bars must be at least 50 for current short-term thresholds")
 
     rows: list[dict[str, Any]] = []
+    dates = _recent_iso_dates(bars)
     for i in range(bars - 1):
-        rows.append({"close": 10_000.0, "volume": 1_000.0, "time": f"2025-11-{i + 1:02d}"})
-    rows.append({"close": 20_000.0, "volume": 3_000.0, "time": "2025-12-20"})
+        rows.append({"close": 10_000.0, "volume": 1_000.0, "time": dates[i]})
+    rows.append({"close": 20_000.0, "volume": 3_000.0, "time": dates[-1]})
     return rows
 
 
@@ -30,5 +38,6 @@ def ohlcv_rows_short_term_hold_flat_volume(*, bars: int = 50) -> list[dict[str, 
     """Flat volume (no spike) so action stays HOLD while still passing min bar count."""
     if bars < 50:
         raise ValueError("bars must be at least 50")
-    return [{"close": 10_000.0 + float(i), "volume": 1_000.0, "time": f"2025-11-{i + 1:02d}"} for i in range(bars)]
+    dates = _recent_iso_dates(bars)
+    return [{"close": 10_000.0 + float(i), "volume": 1_000.0, "time": dates[i]} for i in range(bars)]
 

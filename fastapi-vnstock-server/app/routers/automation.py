@@ -28,6 +28,11 @@ from app.schemas.automation import (
     TechnicalCycleRunResponse,
 )
 from app.services.signal_engine_service import extract_short_term_scan_diagnostics, run_short_term_scan_batch
+from app.services.real_recommendation_service import (
+    build_recommendation_from_signal,
+    normalize_real_recommendation_rows,
+    preflight_real_recommendations,
+)
 from app.services.trading_core_service import evaluate_risk, place_order
 from app.services.automation_scheduler_service import (
     get_active_scheduler_demo_session_id,
@@ -88,7 +93,17 @@ def _extract_mail_signal_recommendations(mail_out: Any) -> list[dict[str, Any]]:
     raw_items = mail_out.get("items")
     if not isinstance(raw_items, list):
         return []
-    return _normalize_real_recommendation_rows(cast(list[dict[str, Any]], raw_items))
+    rows: list[dict[str, Any]] = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        row = dict(raw)
+        confidence = _to_float(row.get("confidence"))
+        if confidence is not None and 0.0 <= confidence <= 1.0:
+            row["confidence"] = confidence * 100.0
+        row.setdefault("source_strategy", "MAIL_SIGNAL")
+        rows.append(row)
+    return normalize_real_recommendation_rows(rows)
 
 
 def _to_float(value: Any) -> float | None:
@@ -99,26 +114,7 @@ def _to_float(value: Any) -> float | None:
 
 
 def _normalize_real_recommendation_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    for row in rows:
-        symbol = str(row.get("symbol") or "").strip().upper()
-        entry = _to_float(row.get("entry"))
-        take_profit = _to_float(row.get("take_profit"))
-        stop_loss = _to_float(row.get("stop_loss"))
-        confidence = _to_float(row.get("confidence"))
-        if not symbol or entry is None or take_profit is None or stop_loss is None:
-            continue
-        out.append(
-            {
-                "symbol": symbol,
-                "entry": entry,
-                "take_profit": take_profit,
-                "stop_loss": stop_loss,
-                "confidence": max(0.0, min(100.0, confidence if confidence is not None else 50.0)),
-                "reason": str(row.get("reason") or "").strip(),
-            }
-        )
-    return out
+    return normalize_real_recommendation_rows(rows)
 
 router = APIRouter(prefix="/automation", tags=["automation"])
 
@@ -323,6 +319,7 @@ def get_short_term_cache_eligible(
 
     try:
         keys = _redis_cache.scan_keys("scan:liquidity:*", limit=500_000)
+        payload_by_key = _redis_cache.get_many_json([str(key) for key in keys])
         items: list[dict[str, Any]] = []
         for key in keys:
             parts = str(key).split(":", 3)
@@ -337,7 +334,9 @@ def get_short_term_cache_eligible(
                 continue
             if exchange_scope != "ALL" and exchange != exchange_scope:
                 continue
-            payload = _redis_cache.get_json(str(key))
+            payload = payload_by_key.get(str(key))
+            if payload is None:
+                payload = _redis_cache.get_json(str(key))
             if not isinstance(payload, dict):
                 continue
             if not _is_true_flag(payload.get("eligible_liquidity", False)):
@@ -580,21 +579,16 @@ def post_real_recommendations_scan(body: RealRecommendationScanRequest = RealRec
 
         scan_result = run_short_term_scan_batch(limit_symbols=body.limit_symbols, exchange_scope=body.exchange_scope)
         raw_signals = scan_result.get("signals") or []
-        recommendations: list[dict[str, Any]] = []
+        raw_recommendations: list[dict[str, Any]] = []
         for signal in raw_signals:
             if not isinstance(signal, dict) or str(signal.get("action") or "").upper() != "BUY":
                 continue
-            recommendations.append(
-                {
-                    "symbol": str(signal.get("symbol") or "").strip().upper(),
-                    "entry": signal.get("entry_price"),
-                    "take_profit": signal.get("take_profit_price"),
-                    "stop_loss": signal.get("stoploss_price"),
-                    "confidence": signal.get("confidence"),
-                    "reason": signal.get("reason"),
-                }
-            )
-        recommendations = _normalize_real_recommendation_rows(recommendations)
+            raw_recommendations.append(build_recommendation_from_signal(signal))
+        recommendations, rejected_recommendations = preflight_real_recommendations(
+            raw_recommendations,
+            available_cash_vnd=body.real_account_available_cash_vnd,
+            cash_source="request_cash" if body.real_account_available_cash_vnd is not None else "config_cash",
+        )
         payload = {
             "generated_at": scan_result.get("scan_finished_at"),
             "exchange_scope": str(body.exchange_scope).upper(),
@@ -604,6 +598,9 @@ def post_real_recommendations_scan(body: RealRecommendationScanRequest = RealRec
             "count": len(recommendations),
             "short_term_recommendations": recommendations,
             "short_term_count": len(recommendations),
+            "all_short_term_recommendations": recommendations + rejected_recommendations,
+            "rejected_recommendations": rejected_recommendations,
+            "rejected_count": len(rejected_recommendations),
             "mail_signal_recommendations": mail_recommendations,
             "mail_signal_count": len(mail_recommendations),
             "scan_diagnostics": extract_short_term_scan_diagnostics(scan_result),
@@ -619,14 +616,17 @@ def post_real_recommendations_scan(body: RealRecommendationScanRequest = RealRec
 def get_real_recommendations_latest() -> dict[str, Any]:
     try:
         row = _redis_cache.get_json(_REAL_RECOMMENDATIONS_REDIS_KEY) or {}
-        recommendations = _normalize_real_recommendation_rows(
+        recommendations = normalize_real_recommendation_rows(
             cast(list[dict[str, Any]], row.get("recommendations") or [])
         )
-        short_term_recommendations = _normalize_real_recommendation_rows(
+        short_term_recommendations = normalize_real_recommendation_rows(
             cast(list[dict[str, Any]], row.get("short_term_recommendations") or recommendations)
         )
-        mail_signal_recommendations = _normalize_real_recommendation_rows(
+        mail_signal_recommendations = normalize_real_recommendation_rows(
             cast(list[dict[str, Any]], row.get("mail_signal_recommendations") or [])
+        )
+        rejected_recommendations = normalize_real_recommendation_rows(
+            cast(list[dict[str, Any]], row.get("rejected_recommendations") or [])
         )
         diag = row.get("scan_diagnostics")
         if not isinstance(diag, dict):
@@ -640,6 +640,11 @@ def get_real_recommendations_latest() -> dict[str, Any]:
             "count": len(short_term_recommendations),
             "short_term_recommendations": short_term_recommendations,
             "short_term_count": len(short_term_recommendations),
+            "all_short_term_recommendations": normalize_real_recommendation_rows(
+                cast(list[dict[str, Any]], row.get("all_short_term_recommendations") or short_term_recommendations)
+            ),
+            "rejected_recommendations": rejected_recommendations,
+            "rejected_count": len(rejected_recommendations),
             "mail_signal_recommendations": mail_signal_recommendations,
             "mail_signal_count": len(mail_signal_recommendations),
             "scan_diagnostics": diag,
@@ -659,14 +664,17 @@ def get_real_recommendations_recent(limit: int = Query(default=10, ge=1, le=50))
             payload = _redis_cache.get_json(key)
             if not isinstance(payload, dict):
                 continue
-            recommendations = _normalize_real_recommendation_rows(
+            recommendations = normalize_real_recommendation_rows(
                 cast(list[dict[str, Any]], payload.get("recommendations") or [])
             )
-            short_term_recommendations = _normalize_real_recommendation_rows(
+            short_term_recommendations = normalize_real_recommendation_rows(
                 cast(list[dict[str, Any]], payload.get("short_term_recommendations") or recommendations)
             )
-            mail_signal_recommendations = _normalize_real_recommendation_rows(
+            mail_signal_recommendations = normalize_real_recommendation_rows(
                 cast(list[dict[str, Any]], payload.get("mail_signal_recommendations") or [])
+            )
+            rejected_recommendations = normalize_real_recommendation_rows(
+                cast(list[dict[str, Any]], payload.get("rejected_recommendations") or [])
             )
             diag = payload.get("scan_diagnostics")
             if not isinstance(diag, dict):
@@ -682,6 +690,14 @@ def get_real_recommendations_recent(limit: int = Query(default=10, ge=1, le=50))
                     "count": len(short_term_recommendations),
                     "short_term_recommendations": short_term_recommendations,
                     "short_term_count": len(short_term_recommendations),
+                    "all_short_term_recommendations": normalize_real_recommendation_rows(
+                        cast(
+                            list[dict[str, Any]],
+                            payload.get("all_short_term_recommendations") or short_term_recommendations,
+                        )
+                    ),
+                    "rejected_recommendations": rejected_recommendations,
+                    "rejected_count": len(rejected_recommendations),
                     "mail_signal_recommendations": mail_signal_recommendations,
                     "mail_signal_count": len(mail_signal_recommendations),
                     "scan_diagnostics": diag,
@@ -702,34 +718,39 @@ def post_real_recommendations_action_buy(body: RealRecommendationBuyRequest) -> 
         entry = float(body.entry)
         stop_loss = float(body.stop_loss)
         available_cash = float(body.available_cash_vnd)
-        risk_result = evaluate_risk(
-            {
-                "account_mode": "REAL",
-                "symbol": symbol,
-                "nav": max(1_000_000.0, available_cash * float(settings.strategy_alloc_short_term_pct)),
-                "risk_per_trade": float(settings.strategy_risk_per_trade),
-                "entry_price": entry,
-                "stoploss_price": stop_loss,
-                "take_profit_price": float(body.take_profit),
-                "side": "BUY",
-                "min_reward_risk": 1.5,
-                "daily_new_orders": 0,
-                "max_daily_new_orders": 10,
-            }
+        buyable, rejected = preflight_real_recommendations(
+            [
+                {
+                    "symbol": symbol,
+                    "entry": entry,
+                    "take_profit": float(body.take_profit),
+                    "stop_loss": stop_loss,
+                    "confidence": float(body.confidence),
+                    "reason": str(body.reason),
+                    "setup_type": getattr(body, "setup_type", None),
+                    "setup": getattr(body, "setup", None),
+                    "freshness": getattr(body, "freshness", None),
+                    "metadata": getattr(body, "metadata", None),
+                }
+            ],
+            available_cash_vnd=available_cash,
+            cash_source="request_cash",
         )
-        if not risk_result.get("pass"):
+        if not buyable:
+            rejected_row = rejected[0] if rejected else {}
             return {
                 "success": False,
                 "data": {
                     "status": "REJECTED",
-                    "reason": f"risk_reject:{risk_result.get('reason')}",
-                    "risk_result": risk_result,
+                    "reason": rejected_row.get("risk_reason") or "risk_preflight_rejected",
+                    "risk_result": rejected_row.get("risk_result") or {},
+                    "account_preflight": rejected_row.get("account_preflight") or {},
+                    "settlement_pressure": rejected_row.get("settlement_pressure") or {},
                 },
             }
-        suggested_size = int(risk_result.get("suggested_size") or 0)
-        max_affordable_size = int(available_cash // entry) if entry > 0 else 0
-        raw_quantity = max(0, min(suggested_size, max_affordable_size))
-        quantity = (raw_quantity // 100) * 100
+        row = buyable[0]
+        risk_result = row.get("risk_result") if isinstance(row.get("risk_result"), dict) else {}
+        quantity = int(row.get("suggested_quantity") or 0)
         if quantity <= 0:
             return {
                 "success": False,
@@ -737,8 +758,8 @@ def post_real_recommendations_action_buy(body: RealRecommendationBuyRequest) -> 
                     "status": "REJECTED",
                     "reason": "insufficient_size_or_cash_after_risk",
                     "risk_result": risk_result,
-                    "suggested_size": suggested_size,
-                    "max_affordable_size": max_affordable_size,
+                    "account_preflight": row.get("account_preflight") or {},
+                    "settlement_pressure": row.get("settlement_pressure") or {},
                 },
             }
         order_row = place_order(
@@ -758,7 +779,16 @@ def post_real_recommendations_action_buy(body: RealRecommendationBuyRequest) -> 
                 },
             }
         )
-        return {"success": True, "data": {"order": order_row, "risk_result": risk_result, "quantity": quantity}}
+        return {
+            "success": True,
+            "data": {
+                "order": order_row,
+                "risk_result": risk_result,
+                "quantity": quantity,
+                "account_preflight": row.get("account_preflight") or {},
+                "settlement_pressure": row.get("settlement_pressure") or {},
+            },
+        }
     except Exception as exc:
         logger.exception("automation.real_recommendations_action_buy_failed")
         raise HTTPException(status_code=500, detail=f"Failed to action BUY from recommendation: {exc}") from exc

@@ -815,11 +815,73 @@ def test_sell_fifo_consumes_oldest_lot_first(trading_db: str, monkeypatch: pytes
             )
             rows = cur.fetchall()
 
-    assert len(rows) == 2
-    assert int(rows[0]["available_qty"]) == 0
-    assert int(rows[0]["qty"]) == 2
-    assert int(rows[1]["available_qty"]) == 1
-    assert int(rows[1]["qty"]) == 2
+    assert len(rows) == 1
+    assert int(rows[0]["available_qty"]) == 1
+    assert int(rows[0]["qty"]) == 1
+
+
+@pytest.mark.postgres
+def test_sold_lot_is_not_reopened_by_settlement_roll(trading_db: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.services.trading_core_service as tcs
+
+    monkeypatch.setattr(tcs, "_settlement_effective_today", lambda: date(2025, 6, 15))
+
+    sym = "TSTNOSOLDROLL"
+    buy = place_order(
+        {
+            "account_mode": "DEMO",
+            "symbol": sym,
+            "side": "BUY",
+            "quantity": 100,
+            "price": 5000.0,
+            "idempotency_key": "idem-tstnosoldroll-buy",
+            "auto_process": True,
+        }
+    )
+    assert buy["status"] == "FILLED"
+
+    with connect(trading_db) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE position_lots
+                SET settle_date = %(settle_date)s, available_qty = qty
+                WHERE account_mode = 'DEMO' AND symbol = %(symbol)s
+                """,
+                {"settle_date": date(2020, 1, 1), "symbol": sym},
+            )
+        conn.commit()
+
+    first_sell = place_order(
+        {
+            "account_mode": "DEMO",
+            "symbol": sym,
+            "side": "SELL",
+            "quantity": 100,
+            "price": 5100.0,
+            "idempotency_key": "idem-tstnosoldroll-sell-a",
+            "auto_process": True,
+        }
+    )
+    assert first_sell["status"] == "FILLED"
+
+    after_first = check_settlement("DEMO", sym, 1)
+    assert after_first["pass"] is False
+    assert after_first["available_qty"] == 0
+
+    second_sell = place_order(
+        {
+            "account_mode": "DEMO",
+            "symbol": sym,
+            "side": "SELL",
+            "quantity": 100,
+            "price": 5100.0,
+            "idempotency_key": "idem-tstnosoldroll-sell-b",
+            "auto_process": True,
+        }
+    )
+    assert second_sell["status"] == "REJECTED"
+    assert second_sell["reason"] == "settlement_guard_failed"
 
 
 @pytest.mark.postgres

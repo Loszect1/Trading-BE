@@ -13,6 +13,8 @@ from psycopg.types.json import Json
 
 from app.core.config import settings
 from app.schemas.auto_trading import DEMO_INITIAL_BALANCE_VND, DemoTradeRequest
+from app.services.experience_service import create_experience_from_trade, ensure_experience_table
+from app.services.price_unit_service import normalize_vn_price_to_vnd
 from app.services.trading_core_service import roll_settlement
 from app.services.vn_market_holiday_calendar import add_vn_trading_days_live, vn_market_local_today
 from app.services.vnstock_api_service import VNStockApiService
@@ -49,9 +51,7 @@ def _last_daily_close_mark(symbol: str) -> float | None:
             close = float(close_raw)
         except (TypeError, ValueError):
             continue
-        # VN market convention: some sources return price in "nghin dong" (e.g. 42.65 -> 42,650 VND).
-        if 0 < close < 1000:
-            close *= 1000.0
+        close = normalize_vn_price_to_vnd(close)
         if close > 0:
             return close
     return None
@@ -369,6 +369,10 @@ def _strategy_used_notional_for_session(session_id: str) -> dict[str, float]:
     return used
 
 
+def _effective_strategy_remaining_cash(cash_value: float, used_notional: float) -> float:
+    return max(0.0, float(cash_value or 0.0) - float(used_notional or 0.0))
+
+
 def _get_demo_positions_from_core(session_id: str) -> list[dict[str, Any]]:
     sid = normalize_demo_session_id(session_id)
     with connect(settings.database_url, row_factory=dict_row) as conn:
@@ -438,8 +442,8 @@ def _get_demo_position_exit_levels_from_core(session_id: str) -> dict[str, tuple
         if not isinstance(meta, dict):
             continue
         try:
-            tp = float(meta.get("take_profit_price") or 0.0)
-            sl = float(meta.get("stoploss_price") or 0.0)
+            tp = normalize_vn_price_to_vnd(meta.get("take_profit_price") or 0.0)
+            sl = normalize_vn_price_to_vnd(meta.get("stoploss_price") or 0.0)
         except (TypeError, ValueError):
             continue
         if tp > 0 and sl > 0:
@@ -464,12 +468,50 @@ def _get_demo_position_exit_levels_overrides(session_id: str) -> dict[str, tuple
     for row in rows:
         symbol = str(row.get("symbol") or "").strip().upper()
         try:
-            tp = float(row.get("take_profit_price") or 0.0)
-            sl = float(row.get("stoploss_price") or 0.0)
+            tp = normalize_vn_price_to_vnd(row.get("take_profit_price") or 0.0)
+            sl = normalize_vn_price_to_vnd(row.get("stoploss_price") or 0.0)
         except (TypeError, ValueError):
             continue
         if symbol and tp > 0 and sl > 0:
             out[symbol] = (tp, sl)
+    return out
+
+
+def _get_demo_position_strategy_codes(session_id: str) -> dict[str, str]:
+    sid = normalize_demo_session_id(session_id)
+    out: dict[str, str] = {}
+    with connect(settings.database_url, row_factory=dict_row) as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT
+                    pl.symbol,
+                    MIN(
+                        CASE
+                            WHEN COALESCE(o.order_metadata->>'strategy_code', '') IN ('SHORT_TERM', 'MAIL_SIGNAL')
+                                THEN COALESCE(o.order_metadata->>'strategy_code', '')
+                            WHEN COALESCE(o.order_metadata->>'source', '') LIKE 'mail_signal_%%'
+                                THEN 'MAIL_SIGNAL'
+                            ELSE 'SHORT_TERM'
+                        END
+                    ) AS strategy_code
+                FROM position_lots pl
+                JOIN orders_core o ON o.id = pl.buy_order_id
+                WHERE pl.account_mode = 'DEMO'
+                  AND pl.qty > 0
+                  AND o.account_mode = 'DEMO'
+                  AND o.status = 'FILLED'
+                  AND COALESCE(o.order_metadata->>'demo_session_id', '') = %(session_id)s
+                GROUP BY pl.symbol
+                """,
+                {"session_id": sid},
+            )
+            rows = cur.fetchall() or []
+    for row in rows:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        strategy_code = str(row.get("strategy_code") or "SHORT_TERM").strip().upper()
+        if symbol and strategy_code in {"SHORT_TERM", "MAIL_SIGNAL"}:
+            out[symbol] = strategy_code
     return out
 
 
@@ -617,7 +659,9 @@ def get_demo_strategy_remaining_cash(session_id: str, strategy_code: str) -> flo
             )
             alloc_row = cur.fetchone() or {}
         conn.commit()
-    return max(0.0, float(alloc_row.get("cash_value") or 0.0))
+    cash_value = max(0.0, float(alloc_row.get("cash_value") or 0.0))
+    used = _strategy_used_notional_for_session(sid)
+    return _effective_strategy_remaining_cash(cash_value, float(used.get(strategy) or 0.0))
 
 
 def _clamp_demo_tp_slot_pct(value: float) -> float:
@@ -674,8 +718,8 @@ def upsert_demo_session_tp_slot_pct(session_id: str, tp_slot_pct: float) -> floa
 def upsert_demo_symbol_exit_levels(session_id: str, symbol: str, take_profit_price: float, stoploss_price: float) -> None:
     sid = normalize_demo_session_id(session_id)
     sym = str(symbol or "").strip().upper()
-    tp = float(take_profit_price)
-    sl = float(stoploss_price)
+    tp = normalize_vn_price_to_vnd(take_profit_price)
+    sl = normalize_vn_price_to_vnd(stoploss_price)
     if not sym:
         raise ValueError("INVALID_SYMBOL")
     if tp <= 0 or sl <= 0:
@@ -1380,6 +1424,12 @@ def execute_demo_trade(session_id: str, body: DemoTradeRequest) -> DemoTradeExec
                     "prediction_outcome": "correct" if realized_on_trade >= 0 else "wrong",
                 },
             }
+            if str((body.market_context or {}).get("trigger") or "").strip().lower() == "stoploss_hit":
+                try:
+                    ensure_experience_table()
+                    create_experience_from_trade(experience_candidate)
+                except Exception:
+                    pass
 
         return DemoTradeExecutionResult(
             trade_id=trade_id,
@@ -1543,6 +1593,7 @@ def get_demo_session_overview(session_id: str) -> dict[str, Any]:
     core_positions_rows = _get_demo_positions_from_core(session_id)
     exit_levels_by_symbol = _get_demo_position_exit_levels_from_core(session_id)
     override_exit_levels_by_symbol = _get_demo_position_exit_levels_overrides(session_id)
+    strategy_by_symbol = _get_demo_position_strategy_codes(session_id)
     settlement_by_symbol = _get_demo_symbol_settlement_snapshot(session_id)
     tp_slot_pct = get_demo_session_tp_slot_pct(session_id)
     holdings: list[dict[str, Any]] = []
@@ -1550,7 +1601,7 @@ def get_demo_session_overview(session_id: str) -> dict[str, Any]:
     for row in core_positions_rows:
         symbol = str(row["symbol"])
         quantity = int(row["total_qty"])
-        average_buy_price = float(row["avg_price"])
+        average_buy_price = normalize_vn_price_to_vnd(row["avg_price"])
         fallback_tp = average_buy_price * 1.04 if average_buy_price > 0 else 0.0
         fallback_sl = average_buy_price * 0.97 if average_buy_price > 0 else 0.0
         tp, sl = override_exit_levels_by_symbol.get(
@@ -1588,6 +1639,7 @@ def get_demo_session_overview(session_id: str) -> dict[str, Any]:
                 ),
                 "is_t2_sell_allowed": bool(settled_quantity > 0),
                 "opened_at": opened_at_by_symbol.get(symbol.strip().upper(), fallback_opened_at),
+                "strategy_code": strategy_by_symbol.get(symbol.strip().upper(), "SHORT_TERM"),
             }
         )
     holdings_count = len(holdings)
@@ -1611,6 +1663,10 @@ def get_demo_session_overview(session_id: str) -> dict[str, Any]:
     short_term_cash = max(0.0, float(alloc_rows.get("SHORT_TERM") or 0.0))
     mail_signal_cash = max(0.0, float(alloc_rows.get("MAIL_SIGNAL") or 0.0))
     unallocated_cash = max(0.0, float(alloc_rows.get("UNALLOCATED") or 0.0))
+    short_term_used = max(0.0, float(strategy_used_notional.get("SHORT_TERM") or 0.0))
+    mail_signal_used = max(0.0, float(strategy_used_notional.get("MAIL_SIGNAL") or 0.0))
+    short_term_remaining = _effective_strategy_remaining_cash(short_term_cash, short_term_used)
+    mail_signal_remaining = _effective_strategy_remaining_cash(mail_signal_cash, mail_signal_used)
     alloc_total = short_term_cash + mail_signal_cash + unallocated_cash
     alloc_short_term_pct = (short_term_cash / alloc_total) if alloc_total > 0 else 0.0
     alloc_mail_signal_pct = (mail_signal_cash / alloc_total) if alloc_total > 0 else 0.0
@@ -1620,15 +1676,15 @@ def get_demo_session_overview(session_id: str) -> dict[str, Any]:
             "strategy_code": "SHORT_TERM",
             "allocation_pct": alloc_short_term_pct,
             "cash_value": round(short_term_cash, 6),
-            "used_cash_value": round(float(strategy_used_notional.get("SHORT_TERM") or 0.0), 6),
-            "remaining_cash_value": round(short_term_cash, 6),
+            "used_cash_value": round(short_term_used, 6),
+            "remaining_cash_value": round(short_term_remaining, 6),
         },
         {
             "strategy_code": "MAIL_SIGNAL",
             "allocation_pct": alloc_mail_signal_pct,
             "cash_value": round(mail_signal_cash, 6),
-            "used_cash_value": round(float(strategy_used_notional.get("MAIL_SIGNAL") or 0.0), 6),
-            "remaining_cash_value": round(mail_signal_cash, 6),
+            "used_cash_value": round(mail_signal_used, 6),
+            "remaining_cash_value": round(mail_signal_remaining, 6),
         },
     ]
     if unallocated_cash > 0:
@@ -1732,6 +1788,9 @@ def run_demo_auto_exit_cycle(session_id: str) -> dict[str, Any]:
         quantity_total = int(row.get("quantity") or 0)
         tp = float(row.get("take_profit_price") or 0.0)
         sl = float(row.get("stoploss_price") or 0.0)
+        strategy_code = str(row.get("strategy_code") or "SHORT_TERM").strip().upper()
+        if strategy_code not in {"SHORT_TERM", "MAIL_SIGNAL"}:
+            strategy_code = "SHORT_TERM"
         if not symbol or sellable_qty < 100:
             continue
         mark = _last_daily_close_mark(symbol)
@@ -1752,7 +1811,7 @@ def run_demo_auto_exit_cycle(session_id: str) -> dict[str, Any]:
                     symbol=symbol,
                     quantity=sell_qty,
                     price=last,
-                    strategy_type="SHORT_TERM",
+                    strategy_type=strategy_code,
                     market_context={
                         "source": "demo_auto_sell_threshold",
                         "trigger": trigger,

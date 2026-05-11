@@ -7,6 +7,7 @@ import math
 import re
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from statistics import mean
 from typing import Any, Literal
@@ -17,7 +18,7 @@ from psycopg import connect
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
-from app.core.config import settings
+from app.core.config import get_vn_market_holiday_dates, settings
 from app.services.claude_service import ClaudeService
 from app.services.redis_cache import RedisCacheService
 from app.services.signal_scoring_pipeline import (
@@ -33,6 +34,7 @@ from app.services.signal_scoring_pipeline import (
     score_technical_strategy_module,
 )
 from app.services.vnstock_api_service import VNStockApiService
+from app.services.vn_market_holiday_calendar import is_vn_market_trading_day
 
 vnstock_api_service = VNStockApiService()
 _claude_service = ClaudeService()
@@ -52,6 +54,8 @@ _EXCHANGE_ALIASES: dict[str, str] = {
     "UP": "UPCOM",
     "XUPC": "UPCOM",
 }
+_MAX_REJECTED_SCAN_CANDIDATES = 40
+_FRESH_DATA_MAX_CALENDAR_DAYS = 5
 
 
 def ensure_market_symbol_tables() -> None:
@@ -749,7 +753,9 @@ def _get_scan_symbol_exchange_pairs_from_liquidity_cache(
     fallback_by_exchange: dict[str, list[str]] = {ex: [] for ex in exchanges}
     preferred_seen: dict[str, set[str]] = {ex: set() for ex in exchanges}
     fallback_seen: dict[str, set[str]] = {ex: set() for ex in exchanges}
+    payload_by_key = _redis_cache.get_many_json([str(key) for key in keys])
 
+    saw_relevant_key = False
     for key in keys:
         parts = str(key).split(":", 3)
         if len(parts) != 4:
@@ -761,7 +767,10 @@ def _get_scan_symbol_exchange_pairs_from_liquidity_cache(
         sym = str(symbol).strip().upper()
         if ex not in preferred_by_exchange or not sym:
             continue
-        payload = _redis_cache.get_json(str(key))
+        saw_relevant_key = True
+        payload = payload_by_key.get(str(key))
+        if payload is None:
+            payload = _redis_cache.get_json(str(key))
         if not isinstance(payload, dict):
             continue
         if not bool(payload.get("eligible_liquidity", False)):
@@ -772,6 +781,8 @@ def _get_scan_symbol_exchange_pairs_from_liquidity_cache(
                 continue
             preferred_seen[ex].add(sym)
             preferred_by_exchange[ex].append(sym)
+            continue
+        if "eligible_spike" not in payload:
             continue
         # Fallback universe: keep liquid symbols even when warm cache has no spike yet.
         # Scanner will re-evaluate fresh spike ratios during run.
@@ -787,6 +798,12 @@ def _get_scan_symbol_exchange_pairs_from_liquidity_cache(
             extra={"exchange_scope": _normalize_exchange_scope(exchange_scope)},
         )
         by_exchange = fallback_by_exchange
+    if all(len(by_exchange[ex]) == 0 for ex in exchanges) and not saw_relevant_key:
+        logger.warning(
+            "short_term_scan_universe_cache_empty_fallback_listing",
+            extra={"exchange_scope": _normalize_exchange_scope(exchange_scope)},
+        )
+        return _get_scan_symbol_exchange_pairs_round_robin(limit_total, exchange_scope)
 
     idx: dict[str, int] = {ex: 0 for ex in exchanges}
     used: set[str] = set()
@@ -921,6 +938,323 @@ def _get_close_and_volume(symbol: str, bars: int = 120, exchange: str = "") -> t
     return closes, volumes
 
 
+def _latest_cached_trading_date(symbol: str, exchange: str = "") -> date | None:
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return None
+    ex = str(exchange or "").strip().upper()
+    exchange_filter = "AND exchange = %(exchange)s" if ex else ""
+    params: dict[str, Any] = {"symbol": sym}
+    if ex:
+        params["exchange"] = ex
+    try:
+        _ensure_market_symbol_tables_once()
+        with connect(settings.database_url, row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT MAX(trading_date) AS latest_date
+                    FROM market_symbol_daily_volume
+                    WHERE symbol = %(symbol)s
+                      {exchange_filter}
+                    """,
+                    params,
+                )
+                row = cur.fetchone() or {}
+    except Exception:
+        return None
+    latest = row.get("latest_date")
+    if isinstance(latest, datetime):
+        return latest.date()
+    if isinstance(latest, date):
+        return latest
+    return None
+
+
+def _latest_completed_vn_trading_date(now_local: datetime | None = None) -> date:
+    effective_now = now_local or datetime.now(tz=ZoneInfo(settings.short_term_scan_timezone))
+    today = effective_now.date()
+    holidays = get_vn_market_holiday_dates()
+    target = today
+    while not is_vn_market_trading_day(target, holidays):
+        target -= timedelta(days=1)
+    if is_vn_market_trading_day(today, holidays):
+        session_minutes = effective_now.hour * 60 + effective_now.minute
+        if session_minutes < (14 * 60 + 45):
+            target = today - timedelta(days=1)
+            while not is_vn_market_trading_day(target, holidays):
+                target -= timedelta(days=1)
+    return target
+
+
+def _freshness_metadata(symbol: str, exchange: str, price_source: str) -> dict[str, Any]:
+    latest = _latest_cached_trading_date(symbol, exchange)
+    now_local = datetime.now(tz=ZoneInfo(settings.short_term_scan_timezone))
+    today = now_local.date()
+    holidays = get_vn_market_holiday_dates()
+    expected = _latest_completed_vn_trading_date(now_local)
+    if latest is None:
+        return {
+            "price_source": price_source,
+            "latest_trading_date": None,
+            "age_calendar_days": None,
+            "expected_trading_date": expected.isoformat(),
+            "age_trading_days": None,
+            "is_fresh": False,
+            "reason": "missing_latest_trading_date",
+        }
+    age_days = max(0, (today - latest).days)
+    age_trading_days = 0
+    cursor = latest
+    while cursor < expected:
+        cursor += timedelta(days=1)
+        if is_vn_market_trading_day(cursor, holidays):
+            age_trading_days += 1
+    intraday_stale_possible = bool(latest < today and is_vn_market_trading_day(today, holidays) and now_local.hour >= 9)
+    is_fresh = bool(latest >= expected)
+    return {
+        "price_source": price_source,
+        "latest_trading_date": latest.isoformat(),
+        "age_calendar_days": age_days,
+        "expected_trading_date": expected.isoformat(),
+        "age_trading_days": age_trading_days,
+        "intraday_stale_possible": intraday_stale_possible,
+        "is_fresh": is_fresh,
+        "max_calendar_days": _FRESH_DATA_MAX_CALENDAR_DAYS,
+        "reason": "ok" if is_fresh else "behind_expected_trading_date",
+    }
+
+
+def _pct_return(values: list[float], lookback: int) -> float | None:
+    if len(values) <= lookback:
+        return None
+    start = float(values[-lookback - 1])
+    end = float(values[-1])
+    if start <= 0 or end <= 0:
+        return None
+    return (end / start - 1.0) * 100.0
+
+
+def _symbol_listing_context(symbol: str) -> dict[str, Any]:
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return {"industry": "", "exchange": "", "info": {}}
+    try:
+        _ensure_market_symbol_tables_once()
+        with connect(settings.database_url, row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT exchange, info FROM market_symbols WHERE symbol = %(symbol)s",
+                    {"symbol": sym},
+                )
+                row = cur.fetchone() or {}
+    except Exception:
+        return {"industry": "", "exchange": "", "info": {}}
+    info = row.get("info") if isinstance(row.get("info"), dict) else {}
+    industry = ""
+    if isinstance(info, dict):
+        for key in ("industry", "industry_name", "industryName", "icb_name", "icbName", "sector"):
+            value = info.get(key)
+            if isinstance(value, str) and value.strip():
+                industry = value.strip()
+                break
+    return {"industry": industry, "exchange": str(row.get("exchange") or "").strip().upper(), "info": info}
+
+
+def _relative_strength_metadata(closes: list[float], benchmark_closes: list[float] | None) -> dict[str, Any]:
+    bench = [float(v) for v in (benchmark_closes or []) if float(v) > 0]
+    out: dict[str, Any] = {}
+    for lookback in (20, 60):
+        sym_ret = _pct_return(closes, lookback)
+        bench_ret = _pct_return(bench, lookback)
+        out[f"symbol_return_{lookback}d_pct"] = round(sym_ret, 4) if sym_ret is not None else None
+        out[f"benchmark_return_{lookback}d_pct"] = round(bench_ret, 4) if bench_ret is not None else None
+        out[f"relative_strength_{lookback}d_pct"] = (
+            round(sym_ret - bench_ret, 4) if sym_ret is not None and bench_ret is not None else None
+        )
+    rs20 = out.get("relative_strength_20d_pct")
+    rs60 = out.get("relative_strength_60d_pct")
+    out["is_leading_benchmark"] = bool(
+        isinstance(rs20, (int, float)) and rs20 > 0 and (not isinstance(rs60, (int, float)) or rs60 >= -2.0)
+    )
+    return out
+
+
+def _sector_breadth_metadata(
+    *,
+    symbol: str,
+    industry: str,
+    benchmark_closes: list[float] | None,
+    max_peers: int = 40,
+) -> dict[str, Any]:
+    industry_norm = str(industry or "").strip()
+    if not industry_norm:
+        return {"industry": "", "samples": 0, "confirmed": False, "reason": "missing_industry"}
+    try:
+        _ensure_market_symbol_tables_once()
+        with connect(settings.database_url, row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT symbol
+                    FROM market_symbols
+                    WHERE symbol <> %(symbol)s
+                      AND (
+                        info->>'industry' = %(industry)s
+                        OR info->>'industry_name' = %(industry)s
+                        OR info->>'industryName' = %(industry)s
+                        OR info->>'icb_name' = %(industry)s
+                        OR info->>'icbName' = %(industry)s
+                        OR info->>'sector' = %(industry)s
+                      )
+                    ORDER BY symbol
+                    LIMIT %(limit)s
+                    """,
+                    {"symbol": str(symbol).upper(), "industry": industry_norm, "limit": max(1, int(max_peers))},
+                )
+                rows = cur.fetchall()
+    except Exception:
+        return {"industry": industry_norm, "samples": 0, "confirmed": False, "reason": "query_failed"}
+    bench = [float(v) for v in (benchmark_closes or []) if float(v) > 0]
+    bench_ret20 = _pct_return(bench, 20)
+    samples = 0
+    above_ma20 = 0
+    leading = 0
+    for row in rows:
+        peer = str(row.get("symbol") or "").strip().upper()
+        if not peer:
+            continue
+        peer_closes, _peer_volumes = _get_close_and_volume_from_db(peer, bars=25)
+        if len(peer_closes) < 20:
+            continue
+        samples += 1
+        ma20 = mean(peer_closes[-20:])
+        if ma20 > 0 and peer_closes[-1] > ma20:
+            above_ma20 += 1
+        peer_ret20 = _pct_return(peer_closes, 20)
+        if peer_ret20 is not None and bench_ret20 is not None and peer_ret20 > bench_ret20:
+            leading += 1
+    above_ratio = above_ma20 / samples if samples else 0.0
+    leading_ratio = leading / samples if samples else 0.0
+    return {
+        "industry": industry_norm,
+        "samples": samples,
+        "above_ma20_ratio": round(above_ratio, 4),
+        "relative_strength_leader_ratio": round(leading_ratio, 4),
+        "confirmed": bool(samples >= 3 and (above_ratio >= 0.5 or leading_ratio >= 0.45)),
+    }
+
+
+def _classify_short_term_setup(
+    *,
+    gate_meta: dict[str, Any],
+    news: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    distance = float(gate_meta.get("distance_from_ema20_pct") or 0.0)
+    spike = float(gate_meta.get("spike_ratio") or 0.0)
+    breakout = bool(gate_meta.get("breakout_ok"))
+    setup_candidate = str(gate_meta.get("setup_candidate") or "").strip().upper()
+    momentum = float(gate_meta.get("momentum_5d_pct") or 0.0)
+    news_score = float((news or {}).get("score_0_100") or 0.0)
+    news_spike_risk = bool(news_score >= 65.0 and spike >= 1.8)
+    if news_spike_risk:
+        setup = "NEWS_SPIKE"
+    elif distance > 8.0:
+        setup = "EXTENDED_CHASE"
+    elif setup_candidate in {"BREAKOUT", "PULLBACK_TO_MA20", "ACCUMULATION"}:
+        setup = setup_candidate
+    elif breakout and spike >= 2.0:
+        setup = "BREAKOUT"
+    elif 0.0 <= distance <= 3.0 and momentum >= 0.5:
+        setup = "PULLBACK_TO_MA20"
+    elif spike >= 1.5 and momentum >= 0.0:
+        setup = "ACCUMULATION"
+    else:
+        setup = "UNCLASSIFIED"
+    return {
+        "setup_type": setup,
+        "news_spike_risk": news_spike_risk,
+        "is_chase_risk": setup == "EXTENDED_CHASE" or (setup == "NEWS_SPIKE" and distance > 5.0),
+        "distance_from_ema20_pct": round(distance, 4),
+        "spike_ratio": round(spike, 4),
+        "momentum_5d_pct": round(momentum, 4),
+        "news_score_0_100": round(news_score, 4),
+    }
+
+
+def _derive_short_term_trade_levels(
+    *,
+    closes: list[float],
+    last_close: float,
+    setup_type: str,
+) -> dict[str, Any]:
+    recent = [float(v) for v in closes[-20:] if float(v) > 0]
+    if len(recent) < 6 or last_close <= 0:
+        entry = float(last_close)
+        stop = entry * 0.97
+        target = entry * 1.06
+        return {"entry": entry, "take_profit": target, "stop_loss": stop, "method": "fallback_pct"}
+    support = min(recent[:-1]) if len(recent) > 1 else last_close * 0.97
+    resistance = max(recent[:-1]) if len(recent) > 1 else last_close * 1.04
+    resistance_60d = max([float(v) for v in closes[-60:-1] if float(v) > 0] or [resistance])
+    ema20 = mean(recent)
+    abs_moves = [abs(recent[i] - recent[i - 1]) for i in range(1, len(recent))]
+    atr_proxy = mean(abs_moves[-14:]) if abs_moves else last_close * 0.02
+    min_stop = last_close * 0.965
+    setup = str(setup_type).upper()
+    if setup == "BREAKOUT":
+        breakout_level = resistance
+        structural_stop = min(breakout_level * 0.985, last_close - atr_proxy * 1.2)
+    elif setup == "PULLBACK_TO_MA20":
+        structural_stop = min(ema20 * 0.985, support * 0.99, last_close - atr_proxy)
+    elif setup == "ACCUMULATION":
+        structural_stop = min(support * 0.985, last_close - atr_proxy * 1.1)
+    else:
+        structural_stop = min(last_close - atr_proxy * 1.2, support * 0.985)
+    stop_loss = max(structural_stop, last_close * 0.90)
+    stop_loss = min(stop_loss, min_stop)
+    risk = max(0.01, last_close - stop_loss)
+    resistance_target = max(resistance, resistance_60d) + atr_proxy * 1.2
+    rr_target = last_close + risk * 1.8
+    if setup == "NEWS_SPIKE":
+        rr_target = last_close + risk * 2.0
+    elif setup == "PULLBACK_TO_MA20":
+        rr_target = last_close + risk * 1.7
+    take_profit = max(resistance_target, rr_target, last_close * 1.045)
+    return {
+        "entry": round(last_close, 4),
+        "take_profit": round(take_profit, 4),
+        "stop_loss": round(stop_loss, 4),
+        "method": "support_resistance_atr_proxy",
+        "support_20d": round(support, 4),
+        "resistance_20d": round(resistance, 4),
+        "resistance_60d": round(resistance_60d, 4),
+        "ema20_proxy": round(ema20, 4),
+        "atr_proxy": round(atr_proxy, 4),
+        "target_rr": round((take_profit - last_close) / risk, 4) if risk > 0 else None,
+    }
+
+
+def _append_rejected_candidate(
+    rejected: list[dict[str, Any]],
+    *,
+    symbol: str,
+    exchange: str,
+    reason: str,
+    detail: dict[str, Any] | None = None,
+) -> None:
+    if len(rejected) >= _MAX_REJECTED_SCAN_CANDIDATES:
+        return
+    rejected.append(
+        {
+            "symbol": str(symbol).strip().upper(),
+            "exchange": str(exchange).strip().upper(),
+            "reason": str(reason or "unknown"),
+            "detail": detail or {},
+        }
+    )
+
+
 def _is_short_term_liquid_enough(baseline_vol: float, latest_vol: float) -> bool:
     return bool(
         baseline_vol >= float(settings.short_term_scan_min_avg_daily_volume)
@@ -947,9 +1281,8 @@ def _short_term_entry_gate(
     macd_min_line: float = 0.0,
 ) -> tuple[bool, dict[str, Any]]:
     """
-    Production-safe BUY gate to reduce false positives:
-    - trend + liquidity/spike already filtered upstream
-    - add breakout confirmation, momentum confirmation, and avoid overly stretched entries.
+    Production-safe BUY gate to reduce false positives while allowing distinct
+    VN short-term setups instead of forcing every candidate through breakout.
     """
     if len(closes) < 55 or len(volumes) < 55 or ema20_proxy <= 0 or last_close <= 0:
         return False, {"reason": "insufficient_bars_or_invalid_price_for_full_technical_confirm"}
@@ -959,9 +1292,13 @@ def _short_term_entry_gate(
     prev_window = closes[-(breakout_lookback + 1) : -1]
     prev_high = max(prev_window) if prev_window else last_close
     breakout_ok = bool(last_close >= prev_high * 0.995)
+    range_high = max(prev_window) if prev_window else last_close
+    range_low = min(prev_window) if prev_window else last_close
+    range_width_pct = ((range_high / range_low) - 1.0) * 100.0 if range_low > 0 else 99.0
 
     ema50_proxy = mean(closes[-50:])
     ema_alignment_ok = bool(last_close > ema20_proxy > ema50_proxy)
+    above_ema20_ok = bool(last_close >= ema20_proxy * 0.995)
 
     momentum_5d = 0.0
     if len(closes) >= 6 and closes[-6] > 0:
@@ -1004,8 +1341,13 @@ def _short_term_entry_gate(
 
     distance_pct = ((last_close / ema20_proxy) - 1.0) * 100.0 if ema20_proxy > 0 else 0.0
     not_overstretched = bool(distance_pct <= float(max_distance_from_ema20_pct))
+    prior_volumes = [float(v) for v in volumes[-11:-1] if float(v) >= 0]
+    prior_volume_avg = mean(prior_volumes) if prior_volumes else 0.0
+    pre_breakout_volume_contracting = bool(prior_volume_avg > 0 and prior_volume_avg <= mean(volumes[-30:-10]) * 1.1) if len(volumes) >= 30 else False
+    pullback_zone_ok = bool(-1.5 <= distance_pct <= 3.5 and above_ema20_ok)
+    accumulation_zone_ok = bool(range_width_pct <= 12.0 and last_close >= range_low * 1.03 and last_close <= range_high * 1.02)
 
-    pass_gate = bool(
+    breakout_gate = bool(
         spike >= min_spike
         and ema_alignment_ok
         and breakout_ok
@@ -1014,14 +1356,48 @@ def _short_term_entry_gate(
         and macd_ok
         and not_overstretched
     )
+    pullback_gate = bool(
+        spike >= max(1.1, min_spike * 0.75)
+        and above_ema20_ok
+        and pullback_zone_ok
+        and momentum_5d >= max(0.0, float(min_momentum_5d_pct) * 0.4)
+        and rsi14 <= min(float(rsi_max), 72.0)
+        and macd_line >= macd_signal * 0.98
+        and not_overstretched
+    )
+    accumulation_gate = bool(
+        spike >= max(1.15, min_spike * 0.8)
+        and ema20_proxy >= ema50_proxy * 0.98
+        and accumulation_zone_ok
+        and rsi14 <= min(float(rsi_max), 70.0)
+        and macd_line >= macd_signal * 0.95
+        and range_width_pct <= 12.0
+    )
+    setup_candidate = "UNCLASSIFIED"
+    if breakout_gate:
+        setup_candidate = "BREAKOUT"
+    elif pullback_gate:
+        setup_candidate = "PULLBACK_TO_MA20"
+    elif accumulation_gate:
+        setup_candidate = "ACCUMULATION"
+    pass_gate = bool(breakout_gate or pullback_gate or accumulation_gate)
     return pass_gate, {
+        "setup_candidate": setup_candidate,
         "min_spike_ratio": round(min_spike, 4),
         "spike_ratio": round(float(spike), 4),
         "ema20_proxy": round(float(ema20_proxy), 4),
         "ema50_proxy": round(float(ema50_proxy), 4),
         "ema_alignment_ok": ema_alignment_ok,
+        "above_ema20_ok": above_ema20_ok,
         "prev_20d_high": round(float(prev_high), 4),
         "breakout_ok": breakout_ok,
+        "breakout_gate": breakout_gate,
+        "pullback_gate": pullback_gate,
+        "accumulation_gate": accumulation_gate,
+        "range_width_pct": round(float(range_width_pct), 4),
+        "pullback_zone_ok": pullback_zone_ok,
+        "accumulation_zone_ok": accumulation_zone_ok,
+        "pre_breakout_volume_contracting": pre_breakout_volume_contracting,
         "momentum_5d_pct": round(float(momentum_5d), 4),
         "min_momentum_5d_pct": round(float(min_momentum_5d_pct), 4),
         "momentum_ok": momentum_ok,
@@ -1418,6 +1794,7 @@ def extract_short_term_scan_diagnostics(scan_result: dict[str, Any]) -> dict[str
         "skipped_entry_gate",
         "skipped_experience_cooldown",
         "skipped_dynamic_buy_floor",
+        "skipped_stale_data",
         "price_history_cache_hits",
         "price_history_vnstock_calls",
         "price_history_missing",
@@ -1431,6 +1808,8 @@ def extract_short_term_scan_diagnostics(scan_result: dict[str, Any]) -> dict[str
         pass
     raw_signals = scan_result.get("signals") or []
     out["buy_signals_written"] = len(raw_signals) if isinstance(raw_signals, list) else 0
+    rejected = scan_result.get("rejected_candidates")
+    out["rejected_candidates"] = rejected if isinstance(rejected, list) else []
     return out
 
 
@@ -1447,13 +1826,16 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
     skipped_entry_gate = 0
     skipped_experience_cooldown = 0
     skipped_dynamic_buy_floor = 0
+    skipped_stale_data = 0
     experience_threshold_source_claude = 0
     experience_threshold_source_heuristic = 0
     price_history_cache_hits = 0
     price_history_vnstock_calls = 0
     price_history_missing = 0
+    rejected_candidates: list[dict[str, Any]] = []
     scan_started_at = time.perf_counter()
     step_stats: dict[str, dict[str, float | int]] = {}
+    sector_breadth_cache: dict[str, dict[str, Any]] = {}
 
     def _track_step(name: str, started: float) -> None:
         elapsed = time.perf_counter() - started
@@ -1508,6 +1890,24 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
         _track_step("_get_close_and_volume", cv_t0)
         if len(closes) < 25 or len(volumes) < 25:
             skipped_insufficient_data += 1
+            _append_rejected_candidate(
+                rejected_candidates,
+                symbol=symbol,
+                exchange=symbol_exchange,
+                reason="insufficient_data",
+                detail={"close_bars": len(closes), "volume_bars": len(volumes)},
+            )
+            continue
+        freshness = _freshness_metadata(symbol, symbol_exchange, price_source)
+        if not bool(freshness.get("is_fresh")):
+            skipped_stale_data += 1
+            _append_rejected_candidate(
+                rejected_candidates,
+                symbol=symbol,
+                exchange=symbol_exchange,
+                reason="stale_data",
+                detail=freshness,
+            )
             continue
         last_close = closes[-1]
         ema20_proxy = mean(closes[-20:])
@@ -1530,9 +1930,23 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
         _track_step("_write_liquidity_gate_cache", write_cache_t0)
         if not eligible_liquidity:
             skipped_low_liquidity += 1
+            _append_rejected_candidate(
+                rejected_candidates,
+                symbol=symbol,
+                exchange=symbol_exchange,
+                reason="low_liquidity",
+                detail={"baseline_vol": round(baseline_vol, 4), "latest_vol": round(latest_vol, 4)},
+            )
             continue
         if not eligible_spike:
             skipped_no_volume_spike += 1
+            _append_rejected_candidate(
+                rejected_candidates,
+                symbol=symbol,
+                exchange=symbol_exchange,
+                reason="no_volume_spike",
+                detail={"spike_ratio": round(spike, 4)},
+            )
             continue
 
         exp_adj = 0.0
@@ -1583,6 +1997,13 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
             distance_from_ema20_pct=float(gate_meta.get("distance_from_ema20_pct") or 0.0),
         )
         if not gate_pass:
+            _append_rejected_candidate(
+                rejected_candidates,
+                symbol=symbol,
+                exchange=symbol_exchange,
+                reason="entry_gate_failed",
+                detail=gate_meta,
+            )
             continue
         news_fetch_t0 = time.perf_counter()
         news_items = get_symbol_news_for_scoring(symbol, symbol_exchange, limit=30)
@@ -1590,6 +2011,61 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
         news_score_t0 = time.perf_counter()
         news = score_news_for_symbol(symbol, news_items)
         _track_step("score_news_for_symbol", news_score_t0)
+        listing_context = _symbol_listing_context(symbol)
+        relative_strength = _relative_strength_metadata(closes, bench_closes)
+        industry_key = str(listing_context.get("industry") or "").strip()
+        if industry_key in sector_breadth_cache:
+            sector_breadth = sector_breadth_cache[industry_key]
+        else:
+            breadth_t0 = time.perf_counter()
+            sector_breadth = _sector_breadth_metadata(
+                symbol=symbol,
+                industry=industry_key,
+                benchmark_closes=bench_closes or None,
+            )
+            sector_breadth_cache[industry_key] = sector_breadth
+            _track_step("_sector_breadth_metadata_cached_by_industry", breadth_t0)
+        setup = _classify_short_term_setup(gate_meta=gate_meta, news=news)
+        levels_preview = _derive_short_term_trade_levels(
+            closes=closes,
+            last_close=last_close,
+            setup_type=str(setup.get("setup_type") or ""),
+        )
+        rr_preview = float(levels_preview.get("target_rr") or 0.0)
+        daily_return_pct = ((last_close / closes[-2]) - 1.0) * 100.0 if len(closes) >= 2 and closes[-2] > 0 else 0.0
+        if str(setup.get("setup_type") or "").upper() == "NEWS_SPIKE":
+            setup["news_spike_risk"] = True
+            setup["news_spike_buyable_exception"] = bool(
+                rr_preview >= 2.0
+                and eligible_liquidity
+                and daily_return_pct < 6.5
+                and float(gate_meta.get("distance_from_ema20_pct") or 0.0) <= 5.0
+            )
+            setup["daily_return_pct"] = round(daily_return_pct, 4)
+            if not bool(setup["news_spike_buyable_exception"]):
+                action = "HOLD"
+                reason = "NEWS_SPIKE default watch; rejected unless R/R >= 2, liquid, not near ceiling, and entry is not extended."
+                skipped_entry_gate += 1
+                _append_rejected_candidate(
+                    rejected_candidates,
+                    symbol=symbol,
+                    exchange=symbol_exchange,
+                    reason="news_spike_risk",
+                    detail={**setup, "trade_levels": levels_preview},
+                )
+                continue
+        if bool(setup.get("is_chase_risk")):
+            action = "HOLD"
+            reason = f"{setup.get('setup_type')} chase risk; downgraded to HOLD."
+            skipped_entry_gate += 1
+            _append_rejected_candidate(
+                rejected_candidates,
+                symbol=symbol,
+                exchange=symbol_exchange,
+                reason="chase_risk",
+                detail=setup,
+            )
+            continue
         macro_t0 = time.perf_counter()
         macro = score_macro_fundamental_proxy(
             symbol,
@@ -1610,6 +2086,14 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
             legacy_flat={"volume_spike_ratio": round(spike, 4)},
         )
         metadata["entry_gate"] = gate_meta
+        metadata["freshness"] = freshness
+        metadata["setup"] = setup
+        metadata["relative_strength"] = relative_strength
+        metadata["sector_breadth"] = sector_breadth
+        metadata["listing_context"] = {
+            "exchange": listing_context.get("exchange") or symbol_exchange,
+            "industry": listing_context.get("industry") or "",
+        }
         metadata["experience_entry_tightening"] = gate_thresholds
         metadata["market_regime_technical_thresholds"] = technical_thresholds
         cooldown_active, cooldown_meta = _experience_buy_cooldown(symbol=symbol, action=action)
@@ -1618,6 +2102,13 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
             action = "HOLD"
             reason = "Recent stoploss cooldown active for symbol; downgraded to HOLD."
             skipped_experience_cooldown += 1
+            _append_rejected_candidate(
+                rejected_candidates,
+                symbol=symbol,
+                exchange=symbol_exchange,
+                reason="experience_cooldown",
+                detail=cooldown_meta,
+            )
         _track_step("build_signal_quality_metadata", meta_t0)
         composite = float(metadata["signal_quality"]["composite_score_0_100"])
         if action == "BUY" and composite < dynamic_buy_floor:
@@ -1627,6 +2118,13 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
                 "downgraded to HOLD."
             )
             skipped_dynamic_buy_floor += 1
+            _append_rejected_candidate(
+                rejected_candidates,
+                symbol=symbol,
+                exchange=symbol_exchange,
+                reason="dynamic_buy_floor",
+                detail={"composite": round(composite, 4), "floor": round(dynamic_buy_floor, 4)},
+            )
         confidence = confidence_from_composite_and_action(
             action=action,
             base_confidence_from_rules=confidence,
@@ -1651,13 +2149,15 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
 
         insert_t0 = time.perf_counter()
         if action in {"BUY", "SELL"}:
+            levels = levels_preview
+            metadata["trade_levels"] = levels
             signal = _insert_signal(
                 "SHORT_TERM",
                 symbol,
                 action,
-                last_close if action == "BUY" else None,
-                (last_close * 1.04) if action == "BUY" else None,
-                (last_close * 0.97) if action == "BUY" else None,
+                float(levels["entry"]) if action == "BUY" else None,
+                float(levels["take_profit"]) if action == "BUY" else None,
+                float(levels["stop_loss"]) if action == "BUY" else None,
                 confidence,
                 reason,
                 metadata,
@@ -1691,6 +2191,7 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
             "skipped_entry_gate": skipped_entry_gate,
             "skipped_experience_cooldown": skipped_experience_cooldown,
             "skipped_dynamic_buy_floor": skipped_dynamic_buy_floor,
+            "skipped_stale_data": skipped_stale_data,
             "dynamic_buy_composite_floor": dynamic_buy_floor,
             "experience_threshold_source_claude": experience_threshold_source_claude,
             "experience_threshold_source_heuristic": experience_threshold_source_heuristic,
@@ -1710,12 +2211,15 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
         "skipped_entry_gate": skipped_entry_gate,
         "skipped_experience_cooldown": skipped_experience_cooldown,
         "skipped_dynamic_buy_floor": skipped_dynamic_buy_floor,
+        "skipped_stale_data": skipped_stale_data,
         "dynamic_buy_composite_floor": dynamic_buy_floor,
         "experience_threshold_source_claude": experience_threshold_source_claude,
         "experience_threshold_source_heuristic": experience_threshold_source_heuristic,
         "price_history_cache_hits": price_history_cache_hits,
         "price_history_vnstock_calls": price_history_vnstock_calls,
         "price_history_missing": price_history_missing,
+        "sector_breadth_cache_size": len(sector_breadth_cache),
+        "rejected_candidates": rejected_candidates,
         "exchange_scope": normalized_scope,
         "scan_finished_at": datetime.now(tz=tz).isoformat(),
     }
@@ -1737,13 +2241,16 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
     skipped_entry_gate = 0
     skipped_experience_cooldown = 0
     skipped_dynamic_buy_floor = 0
+    skipped_stale_data = 0
     experience_threshold_source_claude = 0
     experience_threshold_source_heuristic = 0
     price_history_cache_hits = 0
     price_history_vnstock_calls = 0
     price_history_missing = 0
+    rejected_candidates: list[dict[str, Any]] = []
     scan_started_at = time.perf_counter()
     step_stats: dict[str, dict[str, float | int]] = {}
+    sector_breadth_cache: dict[str, dict[str, Any]] = {}
 
     def _track_step(name: str, started: float) -> None:
         elapsed = time.perf_counter() - started
@@ -1811,6 +2318,24 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
         _track_step("_get_close_and_volume", cv_t0)
         if len(closes) < 22 or len(volumes) < 22:
             skipped_insufficient_data += 1
+            _append_rejected_candidate(
+                rejected_candidates,
+                symbol=symbol,
+                exchange=symbol_exchange,
+                reason="insufficient_data",
+                detail={"close_bars": len(closes), "volume_bars": len(volumes)},
+            )
+            continue
+        freshness = _freshness_metadata(symbol, symbol_exchange, price_source)
+        if not bool(freshness.get("is_fresh")):
+            skipped_stale_data += 1
+            _append_rejected_candidate(
+                rejected_candidates,
+                symbol=symbol,
+                exchange=symbol_exchange,
+                reason="stale_data",
+                detail=freshness,
+            )
             continue
         last_close = closes[-1]
         ema20_proxy = mean(closes[-20:])
@@ -1833,9 +2358,23 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
         _track_step("_write_liquidity_gate_cache", write_cache_t0)
         if not eligible_liquidity:
             skipped_low_liquidity += 1
+            _append_rejected_candidate(
+                rejected_candidates,
+                symbol=symbol,
+                exchange=symbol_exchange,
+                reason="low_liquidity",
+                detail={"baseline_vol": round(baseline_vol, 4), "latest_vol": round(latest_vol, 4)},
+            )
             continue
         if not eligible_spike:
             skipped_no_volume_spike += 1
+            _append_rejected_candidate(
+                rejected_candidates,
+                symbol=symbol,
+                exchange=symbol_exchange,
+                reason="no_volume_spike",
+                detail={"spike_ratio": round(spike, 4)},
+            )
             continue
 
         exp_adj = 0.0
@@ -1886,6 +2425,13 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
             distance_from_ema20_pct=float(gate_meta.get("distance_from_ema20_pct") or 0.0),
         )
         if not gate_pass:
+            _append_rejected_candidate(
+                rejected_candidates,
+                symbol=symbol,
+                exchange=symbol_exchange,
+                reason="entry_gate_failed",
+                detail=gate_meta,
+            )
             continue
         news_fetch_t0 = time.perf_counter()
         news_items = get_symbol_news_for_scoring(symbol, symbol_exchange, limit=30)
@@ -1893,6 +2439,61 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
         news_score_t0 = time.perf_counter()
         news = score_news_for_symbol(symbol, news_items)
         _track_step("score_news_for_symbol", news_score_t0)
+        listing_context = _symbol_listing_context(symbol)
+        relative_strength = _relative_strength_metadata(closes, bench_closes)
+        industry_key = str(listing_context.get("industry") or "").strip()
+        if industry_key in sector_breadth_cache:
+            sector_breadth = sector_breadth_cache[industry_key]
+        else:
+            breadth_t0 = time.perf_counter()
+            sector_breadth = _sector_breadth_metadata(
+                symbol=symbol,
+                industry=industry_key,
+                benchmark_closes=bench_closes or None,
+            )
+            sector_breadth_cache[industry_key] = sector_breadth
+            _track_step("_sector_breadth_metadata_cached_by_industry", breadth_t0)
+        setup = _classify_short_term_setup(gate_meta=gate_meta, news=news)
+        levels_preview = _derive_short_term_trade_levels(
+            closes=closes,
+            last_close=last_close,
+            setup_type=str(setup.get("setup_type") or ""),
+        )
+        rr_preview = float(levels_preview.get("target_rr") or 0.0)
+        daily_return_pct = ((last_close / closes[-2]) - 1.0) * 100.0 if len(closes) >= 2 and closes[-2] > 0 else 0.0
+        if str(setup.get("setup_type") or "").upper() == "NEWS_SPIKE":
+            setup["news_spike_risk"] = True
+            setup["news_spike_buyable_exception"] = bool(
+                rr_preview >= 2.0
+                and eligible_liquidity
+                and daily_return_pct < 6.5
+                and float(gate_meta.get("distance_from_ema20_pct") or 0.0) <= 5.0
+            )
+            setup["daily_return_pct"] = round(daily_return_pct, 4)
+            if not bool(setup["news_spike_buyable_exception"]):
+                action = "HOLD"
+                reason = "NEWS_SPIKE default watch; rejected unless R/R >= 2, liquid, not near ceiling, and entry is not extended."
+                skipped_entry_gate += 1
+                _append_rejected_candidate(
+                    rejected_candidates,
+                    symbol=symbol,
+                    exchange=symbol_exchange,
+                    reason="news_spike_risk",
+                    detail={**setup, "trade_levels": levels_preview},
+                )
+                continue
+        if bool(setup.get("is_chase_risk")):
+            action = "HOLD"
+            reason = f"{setup.get('setup_type')} chase risk; downgraded to HOLD."
+            skipped_entry_gate += 1
+            _append_rejected_candidate(
+                rejected_candidates,
+                symbol=symbol,
+                exchange=symbol_exchange,
+                reason="chase_risk",
+                detail=setup,
+            )
+            continue
         macro = {
             "score_0_100": 50.0,
             "detail": {"mode": "fallback_light", "reason": "full_macro_disabled_due_timeout"},
@@ -1906,6 +2507,14 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
             legacy_flat={"volume_spike_ratio": round(spike, 4), "scan_mode": "fallback_light"},
         )
         metadata["entry_gate"] = gate_meta
+        metadata["freshness"] = freshness
+        metadata["setup"] = setup
+        metadata["relative_strength"] = relative_strength
+        metadata["sector_breadth"] = sector_breadth
+        metadata["listing_context"] = {
+            "exchange": listing_context.get("exchange") or symbol_exchange,
+            "industry": listing_context.get("industry") or "",
+        }
         metadata["experience_entry_tightening"] = gate_thresholds
         metadata["market_regime_technical_thresholds"] = technical_thresholds
         cooldown_active, cooldown_meta = _experience_buy_cooldown(symbol=symbol, action=action)
@@ -1914,6 +2523,13 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
             action = "HOLD"
             reason = "Recent stoploss cooldown active for symbol; downgraded to HOLD."
             skipped_experience_cooldown += 1
+            _append_rejected_candidate(
+                rejected_candidates,
+                symbol=symbol,
+                exchange=symbol_exchange,
+                reason="experience_cooldown",
+                detail=cooldown_meta,
+            )
         composite = float(metadata["signal_quality"]["composite_score_0_100"])
         if action == "BUY" and composite < dynamic_buy_floor:
             action = "HOLD"
@@ -1922,6 +2538,13 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
                 "downgraded to HOLD."
             )
             skipped_dynamic_buy_floor += 1
+            _append_rejected_candidate(
+                rejected_candidates,
+                symbol=symbol,
+                exchange=symbol_exchange,
+                reason="dynamic_buy_floor",
+                detail={"composite": round(composite, 4), "floor": round(dynamic_buy_floor, 4)},
+            )
         confidence = confidence_from_composite_and_action(
             action=action,
             base_confidence_from_rules=confidence,
@@ -1933,13 +2556,15 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
 
         insert_t0 = time.perf_counter()
         if action in {"BUY", "SELL"}:
+            levels = levels_preview
+            metadata["trade_levels"] = levels
             signal = _insert_signal(
                 "SHORT_TERM",
                 symbol,
                 action,
-                last_close if action == "BUY" else None,
-                (last_close * 1.04) if action == "BUY" else None,
-                (last_close * 0.97) if action == "BUY" else None,
+                float(levels["entry"]) if action == "BUY" else None,
+                float(levels["take_profit"]) if action == "BUY" else None,
+                float(levels["stop_loss"]) if action == "BUY" else None,
                 confidence,
                 reason,
                 metadata,
@@ -1973,6 +2598,7 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
             "skipped_entry_gate": skipped_entry_gate,
             "skipped_experience_cooldown": skipped_experience_cooldown,
             "skipped_dynamic_buy_floor": skipped_dynamic_buy_floor,
+            "skipped_stale_data": skipped_stale_data,
             "dynamic_buy_composite_floor": dynamic_buy_floor,
             "experience_threshold_source_claude": experience_threshold_source_claude,
             "experience_threshold_source_heuristic": experience_threshold_source_heuristic,
@@ -1991,12 +2617,15 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
         "skipped_entry_gate": skipped_entry_gate,
         "skipped_experience_cooldown": skipped_experience_cooldown,
         "skipped_dynamic_buy_floor": skipped_dynamic_buy_floor,
+        "skipped_stale_data": skipped_stale_data,
         "dynamic_buy_composite_floor": dynamic_buy_floor,
         "experience_threshold_source_claude": experience_threshold_source_claude,
         "experience_threshold_source_heuristic": experience_threshold_source_heuristic,
         "price_history_cache_hits": price_history_cache_hits,
         "price_history_vnstock_calls": price_history_vnstock_calls,
         "price_history_missing": price_history_missing,
+        "sector_breadth_cache_size": len(sector_breadth_cache),
+        "rejected_candidates": rejected_candidates,
         "scan_mode": "fallback_light",
         "exchange_scope": normalized_scope,
         "listing_target_symbols": listing_target_symbols if listing_target_symbols is not None else scanned,
@@ -2279,8 +2908,9 @@ def warm_daily_volume_for_saved_symbols(days: int = 30) -> dict[str, Any]:
     retention_days = max(5, int(settings.market_symbol_daily_volume_retention_days))
     safe_days = max(5, min(int(days), retention_days))
     tz = ZoneInfo(settings.short_term_scan_timezone)
-    today_local = datetime.now(tz=tz).date()
-    cutoff_date = today_local - timedelta(days=safe_days - 1)
+    now_local = datetime.now(tz=tz)
+    target_latest_date = _latest_completed_vn_trading_date(now_local)
+    cutoff_date = target_latest_date - timedelta(days=safe_days - 1)
     _ensure_market_symbol_tables_once()
     with connect(settings.database_url, row_factory=dict_row) as conn:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -2322,30 +2952,45 @@ def warm_daily_volume_for_saved_symbols(days: int = 30) -> dict[str, Any]:
         if dates_set:
             latest_date_by_symbol[symbol] = max(dates_set)
 
-    scanned = 0
-    warmed = 0
-    errors = 0
+    candidates: list[dict[str, Any]] = []
     skipped_up_to_date = 0
-    missing_days_filled = 0
     for row in symbols:
         symbol = str(row.get("symbol", "")).strip().upper()
         exchange = str(row.get("exchange", "")).strip().upper()
         if not symbol:
             continue
-        scanned += 1
         latest_cached_date = latest_date_by_symbol.get(symbol)
-        if latest_cached_date is not None and latest_cached_date >= today_local:
+        if latest_cached_date is not None and latest_cached_date >= target_latest_date:
             skipped_up_to_date += 1
             continue
+        if latest_cached_date is not None:
+            gap_days = max(1, (target_latest_date - latest_cached_date).days)
+            count_back = max(7, min(safe_days, gap_days + 5))
+        else:
+            count_back = safe_days
+        candidates.append(
+            {
+                "symbol": symbol,
+                "exchange": exchange or "UNKNOWN",
+                "count_back": count_back,
+                "existing_dates": existing_dates_by_symbol.get(symbol, set()),
+            }
+        )
+
+    def _fetch_missing_volume(candidate: dict[str, Any]) -> dict[str, Any]:
+        symbol = str(candidate["symbol"])
+        exchange = str(candidate["exchange"])
+        count_back = int(candidate["count_back"])
+        existing_dates = candidate.get("existing_dates") if isinstance(candidate.get("existing_dates"), set) else set()
         try:
             rows = vnstock_api_service.call_quote(
                 "history",
                 source="VCI",
                 symbol=symbol,
-                method_kwargs={"interval": "1D", "count_back": safe_days},
+                method_kwargs={"interval": "1D", "count_back": count_back},
             )
             if not isinstance(rows, list):
-                continue
+                return {"symbol": symbol, "exchange": exchange, "rows": [], "missing_dates": set(), "error": None}
             dict_rows = [item for item in rows if isinstance(item, dict)]
             source_dates: set[date] = set()
             for item in dict_rows:
@@ -2354,38 +2999,79 @@ def warm_daily_volume_for_saved_symbols(days: int = 30) -> dict[str, Any]:
                     continue
                 source_dates.add(trading_date)
             if not source_dates:
-                continue
-            existing_dates = existing_dates_by_symbol.get(symbol, set())
+                return {"symbol": symbol, "exchange": exchange, "rows": [], "missing_dates": set(), "error": None}
             missing_dates = source_dates - existing_dates
             if not missing_dates:
-                skipped_up_to_date += 1
-                continue
-            _persist_symbol_daily_volume_rows(
-                symbol=symbol,
-                exchange=exchange or "UNKNOWN",
-                source="VCI",
-                rows=dict_rows,
-                min_trading_date=cutoff_date,
-            )
-            warmed += 1
-            missing_days_filled += len(missing_dates)
-            existing_dates_by_symbol[symbol] = existing_dates.union(source_dates)
+                return {"symbol": symbol, "exchange": exchange, "rows": [], "missing_dates": set(), "error": None}
+            return {
+                "symbol": symbol,
+                "exchange": exchange,
+                "rows": dict_rows,
+                "missing_dates": missing_dates,
+                "source_dates": source_dates,
+                "error": None,
+            }
         except Exception as exc:
-            errors += 1
-            logger.warning(
-                "warm_daily_volume_for_saved_symbols_failed",
-                extra={"symbol": symbol, "exchange": exchange, "error": str(exc)},
-            )
-            continue
+            return {"symbol": symbol, "exchange": exchange, "rows": [], "missing_dates": set(), "error": str(exc)}
+
+    scanned = len(candidates)
+    warmed = 0
+    errors = 0
+    skipped_after_fetch = 0
+    missing_days_filled = 0
+    quote_calls = len(candidates)
+    max_workers = max(1, min(int(settings.automation_short_term_post_close_refresh_max_workers), len(candidates) or 1))
+    fetched_results: list[dict[str, Any]] = []
+    if candidates:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_fetch_missing_volume, candidate) for candidate in candidates]
+            for future in as_completed(futures):
+                result = future.result()
+                if result.get("error"):
+                    errors += 1
+                    logger.warning(
+                        "warm_daily_volume_for_saved_symbols_failed",
+                        extra={
+                            "symbol": result.get("symbol"),
+                            "exchange": result.get("exchange"),
+                            "error": result.get("error"),
+                        },
+                    )
+                    continue
+                if not result.get("rows") or not result.get("missing_dates"):
+                    skipped_after_fetch += 1
+                    continue
+                fetched_results.append(result)
+
+    for result in fetched_results:
+        symbol = str(result.get("symbol") or "")
+        exchange = str(result.get("exchange") or "UNKNOWN")
+        rows = result.get("rows") if isinstance(result.get("rows"), list) else []
+        missing_dates = result.get("missing_dates") if isinstance(result.get("missing_dates"), set) else set()
+        source_dates = result.get("source_dates") if isinstance(result.get("source_dates"), set) else set()
+        _persist_symbol_daily_volume_rows(
+            symbol=symbol,
+            exchange=exchange,
+            source="VCI",
+            rows=rows,
+            min_trading_date=cutoff_date,
+        )
+        warmed += 1
+        missing_days_filled += len(missing_dates)
+        existing_dates_by_symbol[symbol] = existing_dates_by_symbol.get(symbol, set()).union(source_dates)
 
     return {
         "days": safe_days,
         "cutoff_date": str(cutoff_date),
+        "target_latest_date": str(target_latest_date),
         "total_symbols": len(symbols),
         "symbols_scanned": scanned,
         "symbols_skipped_up_to_date": skipped_up_to_date,
+        "symbols_skipped_after_fetch": skipped_after_fetch,
         "symbols_backfilled": warmed,
         "missing_days_filled": missing_days_filled,
+        "quote_calls": quote_calls,
+        "max_workers": max_workers,
         "errors": errors,
     }
 
@@ -2399,10 +3085,10 @@ def refresh_short_term_liquidity_cache_from_db(days: int = 30, exchange_scope: s
     normalized_scope = _normalize_exchange_scope(exchange_scope)
     exchanges = _resolve_exchange_list(normalized_scope)
     safe_days = max(5, min(int(days), int(settings.market_symbol_daily_volume_retention_days)))
-    # Use app timezone so "today" matches scheduler triggers (e.g. Asia/Ho_Chi_Minh).
+    # Use app timezone so latest completed trading day matches scheduler triggers.
     tz = ZoneInfo(settings.short_term_scan_timezone)
-    today_local = datetime.now(tz=tz).date()
-    cutoff_date = today_local - timedelta(days=safe_days - 1)
+    target_latest_date = _latest_completed_vn_trading_date(datetime.now(tz=tz))
+    cutoff_date = target_latest_date - timedelta(days=safe_days - 1)
 
     with connect(settings.database_url, row_factory=dict_row) as conn:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -2459,13 +3145,13 @@ def refresh_short_term_liquidity_cache_from_db(days: int = 30, exchange_scope: s
     skipped_not_spike = 0
 
     for symbol, dated_volumes in volume_by_symbol.items():
-        # Eligibility uses "today" as the latest point.
-        # If we don't have today's volume in DB, latest_vol(today)=0 (do not use stale latest).
+        # Eligibility uses the latest completed VN trading day as the latest point.
+        # If we don't have that date in DB, latest_vol=0 (do not use stale latest).
         baseline_slice: list[float] = []
-        latest_vol_today = 0.0
+        latest_vol = 0.0
         for trading_date, vol in dated_volumes:
-            if trading_date == today_local:
-                latest_vol_today = float(vol)
+            if trading_date == target_latest_date:
+                latest_vol = float(vol)
             else:
                 baseline_slice.append(float(vol))
 
@@ -2476,20 +3162,14 @@ def refresh_short_term_liquidity_cache_from_db(days: int = 30, exchange_scope: s
 
         scanned += 1
         baseline_vol = float(mean(baseline_slice))
-        spike = (latest_vol_today / baseline_vol) if baseline_vol > 0 else 0.0
-        eligible_liquidity = _is_short_term_liquid_enough(baseline_vol, latest_vol_today)
+        spike = (latest_vol / baseline_vol) if baseline_vol > 0 else 0.0
+        eligible_liquidity = _is_short_term_liquid_enough(baseline_vol, latest_vol)
         eligible_spike = _is_short_term_volume_spike(spike)
-        if not eligible_spike:
-            skipped_not_spike += 1
-            no_volume_spike += 1
-            if not eligible_liquidity:
-                low_liquidity += 1
-            continue
         _write_liquidity_gate_cache(
             symbol=symbol,
             exchange=exchange_by_symbol.get(symbol, "UNKNOWN"),
             baseline_vol=baseline_vol,
-            latest_vol=latest_vol_today,
+            latest_vol=latest_vol,
             spike_ratio=spike,
             eligible_liquidity=eligible_liquidity,
             eligible_spike=eligible_spike,
@@ -2497,12 +3177,16 @@ def refresh_short_term_liquidity_cache_from_db(days: int = 30, exchange_scope: s
         cached_written += 1
         if not eligible_liquidity:
             low_liquidity += 1
+        if not eligible_spike:
+            skipped_not_spike += 1
+            no_volume_spike += 1
 
     return {
         "source": "market_symbol_daily_volume",
         "exchange_scope": normalized_scope,
         "days": safe_days,
         "cutoff_date": str(cutoff_date),
+        "target_latest_date": str(target_latest_date),
         "db_rows": len(rows),
         "deleted_old_redis_keys": deleted_old_keys,
         "symbols_scanned": scanned,

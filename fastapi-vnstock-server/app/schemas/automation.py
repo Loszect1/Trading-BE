@@ -139,6 +139,11 @@ class MailSignalEntryRunOnceRequest(BaseModel):
 class RealRecommendationScanRequest(BaseModel):
     exchange_scope: Literal["ALL", "HOSE", "HNX", "UPCOM"] = "ALL"
     limit_symbols: int = Field(default=0, ge=0)
+    real_account_available_cash_vnd: float | None = Field(
+        default=None,
+        gt=0,
+        description="Optional REAL available cash used for recommendation-time risk preflight.",
+    )
 
 
 class RealRecommendationBuyRequest(BaseModel):
@@ -149,3 +154,7 @@ class RealRecommendationBuyRequest(BaseModel):
     confidence: float = Field(default=50.0, ge=0, le=100)
     reason: str = Field(default="", max_length=2000)
     available_cash_vnd: float = Field(gt=0)
+    setup_type: str | None = None
+    setup: dict[str, Any] | None = None
+    freshness: dict[str, Any] | None = None
+    metadata: dict[str, Any] | None = None

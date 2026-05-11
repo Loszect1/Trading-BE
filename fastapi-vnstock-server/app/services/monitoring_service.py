@@ -738,7 +738,9 @@ def list_recent_runtime_logs(*, account_mode: str | None = None, limit: int = 10
                         run_status,
                         scanned,
                         buy_candidates,
+                        risk_rejected,
                         executed,
+                        execution_rejected,
                         errors,
                         detail
                     FROM short_term_automation_runs
@@ -757,7 +759,9 @@ def list_recent_runtime_logs(*, account_mode: str | None = None, limit: int = 10
                         run_status,
                         scanned,
                         buy_candidates,
+                        risk_rejected,
                         executed,
+                        execution_rejected,
                         errors,
                         detail
                     FROM short_term_automation_runs
@@ -775,11 +779,14 @@ def list_recent_runtime_logs(*, account_mode: str | None = None, limit: int = 10
         run_status = str(row.get("run_status") or "-")
         scanned = int(row.get("scanned") or 0)
         buy_candidates = int(row.get("buy_candidates") or 0)
+        risk_rejected = int(row.get("risk_rejected") or 0)
         executed = int(row.get("executed") or 0)
+        execution_rejected = int(row.get("execution_rejected") or 0)
         errors = int(row.get("errors") or 0)
         skip_reason = str(detail.get("skip_reason") or "").strip()
         runtime_message = (
-            f"{run_status} | scope={exchange_scope} | scan={scanned} | buy={buy_candidates} | exec={executed} | err={errors}"
+            f"{run_status} | scope={exchange_scope} | scan={scanned} | candidate={buy_candidates} | "
+            f"risk_rej={risk_rejected} | exec={executed} | exec_rej={execution_rejected} | err={errors}"
         )
         if skip_reason:
             runtime_message = f"{runtime_message} | skip_reason={skip_reason}"

@@ -11,7 +11,7 @@ def _base_payload(**overrides):
     base = {
         "stoploss_price": 90.0,
         "entry_price": 100.0,
-        "nav": 1_000_000.0,
+        "nav": 100_000_000.0,
         "risk_per_trade": 0.01,
         "daily_new_orders": 0,
         "max_daily_new_orders": 10,
@@ -24,9 +24,10 @@ def test_evaluate_risk_ok_suggested_size():
     r = evaluate_risk(_base_payload())
     assert r["pass"] is True
     assert r["reason"] == "ok"
-    # distance 10, risk 1% of 1M = 10_000 / 10 = 1000
-    assert r["suggested_size"] == 1000
-    assert r["suggested_lot_size"] == 1000
+    # 100.0 is thousand-VND notation, so distance is 10,000 VND.
+    # Risk 1% of 100M = 1,000,000 / 10,000 = 100 shares.
+    assert r["suggested_size"] == 100
+    assert r["suggested_lot_size"] == 100
 
 
 def test_evaluate_risk_zero_stop_distance_rejected():
