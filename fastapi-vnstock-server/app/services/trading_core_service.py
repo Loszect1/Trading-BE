@@ -380,6 +380,72 @@ def check_settlement(
     return {"pass": available_qty >= quantity, "available_qty": available_qty, "pending_settlement_qty": pending_qty}
 
 
+def _get_demo_shared_cash_balance_for_order(conn, demo_session_id: str) -> float | None:
+    session_id = str(demo_session_id or "").strip()
+    if not session_id:
+        return None
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT to_regclass('public.demo_sessions') IS NOT NULL AS table_exists")
+        table_row = cur.fetchone() or {}
+        if not bool(table_row.get("table_exists")):
+            return None
+        cur.execute(
+            """
+            SELECT initial_balance
+            FROM demo_sessions
+            WHERE session_id = %(session_id)s
+            """,
+            {"session_id": session_id},
+        )
+        session_row = cur.fetchone() or {}
+        if not session_row:
+            return None
+        initial_balance = float(session_row.get("initial_balance") or 0.0)
+        cur.execute(
+            """
+            SELECT
+                COALESCE(SUM(quantity * price) FILTER (WHERE side = 'BUY'), 0)::double precision AS buy_notional,
+                COALESCE(SUM(quantity * price) FILTER (WHERE side = 'SELL'), 0)::double precision AS sell_notional
+            FROM orders_core
+            WHERE account_mode = 'DEMO'
+              AND status = 'FILLED'
+              AND COALESCE(order_metadata->>'demo_session_id', '') = %(session_id)s
+            """,
+            {"session_id": session_id},
+        )
+        notional_row = cur.fetchone() or {}
+    buy_notional = float(notional_row.get("buy_notional") or 0.0)
+    sell_notional = float(notional_row.get("sell_notional") or 0.0)
+    return max(0.0, initial_balance + sell_notional - buy_notional)
+
+
+def _get_demo_filled_position_qty_for_order(conn, demo_session_id: str, symbol: str) -> int | None:
+    session_id = str(demo_session_id or "").strip()
+    sym = str(symbol or "").strip().upper()
+    if not session_id or not sym:
+        return None
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT to_regclass('public.demo_sessions') IS NOT NULL AS table_exists")
+        table_row = cur.fetchone() or {}
+        if not bool(table_row.get("table_exists")):
+            return None
+        cur.execute(
+            """
+            SELECT
+                COALESCE(SUM(quantity) FILTER (WHERE side = 'BUY'), 0)::bigint AS buy_qty,
+                COALESCE(SUM(quantity) FILTER (WHERE side = 'SELL'), 0)::bigint AS sell_qty
+            FROM orders_core
+            WHERE account_mode = 'DEMO'
+              AND symbol = %(symbol)s
+              AND status = 'FILLED'
+              AND COALESCE(order_metadata->>'demo_session_id', '') = %(session_id)s
+            """,
+            {"symbol": sym, "session_id": session_id},
+        )
+        row = cur.fetchone() or {}
+    return max(0, int(row.get("buy_qty") or 0) - int(row.get("sell_qty") or 0))
+
+
 def roll_settlement(account_mode: str) -> None:
     """
     Public helper to update `position_lots.available_qty` when `settle_date` has passed.
@@ -661,6 +727,47 @@ def process_order(order_id: str) -> dict[str, Any]:
             order_metadata=meta,
             current_status=st,
         )
+
+        if account_mode == "DEMO" and side == "BUY":
+            demo_session_id = str(meta.get("demo_session_id") or "").strip()
+            if demo_session_id:
+                demo_cash = _get_demo_shared_cash_balance_for_order(conn, demo_session_id)
+                required_cash = max(0.0, float(quantity) * float(price))
+                if demo_cash is None or required_cash > demo_cash + 1e-9:
+                    final_order = _set_order_status(conn, order_id, "REJECTED", "insufficient_demo_shared_cash")
+                    _append_order_event(
+                        conn,
+                        order_id,
+                        "REJECTED",
+                        "DEMO shared cash guard rejected order",
+                        {
+                            "demo_session_id": demo_session_id,
+                            "required_cash": required_cash,
+                            "available_cash": demo_cash,
+                        },
+                    )
+                    conn.commit()
+                    return {"processed": True, "order": final_order}
+
+        if account_mode == "DEMO" and side == "SELL":
+            demo_session_id = str(meta.get("demo_session_id") or "").strip()
+            if demo_session_id:
+                demo_position_qty = _get_demo_filled_position_qty_for_order(conn, demo_session_id, symbol)
+                if demo_position_qty is None or quantity > demo_position_qty:
+                    final_order = _set_order_status(conn, order_id, "REJECTED", "insufficient_demo_position")
+                    _append_order_event(
+                        conn,
+                        order_id,
+                        "REJECTED",
+                        "DEMO filled position guard rejected sell order",
+                        {
+                            "demo_session_id": demo_session_id,
+                            "required_qty": quantity,
+                            "available_filled_qty": demo_position_qty,
+                        },
+                    )
+                    conn.commit()
+                    return {"processed": True, "order": final_order}
 
         try:
             outcome = adapter.execute(ctx)

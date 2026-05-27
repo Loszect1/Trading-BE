@@ -95,6 +95,9 @@ class AppSettings(BaseSettings):
     short_term_scan_interval_minutes: int = Field(default=15, ge=1, le=120)
     #: IANA timezone for session windows and schedule API (VN market local time).
     short_term_scan_timezone: str = Field(default="Asia/Ho_Chi_Minh", min_length=3, max_length=64)
+    #: Minutes after the 14:45 close before daily bars are considered complete for freshness checks.
+    #: Keeps scans from rejecting every symbol while upstream/post-close caches are still updating.
+    short_term_daily_bar_completion_grace_minutes: int = Field(default=75, ge=0, le=240)
     #: Drawdown proxy (from snapshots + positions) alert threshold, percent.
     monitoring_drawdown_alert_pct: float = Field(default=15.0, ge=0.1, le=99.0)
     #: Rolling window for counting rejected orders (execution stress proxy).

@@ -16,7 +16,6 @@ from app.services.claude_service import ClaudeService
 from app.services.demo_trading_service import (
     get_active_scheduler_demo_session_id_from_db,
     get_demo_session_cash_balance,
-    get_demo_strategy_remaining_cash,
 )
 from app.services.gmail_service import GmailFetchService
 from app.services.price_unit_service import normalize_vn_price_to_vnd
@@ -72,16 +71,12 @@ def _mail_signal_allocated_nav() -> float:
     return max(1_000_000.0, nav)
 
 
-def _mail_signal_allocated_nav_for_mode(account_mode: str) -> float:
+def _mail_signal_allocated_nav_for_mode(account_mode: str, demo_session_id: str | None = None) -> float:
     if str(account_mode).upper() == "DEMO":
-        active_demo_session_id = get_active_scheduler_demo_session_id_from_db()
-        strategy_cash = get_demo_strategy_remaining_cash(str(active_demo_session_id or ""), "MAIL_SIGNAL")
-        if strategy_cash > 0:
-            return max(1_000_000.0, strategy_cash)
+        active_demo_session_id = str(demo_session_id or "").strip() or get_active_scheduler_demo_session_id_from_db()
         cash = get_demo_session_cash_balance(active_demo_session_id)
         if cash is not None and cash > 0:
-            alloc = cash * float(settings.strategy_alloc_mail_signal_pct)
-            return max(1_000_000.0, alloc)
+            return max(1_000_000.0, cash)
     return _mail_signal_allocated_nav()
 
 
@@ -498,8 +493,13 @@ def run_prev_day_entry_auto_trading_once(
         active_demo_session_id = override_sid or get_active_scheduler_demo_session_id_from_db()
     else:
         active_demo_session_id = None
-    nav = float(nav_override) if nav_override is not None else _mail_signal_allocated_nav_for_mode(account_mode)
+    nav = (
+        float(nav_override)
+        if nav_override is not None
+        else _mail_signal_allocated_nav_for_mode(account_mode, active_demo_session_id)
+    )
     nav = max(1_000_000.0, nav)
+    remaining_nav = float(nav)
     risk_per_trade = float(settings.mail_signal_entry_risk_per_trade)
     max_qty = int(settings.mail_signal_entry_max_quantity)
 
@@ -551,12 +551,23 @@ def run_prev_day_entry_auto_trading_once(
                         }
                     )
                     continue
+                if remaining_nav < market_price * 100.0:
+                    skipped.append(
+                        {
+                            "symbol": symbol,
+                            "reason": "insufficient_shared_cash_for_lot100",
+                            "market_price": market_price,
+                            "remaining_nav": float(remaining_nav),
+                            "required_cash_for_lot100": float(market_price * 100.0),
+                        }
+                    )
+                    continue
 
                 risk = evaluate_risk(
                     {
                         "stoploss_price": stop_loss_price,
                         "entry_price": market_price,
-                        "nav": nav,
+                        "nav": remaining_nav,
                         "risk_per_trade": risk_per_trade,
                         "daily_new_orders": 0,
                         "max_daily_new_orders": 10_000,
@@ -577,7 +588,7 @@ def run_prev_day_entry_auto_trading_once(
                             "market_price": market_price,
                             "stop_loss": stop_loss_price,
                             "take_profit": take_profit_price,
-                            "nav": float(nav),
+                            "nav": float(remaining_nav),
                             "risk_per_trade": float(risk_per_trade),
                             "suggested_size": int(risk.get("suggested_size") or 0),
                             "suggested_lot_size": int(risk.get("suggested_lot_size") or 0),
@@ -612,17 +623,32 @@ def run_prev_day_entry_auto_trading_once(
                         },
                     }
                 )
+                resolved_order = placed.get("order") if isinstance(placed.get("order"), dict) else placed
+                order_status = str((resolved_order or {}).get("status") or "").upper()
+                order_id = (resolved_order or {}).get("id") or placed.get("id")
+                if order_status in {"REJECTED", "CANCELLED"}:
+                    skipped.append(
+                        {
+                            "symbol": symbol,
+                            "reason": "order_rejected",
+                            "status": order_status,
+                            "order_id": order_id,
+                            "order_reason": (resolved_order or {}).get("reason"),
+                        }
+                    )
+                    continue
+                remaining_nav = max(0.0, float(remaining_nav) - (float(qty) * float(market_price)))
                 _redis.set_json(
                     execution_marker_key,
                     {
                         "executed_at": now_local.isoformat(),
                         "symbol": symbol,
-                        "order_id": placed.get("id"),
-                        "status": placed.get("status"),
+                        "order_id": order_id,
+                        "status": order_status or None,
                     },
                     ttl_seconds=max(3600, int(settings.mail_signal_redis_ttl_seconds)),
                 )
-                executed.append({"symbol": symbol, "order_id": placed.get("id"), "status": placed.get("status"), "quantity": qty})
+                executed.append({"symbol": symbol, "order_id": order_id, "status": order_status or None, "quantity": qty})
             except Exception as symbol_exc:
                 logger.exception(
                     "mail_signal_entry_symbol_failed",
@@ -643,6 +669,7 @@ def run_prev_day_entry_auto_trading_once(
             if real_account_available_cash_vnd is not None
             else None,
             "effective_nav_vnd": float(nav),
+            "remaining_nav_vnd": float(remaining_nav),
             "scanned": len(raw_items),
             "executed": executed,
             "skipped": skipped,

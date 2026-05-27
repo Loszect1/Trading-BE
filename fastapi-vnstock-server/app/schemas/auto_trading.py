@@ -122,14 +122,6 @@ class DemoHoldingOverviewItem(BaseModel):
     opened_at: datetime
 
 
-class DemoStrategyCashOverviewItem(BaseModel):
-    strategy_code: Literal["SHORT_TERM", "MAIL_SIGNAL", "UNALLOCATED"]
-    allocation_pct: float = Field(..., ge=0.0, le=1.0)
-    cash_value: float = Field(..., ge=0.0)
-    used_cash_value: float = Field(default=0.0, ge=0.0)
-    remaining_cash_value: float = Field(default=0.0, ge=0.0)
-
-
 class DemoSessionOverviewData(BaseModel):
     session_id: str
     is_active: bool = Field(
@@ -145,21 +137,19 @@ class DemoSessionOverviewData(BaseModel):
     holdings_count: int = Field(..., ge=0)
     holdings: list[DemoHoldingOverviewItem] = Field(default_factory=list)
     tp_slot_pct: float = Field(default=0.3, ge=0.1, le=0.9)
-    strategy_cash_overview: list[DemoStrategyCashOverviewItem] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
 
 
-class DemoStrategyCashTransferRequest(BaseModel):
-    from_strategy: Literal["UNALLOCATED", "SHORT_TERM", "MAIL_SIGNAL"] = "UNALLOCATED"
-    to_strategy: Literal["SHORT_TERM", "MAIL_SIGNAL", "UNALLOCATED"]
-    amount_vnd: float = Field(..., gt=0.0)
+class DemoDepositRequest(BaseModel):
+    amount_vnd: float = Field(..., gt=0.0, le=100_000_000_000.0)
 
 
-class DemoStrategyCashTransferData(BaseModel):
+class DemoDepositResponseData(BaseModel):
     session_id: str
-    transferred_to: Literal["SHORT_TERM", "MAIL_SIGNAL", "UNALLOCATED"]
     amount_vnd: float = Field(..., gt=0.0)
+    initial_balance: float = Field(..., ge=0.0)
+    cash_balance: float = Field(..., ge=0.0)
 
 
 class DemoTpSlotPctUpdateRequest(BaseModel):

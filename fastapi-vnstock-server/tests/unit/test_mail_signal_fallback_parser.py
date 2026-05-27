@@ -26,3 +26,12 @@ def test_fallback_mail_signal_parser_extracts_only_clear_buy_rows():
     assert items[0]["take_profit"] == 10400.0
     assert items[0]["stop_loss"] == 6800.0
     assert items[1]["entry"] == 114200.0
+
+
+def test_demo_mail_signal_nav_uses_shared_session_cash(monkeypatch):
+    import app.services.mail_signal_scheduler_service as svc
+
+    monkeypatch.setattr(svc, "get_active_scheduler_demo_session_id_from_db", lambda: "demo-session")
+    monkeypatch.setattr(svc, "get_demo_session_cash_balance", lambda session_id: 42_000_000.0)
+
+    assert svc._mail_signal_allocated_nav_for_mode("DEMO") == 42_000_000.0

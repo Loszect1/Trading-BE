@@ -311,12 +311,24 @@ def preflight_real_recommendations(
     cash_source: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     normalized = normalize_real_recommendation_rows(rows)
-    cash_snapshot = get_real_cash_snapshot() if available_cash_vnd is None else {"available": True, "source": "request_cash", "cash": available_cash_vnd}
-    cash_base = (
-        float(available_cash_vnd)
-        if available_cash_vnd is not None and float(available_cash_vnd) > 0
-        else float(cash_snapshot.get("cash"))
+    request_cash_provided = available_cash_vnd is not None
+    request_cash = max(0.0, float(available_cash_vnd or 0.0)) if request_cash_provided else None
+    cash_snapshot = (
+        {"available": True, "source": "request_cash", "cash": request_cash}
+        if request_cash_provided
+        else get_real_cash_snapshot()
+    )
+    snapshot_cash = (
+        float(cash_snapshot.get("cash"))
         if cash_snapshot.get("cash") is not None and float(cash_snapshot.get("cash") or 0.0) > 0
+        else None
+    )
+    cash_is_reliable = bool(request_cash_provided or (cash_snapshot.get("available") and snapshot_cash is not None))
+    cash_base = (
+        float(request_cash)
+        if request_cash is not None
+        else float(snapshot_cash)
+        if snapshot_cash is not None
         else float(settings.strategy_total_cash_vnd)
     )
     resolved_cash_source = str(cash_source or cash_snapshot.get("source") or ("request_cash" if available_cash_vnd is not None else "config_cash"))
@@ -363,6 +375,27 @@ def preflight_real_recommendations(
                 "risk_result": {"pass": False, "reason": "stale_data"},
                 "settlement_pressure": item_pressure,
                 "account_preflight": acct,
+                "suggested_quantity": 0,
+                "suggested_notional": 0.0,
+            }
+            rejected.append(enriched)
+            continue
+        if not cash_is_reliable:
+            enriched = {
+                **item,
+                "risk_status": "PREFLIGHT_UNKNOWN_CASH",
+                "risk_reason": "cash_snapshot_unavailable",
+                "risk_result": {
+                    "pass": False,
+                    "reason": "cash_snapshot_unavailable",
+                    "cash_source": resolved_cash_source,
+                },
+                "settlement_pressure": item_pressure,
+                "account_preflight": {
+                    **acct,
+                    "cash_source": resolved_cash_source,
+                    "cash_snapshot": cash_snapshot,
+                },
                 "suggested_quantity": 0,
                 "suggested_notional": 0.0,
             }

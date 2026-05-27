@@ -890,7 +890,10 @@ def _get_close_and_volume_with_source(
     cached_closes, cached_volumes = _get_close_and_volume_from_db(symbol=symbol, bars=bars, exchange=exchange)
     required_cached_bars = int(min_cached_bars) if min_cached_bars is not None else int(bars)
     if len(cached_closes) >= required_cached_bars and len(cached_volumes) >= required_cached_bars:
-        return cached_closes, cached_volumes, "db_cache"
+        latest_cached = _latest_cached_trading_date(symbol, exchange)
+        expected_latest = _latest_completed_vn_trading_date()
+        if latest_cached is not None and latest_cached >= expected_latest:
+            return cached_closes, cached_volumes, "db_cache"
 
     try:
         rows = vnstock_api_service.call_quote(
@@ -902,7 +905,12 @@ def _get_close_and_volume_with_source(
     except Exception:
         # Skip symbol-level data-source failures; do not fail entire scan batch.
         if cached_closes and cached_volumes:
-            return cached_closes, cached_volumes, "db_cache_partial_after_vnstock_error"
+            source = (
+                "db_cache_stale_after_vnstock_error"
+                if len(cached_closes) >= required_cached_bars and len(cached_volumes) >= required_cached_bars
+                else "db_cache_partial_after_vnstock_error"
+            )
+            return cached_closes, cached_volumes, source
         return [], [], "missing"
     closes: list[float] = []
     volumes: list[float] = []
@@ -930,6 +938,8 @@ def _get_close_and_volume_with_source(
                 "persist_symbol_daily_volume_rows_failed",
                 extra={"symbol": symbol, "exchange": str(exchange).upper(), "error": str(exc)},
             )
+    if (len(closes) < required_cached_bars or len(volumes) < required_cached_bars) and cached_closes and cached_volumes:
+        return cached_closes, cached_volumes, "db_cache_partial_after_vnstock_incomplete"
     return closes, volumes, "vnstock"
 
 
@@ -980,7 +990,8 @@ def _latest_completed_vn_trading_date(now_local: datetime | None = None) -> date
         target -= timedelta(days=1)
     if is_vn_market_trading_day(today, holidays):
         session_minutes = effective_now.hour * 60 + effective_now.minute
-        if session_minutes < (14 * 60 + 45):
+        close_completion_minutes = (14 * 60 + 45) + int(settings.short_term_daily_bar_completion_grace_minutes)
+        if session_minutes < close_completion_minutes:
             target = today - timedelta(days=1)
             while not is_vn_market_trading_day(target, holidays):
                 target -= timedelta(days=1)
@@ -999,6 +1010,7 @@ def _freshness_metadata(symbol: str, exchange: str, price_source: str) -> dict[s
             "latest_trading_date": None,
             "age_calendar_days": None,
             "expected_trading_date": expected.isoformat(),
+            "daily_bar_completion_grace_minutes": int(settings.short_term_daily_bar_completion_grace_minutes),
             "age_trading_days": None,
             "is_fresh": False,
             "reason": "missing_latest_trading_date",
@@ -1017,6 +1029,7 @@ def _freshness_metadata(symbol: str, exchange: str, price_source: str) -> dict[s
         "latest_trading_date": latest.isoformat(),
         "age_calendar_days": age_days,
         "expected_trading_date": expected.isoformat(),
+        "daily_bar_completion_grace_minutes": int(settings.short_term_daily_bar_completion_grace_minutes),
         "age_trading_days": age_trading_days,
         "intraday_stale_possible": intraday_stale_possible,
         "is_fresh": is_fresh,
@@ -2631,6 +2644,7 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
         "listing_target_symbols": listing_target_symbols if listing_target_symbols is not None else scanned,
         "listing_candidates_total": len(symbol_batch),
         "listing_per_exchange_cap": listing_per_exchange_cap,
+        "scan_finished_at": datetime.now(tz=ZoneInfo(settings.short_term_scan_timezone)).isoformat(),
     }
 
 

@@ -40,3 +40,11 @@ def test_real_scan_only_scheduler_runs_one_grid_tick(monkeypatch):
     finally:
         svc._runtime_real_scan_only_enabled = False
         svc._real_scan_only_last_slot_marker = None
+
+
+def test_demo_short_term_nav_uses_shared_session_cash(monkeypatch):
+    import app.services.automation_scheduler_service as svc
+
+    monkeypatch.setattr(svc, "get_demo_session_cash_balance", lambda session_id: 37_500_000.0)
+
+    assert svc._short_term_allocated_nav_for_mode("DEMO", "demo-session") == 37_500_000.0

@@ -15,6 +15,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from app.routers.automation import router as automation_router
+from app.routers.auto_trading import router as auto_trading_router
 from app.routers.experience import router as experience_router
 from app.routers.health import router as health_router
 from app.routers.monitoring import router as monitoring_router
@@ -53,6 +54,12 @@ def _monitoring_client() -> TestClient:
 def _automation_client() -> TestClient:
     app = FastAPI()
     app.include_router(automation_router)
+    return TestClient(app)
+
+
+def _auto_trading_client() -> TestClient:
+    app = FastAPI()
+    app.include_router(auto_trading_router)
     return TestClient(app)
 
 
@@ -97,7 +104,7 @@ class TestMonitoringRouterThin:
     def test_summary_dashboard_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
             "app.routers.monitoring.build_account_monitoring_dashboard",
-            lambda mode: {"account_mode": mode, "kpis": {}},
+            lambda mode, **_kwargs: {"account_mode": mode, "kpis": {}},
         )
         monkeypatch.setattr("app.routers.monitoring.list_recent_alerts", lambda limit=30: [{"id": "1"}])
         client = _monitoring_client()
@@ -108,7 +115,7 @@ class TestMonitoringRouterThin:
     def test_summary_value_error_400(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
             "app.routers.monitoring.build_account_monitoring_dashboard",
-            lambda mode: (_ for _ in ()).throw(ValueError("invalid account mode")),
+            lambda mode, **_kwargs: (_ for _ in ()).throw(ValueError("invalid account mode")),
         )
         client = _monitoring_client()
         r = client.get("/monitoring/summary", params={"account_mode": "REAL"})
@@ -336,6 +343,33 @@ class TestAutomationRouterThin:
         monkeypatch.setattr("app.routers.automation.set_automation_scheduler_enabled", toggle2)
         r4 = client.post("/automation/scheduler/toggle", json={"account_mode": "DEMO", "enabled": True})
         assert r4.status_code == 500
+
+
+class TestAutoTradingRouterThin:
+    def test_demo_deposit_success_and_validation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "app.routers.auto_trading.deposit_demo_cash",
+            lambda session_id, amount_vnd: {
+                "session_id": session_id,
+                "amount_vnd": amount_vnd,
+                "initial_balance": 150_000_000.0,
+                "cash_balance": 120_000_000.0,
+            },
+        )
+        client = _auto_trading_client()
+        r = client.post(
+            "/auto-trading/demo/deposit",
+            headers={"X-Demo-Session-Id": "demo-1"},
+            json={"amount_vnd": 50_000_000},
+        )
+        assert r.status_code == 200
+        body = r.json()["data"]
+        assert body["session_id"] == "demo-1"
+        assert body["initial_balance"] == 150_000_000.0
+        assert body["cash_balance"] == 120_000_000.0
+
+        bad = client.post("/auto-trading/demo/deposit", json={"amount_vnd": 0})
+        assert bad.status_code == 422
 
 
 class TestTradingCoreRouterThin:

@@ -46,6 +46,12 @@ _ASYNC_RUNS: dict[str, dict[str, Any]] = {}
 _automation_claude_service = ClaudeService()
 _vnstock_api = VNStockApiService()
 _STALE_RUNNING_RUN_MINUTES = 45
+_ALLOCATION_MIN_REWARD_RISK = 1.5
+_ALLOCATION_REWARD_RISK_CAP = 3.0
+_ALLOCATION_MIN_QUALITY_SCORE = 50.0
+_ALLOCATION_EVALUATION_WEIGHT = 0.5
+_ALLOCATION_CONFIDENCE_WEIGHT = 0.3
+_ALLOCATION_RR_WEIGHT = 0.2
 
 
 def _is_scanner_universe_empty_error(exc: Exception) -> bool:
@@ -132,21 +138,299 @@ def _refine_buy_levels_with_claude(sig: dict[str, Any]) -> dict[str, Any] | None
     }
 
 
-def _buy_score(sig: dict[str, Any]) -> float:
-    score = 0.0
+def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        score = float(sig.get("confidence") or 0.0)
+        if value is None:
+            return default
+        return float(value)
     except (TypeError, ValueError):
-        score = 0.0
+        return default
+
+
+def _clamp_float(value: float, min_value: float, max_value: float) -> float:
+    return max(min_value, min(max_value, float(value)))
+
+
+def _signal_metadata(sig: dict[str, Any]) -> dict[str, Any]:
     meta = sig.get("metadata")
+    return meta if isinstance(meta, dict) else {}
+
+
+def _candidate_evaluation_score(sig: dict[str, Any]) -> float:
+    meta = _signal_metadata(sig)
+    score: float | None = None
+    sq = meta.get("signal_quality")
     if isinstance(meta, dict):
-        sq = meta.get("signal_quality")
         if isinstance(sq, dict):
-            try:
-                score = max(score, float(sq.get("composite_score_0_100") or 0.0))
-            except (TypeError, ValueError):
-                pass
-    return max(1.0, score)
+            score = _safe_float(sq.get("composite_score_0_100"), -1.0)
+    if score is None or score < 0:
+        score = _safe_float(sig.get("evaluation_score"), -1.0)
+    if score is None or score < 0:
+        score = _safe_float(sig.get("composite"), -1.0)
+    if score is None or score < 0:
+        score = _safe_float(sig.get("confidence"), 0.0)
+    return _clamp_float(score, 0.0, 100.0)
+
+
+def _candidate_confidence_score(sig: dict[str, Any]) -> float:
+    return _clamp_float(_safe_float(sig.get("confidence"), 0.0), 0.0, 100.0)
+
+
+def _candidate_reward_risk(sig: dict[str, Any]) -> float | None:
+    entry = normalize_vn_price_to_vnd(sig.get("entry_price"))
+    tp = normalize_vn_price_to_vnd(sig.get("take_profit_price"))
+    stoploss = normalize_vn_price_to_vnd(sig.get("stoploss_price"))
+    if entry <= 0 or tp <= entry or stoploss <= 0 or stoploss >= entry:
+        return None
+    risk = entry - stoploss
+    if risk <= 0:
+        return None
+    return (tp - entry) / risk
+
+
+def _rr_allocation_score(reward_risk: float) -> float:
+    capped_rr = _clamp_float(reward_risk, 0.0, _ALLOCATION_REWARD_RISK_CAP)
+    return _clamp_float((capped_rr / _ALLOCATION_REWARD_RISK_CAP) * 100.0, 0.0, 100.0)
+
+
+def _experience_allocation_adjustment(sig: dict[str, Any]) -> dict[str, Any]:
+    meta = _signal_metadata(sig)
+    exp_meta = meta.get("experience_scoring_adjustment")
+    cooldown_meta = meta.get("experience_buy_cooldown")
+    exp = exp_meta if isinstance(exp_meta, dict) else {}
+    cooldown = cooldown_meta if isinstance(cooldown_meta, dict) else {}
+    score_adjustment = _clamp_float(_safe_float(exp.get("confidence_adjustment"), 0.0), -25.0, 15.0)
+    cooldown_active = bool(cooldown.get("cooldown_active"))
+
+    if cooldown_active:
+        cap_multiplier = 0.0
+        cap_reason = "experience_cooldown"
+    elif score_adjustment <= -12.0:
+        cap_multiplier = 0.4
+        cap_reason = "experience_stoploss_heavy"
+    elif score_adjustment <= -8.0:
+        cap_multiplier = 0.55
+        cap_reason = "experience_loss_heavy"
+    elif score_adjustment <= -4.0:
+        cap_multiplier = 0.7
+        cap_reason = "experience_negative"
+    elif score_adjustment < 0.0:
+        cap_multiplier = 0.85
+        cap_reason = "experience_slightly_negative"
+    elif score_adjustment >= 6.0:
+        cap_multiplier = 1.25
+        cap_reason = "experience_strong_positive"
+    elif score_adjustment >= 3.0:
+        cap_multiplier = 1.15
+        cap_reason = "experience_positive"
+    else:
+        cap_multiplier = 1.0
+        cap_reason = "experience_neutral"
+
+    return {
+        "score_adjustment": round(score_adjustment, 4),
+        "symbol_cap_multiplier": round(cap_multiplier, 4),
+        "cap_reason": cap_reason,
+        "experience": exp,
+        "cooldown": cooldown,
+    }
+
+
+def _candidate_quality(sig: dict[str, Any]) -> dict[str, Any]:
+    reward_risk = _candidate_reward_risk(sig)
+    evaluation = _candidate_evaluation_score(sig)
+    confidence = _candidate_confidence_score(sig)
+    exp = _experience_allocation_adjustment(sig)
+    adjusted_evaluation = _clamp_float(evaluation + float(exp["score_adjustment"]), 0.0, 100.0)
+    rr_score = _rr_allocation_score(float(reward_risk or 0.0))
+    quality = (
+        _ALLOCATION_EVALUATION_WEIGHT * adjusted_evaluation
+        + _ALLOCATION_CONFIDENCE_WEIGHT * confidence
+        + _ALLOCATION_RR_WEIGHT * rr_score
+    )
+    return {
+        "evaluation_score": round(evaluation, 4),
+        "adjusted_evaluation_score": round(adjusted_evaluation, 4),
+        "confidence_score": round(confidence, 4),
+        "reward_risk": round(float(reward_risk), 4) if reward_risk is not None else None,
+        "rr_score": round(rr_score, 4),
+        "quality_score": round(_clamp_float(quality, 0.0, 100.0), 4),
+        "experience_adjustment": exp,
+    }
+
+
+def _floor_lot_quantity_for_budget(budget: float, entry: float, lot_size: int) -> int:
+    if budget <= 0 or entry <= 0:
+        return 0
+    return int((float(budget) / float(entry)) // int(lot_size)) * int(lot_size)
+
+
+def _build_score_weighted_allocation_plan(
+    buy_rows: list[dict[str, Any]],
+    nav_total: float,
+    *,
+    lot_size: int = 100,
+) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, Any]]:
+    lot = max(1, int(lot_size))
+    total_nav = max(0.0, float(nav_total))
+    allocations: dict[str, int] = {}
+    if total_nav <= 0 or not buy_rows:
+        return [], allocations, {"source": "score_weighted_deterministic", "selected": 0, "allocation_plan": []}
+
+    base_symbol_cap_pct = _clamp_float(float(settings.strategy_max_symbol_exposure_pct), 0.01, 1.0)
+    candidates: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    row_by_id: dict[str, dict[str, Any]] = {}
+
+    for sig in buy_rows:
+        sid = str(sig.get("id") or "").strip()
+        symbol = str(sig.get("symbol") or "").strip().upper()
+        entry = normalize_vn_price_to_vnd(sig.get("entry_price"))
+        if sid:
+            row_by_id[sid] = dict(sig)
+            allocations.setdefault(sid, 0)
+        if not sid or not symbol or entry <= 0:
+            skipped.append({"signal_id": sid, "symbol": symbol, "reason": "invalid_candidate_identity_or_entry"})
+            continue
+
+        quality = _candidate_quality(sig)
+        rr = quality.get("reward_risk")
+        if rr is None or float(rr) < _ALLOCATION_MIN_REWARD_RISK:
+            skipped.append(
+                {
+                    "signal_id": sid,
+                    "symbol": symbol,
+                    "reason": "reward_risk_below_min",
+                    **quality,
+                }
+            )
+            continue
+        if float(quality["quality_score"]) < _ALLOCATION_MIN_QUALITY_SCORE:
+            skipped.append(
+                {
+                    "signal_id": sid,
+                    "symbol": symbol,
+                    "reason": "quality_below_min",
+                    "min_quality_score": _ALLOCATION_MIN_QUALITY_SCORE,
+                    **quality,
+                }
+            )
+            continue
+
+        exp_adj = quality["experience_adjustment"]
+        cap_multiplier = float(exp_adj.get("symbol_cap_multiplier") or 0.0)
+        if cap_multiplier <= 0:
+            skipped.append(
+                {
+                    "signal_id": sid,
+                    "symbol": symbol,
+                    "reason": exp_adj.get("cap_reason") or "symbol_cap_zero",
+                    **quality,
+                }
+            )
+            continue
+
+        raw_cap_notional = total_nav * base_symbol_cap_pct * cap_multiplier
+        lot_notional = float(entry) * float(lot)
+        cap_notional = max(raw_cap_notional, lot_notional) if total_nav >= lot_notional else raw_cap_notional
+        max_qty_by_cap = _floor_lot_quantity_for_budget(cap_notional, entry, lot)
+        if max_qty_by_cap < lot:
+            skipped.append(
+                {
+                    "signal_id": sid,
+                    "symbol": symbol,
+                    "reason": "symbol_cap_below_board_lot",
+                    "entry_price": entry,
+                    "symbol_cap_notional": round(cap_notional, 4),
+                    **quality,
+                }
+            )
+            continue
+
+        candidates.append(
+            {
+                "signal_id": sid,
+                "symbol": symbol,
+                "entry_price": entry,
+                "quality_score": float(quality["quality_score"]),
+                "symbol_cap_pct": round(base_symbol_cap_pct * cap_multiplier, 6),
+                "symbol_cap_notional": float(cap_notional),
+                "max_qty_by_cap": int(max_qty_by_cap),
+                **quality,
+            }
+        )
+
+    candidates.sort(key=lambda row: (float(row["quality_score"]), float(row.get("reward_risk") or 0.0)), reverse=True)
+    quality_sum = sum(float(row["quality_score"]) for row in candidates)
+    spent = 0.0
+    if quality_sum > 0:
+        for cand in candidates:
+            sid = str(cand["signal_id"])
+            entry = float(cand["entry_price"])
+            target_budget = total_nav * (float(cand["quality_score"]) / quality_sum)
+            budget = min(target_budget, float(cand["symbol_cap_notional"]), max(0.0, total_nav - spent))
+            qty = _floor_lot_quantity_for_budget(budget, entry, lot)
+            qty = min(qty, int(cand["max_qty_by_cap"]))
+            allocations[sid] = max(0, qty)
+            spent += float(allocations[sid]) * entry
+
+    remaining_nav = max(0.0, total_nav - spent)
+    added = True
+    while added:
+        added = False
+        for cand in candidates:
+            sid = str(cand["signal_id"])
+            entry = float(cand["entry_price"])
+            current_qty = int(allocations.get(sid, 0))
+            if current_qty + lot > int(cand["max_qty_by_cap"]):
+                continue
+            lot_notional = entry * float(lot)
+            if remaining_nav < lot_notional:
+                continue
+            allocations[sid] = current_qty + lot
+            remaining_nav = max(0.0, remaining_nav - lot_notional)
+            added = True
+
+    allocation_rows: list[dict[str, Any]] = []
+    selected_rows: list[dict[str, Any]] = []
+    for cand in candidates:
+        sid = str(cand["signal_id"])
+        qty = int(allocations.get(sid, 0))
+        notional = qty * float(cand["entry_price"])
+        cap_notional = float(cand["symbol_cap_notional"])
+        cap_limited = qty >= int(cand["max_qty_by_cap"])
+        row_meta = {
+            **cand,
+            "planned_quantity": qty,
+            "planned_notional": round(notional, 4),
+            "cap_limited": bool(cap_limited),
+            "cap_reason": cand["experience_adjustment"].get("cap_reason"),
+        }
+        allocation_rows.append(row_meta)
+        if qty >= lot:
+            selected_rows.append(row_by_id[sid])
+
+    allocation_rows.extend(skipped)
+    spent = sum(float(allocations.get(str(c.get("signal_id")), 0)) * float(c.get("entry_price") or 0.0) for c in candidates)
+    meta = {
+        "source": "score_weighted_deterministic",
+        "selected": len(selected_rows),
+        "eligible": len(candidates),
+        "skipped": len(skipped),
+        "strategy_remaining_cash": float(total_nav),
+        "base_symbol_cap_pct": round(base_symbol_cap_pct, 6),
+        "min_quality_score": _ALLOCATION_MIN_QUALITY_SCORE,
+        "min_reward_risk": _ALLOCATION_MIN_REWARD_RISK,
+        "reward_risk_cap": _ALLOCATION_REWARD_RISK_CAP,
+        "weights": {
+            "evaluation": _ALLOCATION_EVALUATION_WEIGHT,
+            "confidence": _ALLOCATION_CONFIDENCE_WEIGHT,
+            "reward_risk": _ALLOCATION_RR_WEIGHT,
+        },
+        "planned_spent_by_allocator": round(spent, 2),
+        "allocation_plan": allocation_rows,
+    }
+    return selected_rows, allocations, meta
 
 
 def _allocate_quantities_by_score(
@@ -155,194 +439,25 @@ def _allocate_quantities_by_score(
     *,
     lot_size: int = 100,
 ) -> dict[str, int]:
-    lot = max(1, int(lot_size))
-    total_nav = max(0.0, float(nav_total))
-    if total_nav <= 0 or not buy_rows:
-        return {}
-    scored: list[tuple[str, float, float]] = []
-    for sig in buy_rows:
-        sid = str(sig.get("id") or "").strip()
-        entry = normalize_vn_price_to_vnd(sig.get("entry_price"))
-        if not sid or entry <= 0:
-            continue
-        scored.append((sid, entry, _buy_score(sig)))
-    if not scored:
-        return {}
-    sum_score = sum(s for _sid, _entry, s in scored) or float(len(scored))
-    allocations: dict[str, int] = {}
-    remaining_nav = total_nav
-    for idx, (sid, entry, score) in enumerate(scored):
-        if remaining_nav < entry * lot:
-            allocations[sid] = 0
-            continue
-        if idx == len(scored) - 1:
-            budget = remaining_nav
-        else:
-            budget = total_nav * (score / sum_score)
-            budget = min(budget, remaining_nav)
-        raw_qty = int(budget / entry)
-        qty = (raw_qty // lot) * lot
-        if qty <= 0 and remaining_nav >= entry * lot:
-            qty = lot
-        notional = float(qty) * entry
-        if notional > remaining_nav and entry > 0:
-            qty = int((remaining_nav / entry) // lot) * lot
-            notional = float(qty) * entry
-        allocations[sid] = max(0, int(qty))
-        remaining_nav = max(0.0, remaining_nav - notional)
+    _selected_rows, allocations, _meta = _build_score_weighted_allocation_plan(
+        buy_rows,
+        nav_total,
+        lot_size=lot_size,
+    )
     return allocations
 
 
-def _build_claude_buy_decision_prompt(
-    *,
-    buy_rows: list[dict[str, Any]],
-    strategy_remaining_cash: float,
-    lot_size: int = 100,
-) -> str:
-    compact_rows: list[dict[str, Any]] = []
-    for row in buy_rows:
-        compact_rows.append(
-            {
-                "signal_id": str(row.get("id") or "").strip(),
-                "symbol": str(row.get("symbol") or "").strip().upper(),
-                "entry_price": float(row.get("entry_price") or 0.0),
-                "take_profit_price": normalize_vn_price_to_vnd(row.get("take_profit_price")),
-                "stoploss_price": normalize_vn_price_to_vnd(row.get("stoploss_price")),
-                "confidence": float(row.get("confidence") or 0.0),
-                "metadata": row.get("metadata") if isinstance(row.get("metadata"), dict) else {},
-            }
-        )
-    payload = {
-        "strategy_remaining_cash": float(strategy_remaining_cash),
-        "lot_size": int(max(1, lot_size)),
-        "candidates": compact_rows,
-    }
-    return (
-        "You are a VN equities short-term trading decision engine.\n"
-        "Return only valid JSON with this exact schema:\n"
-        "{\n"
-        '  "items": [\n'
-        "    {\n"
-        '      "signal_id": "string",\n'
-        '      "symbol": "string",\n'
-        '      "quantity": 0,\n'
-        '      "entry_price": 0,\n'
-        '      "take_profit_price": 0,\n'
-        '      "stoploss_price": 0,\n'
-        '      "reason": "string"\n'
-        "    }\n"
-        "  ]\n"
-        "}\n"
-        "Hard constraints:\n"
-        "- Total notional (sum(quantity * entry_price)) must be <= strategy_remaining_cash.\n"
-        "- quantity must be multiple of lot_size and >= 0.\n"
-        "- stoploss_price < entry_price <= take_profit_price.\n"
-        "- Select only symbols from candidates.\n"
-        "- Prefer higher quality setups and avoid over-concentration.\n"
-        f"Input: {json.dumps(payload, ensure_ascii=True)}"
-    )
-
-
-def _apply_claude_buy_decision(
+def _apply_score_weighted_buy_decision(
     *,
     buy_rows: list[dict[str, Any]],
     strategy_remaining_cash: float,
     lot_size: int = 100,
 ) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, Any]]:
-    if not buy_rows:
-        return [], {}, {"source": "none", "selected": 0}
-
-    safe_lot = max(1, int(lot_size))
-    fallback_qty = _allocate_quantities_by_score(buy_rows, float(strategy_remaining_cash), lot_size=safe_lot)
-    fallback_rows = [dict(row) for row in buy_rows]
-    if not settings.use_claude:
-        return fallback_rows, fallback_qty, {
-            "source": "score_weighted_fallback",
-            "selected": len(fallback_rows),
-            "strategy_remaining_cash": float(strategy_remaining_cash),
-            "fallback_reason": "claude_disabled",
-        }
-
-    prompt = _build_claude_buy_decision_prompt(
+    return _build_score_weighted_allocation_plan(
         buy_rows=buy_rows,
-        strategy_remaining_cash=float(strategy_remaining_cash),
-        lot_size=safe_lot,
+        nav_total=float(strategy_remaining_cash),
+        lot_size=max(1, int(lot_size)),
     )
-    try:
-        raw = _automation_claude_service.generate_text_with_resilience(
-            prompt=prompt,
-            system_prompt="Return strict JSON only. No markdown or prose.",
-            model=settings.claude_model,
-            max_tokens=1200,
-            temperature=0.1,
-            cache_namespace="short-term-buy-decision",
-            cache_ttl_seconds=120,
-        )
-        parsed = _extract_json_object(raw)
-        if not isinstance(parsed, dict):
-            raise ValueError("claude_buy_decision_invalid_json")
-        raw_items = parsed.get("items")
-        if not isinstance(raw_items, list):
-            raise ValueError("claude_buy_decision_items_missing")
-
-        row_by_signal_id: dict[str, dict[str, Any]] = {
-            str(row.get("id") or "").strip(): dict(row)
-            for row in buy_rows
-            if str(row.get("id") or "").strip()
-        }
-        planned_qty_by_signal_id: dict[str, int] = {}
-        selected_rows: list[dict[str, Any]] = []
-        spent = 0.0
-
-        for item in raw_items:
-            if not isinstance(item, dict):
-                continue
-            signal_id = str(item.get("signal_id") or "").strip()
-            symbol = str(item.get("symbol") or "").strip().upper()
-            base_row = row_by_signal_id.get(signal_id)
-            if base_row is None:
-                continue
-            if symbol and symbol != str(base_row.get("symbol") or "").strip().upper():
-                continue
-            try:
-                qty = int(item.get("quantity") or 0)
-                entry = normalize_vn_price_to_vnd(item.get("entry_price") or base_row.get("entry_price") or 0.0)
-                tp = normalize_vn_price_to_vnd(item.get("take_profit_price") or base_row.get("take_profit_price") or 0.0)
-                sl = normalize_vn_price_to_vnd(item.get("stoploss_price") or base_row.get("stoploss_price") or 0.0)
-            except (TypeError, ValueError):
-                continue
-            if entry <= 0 or sl <= 0 or sl >= entry or tp < entry:
-                continue
-            qty = max(0, (qty // safe_lot) * safe_lot)
-            if qty <= 0:
-                continue
-            next_spent = spent + float(qty) * entry
-            if next_spent > float(strategy_remaining_cash):
-                continue
-            spent = next_spent
-            row = dict(base_row)
-            row["entry_price"] = entry
-            row["take_profit_price"] = tp
-            row["stoploss_price"] = sl
-            row["claude_decision_reason"] = str(item.get("reason") or "").strip()
-            selected_rows.append(row)
-            planned_qty_by_signal_id[signal_id] = qty
-
-        if selected_rows:
-            return selected_rows, planned_qty_by_signal_id, {
-                "source": "claude",
-                "selected": len(selected_rows),
-                "spent": round(spent, 2),
-                "strategy_remaining_cash": float(strategy_remaining_cash),
-            }
-    except Exception as exc:
-        logger.warning("short_term_claude_buy_decision_failed", extra={"error": str(exc)})
-
-    return fallback_rows, fallback_qty, {
-        "source": "score_weighted_fallback",
-        "selected": len(fallback_rows),
-        "strategy_remaining_cash": float(strategy_remaining_cash),
-    }
 
 
 def _call_with_thread_timeout(
@@ -1429,6 +1544,27 @@ def _run_scan_with_timeout_fallback(
         raise
 
 
+def run_short_term_scan_batch_resilient(
+    *,
+    limit_symbols: int = 0,
+    exchange_scope: str = "ALL",
+    timeout_seconds: int | None = None,
+    fallback_timeout_seconds: int | None = None,
+    run_id: UUID | None = None,
+) -> dict[str, Any]:
+    """
+    Public scanner entrypoint with the same timeout and light-fallback behavior
+    used by production automation.
+    """
+    return _run_scan_with_timeout_fallback(
+        run_id=run_id or uuid4(),
+        limit_symbols=int(limit_symbols),
+        exchange_scope=str(exchange_scope).upper(),
+        timeout_seconds=timeout_seconds,
+        fallback_timeout_seconds=fallback_timeout_seconds,
+    )
+
+
 def ensure_short_term_automation_runs_table() -> None:
     """Aligns runtime with migration `005_create_short_term_automation_runs.sql`."""
     ddl = """
@@ -2051,7 +2187,7 @@ def run_short_term_production_cycle(
                 buy_rows_decided, planned_qty_by_signal_id, decision_meta = _call_with_thread_timeout(
                     name=f"short-term-buy-decision-{normalized_account_mode.lower()}",
                     timeout_seconds=buy_step_timeout_seconds,
-                    fn=lambda: _apply_claude_buy_decision(
+                    fn=lambda: _apply_score_weighted_buy_decision(
                         buy_rows=buy_rows_filtered,
                         strategy_remaining_cash=strategy_remaining_cash,
                         lot_size=100,
@@ -2065,13 +2201,13 @@ def run_short_term_production_cycle(
                 )
                 buy_rows_decided = [dict(row) for row in buy_rows_filtered]
                 decision_meta = {
-                    "source": "score_weighted_fallback",
+                    "source": "score_weighted_deterministic",
                     "selected": len(buy_rows_decided),
                     "strategy_remaining_cash": strategy_remaining_cash,
-                    "fallback_reason": f"claude_buy_decision_timeout:{buy_step_timeout_seconds}s",
+                    "fallback_reason": f"score_weighted_decision_timeout:{buy_step_timeout_seconds}s",
                 }
                 logger.warning(
-                    "short_term_claude_buy_decision_timeout",
+                    "short_term_buy_decision_timeout",
                     extra={"run_id": str(run_id), "timeout_seconds": buy_step_timeout_seconds},
                 )
             except Exception as exc:
@@ -2082,12 +2218,17 @@ def run_short_term_production_cycle(
                 )
                 buy_rows_decided = [dict(row) for row in buy_rows_filtered]
                 decision_meta = {
-                    "source": "score_weighted_fallback",
+                    "source": "score_weighted_deterministic",
                     "selected": len(buy_rows_decided),
                     "strategy_remaining_cash": strategy_remaining_cash,
                     "fallback_reason": str(exc),
                 }
                 logger.warning("short_term_buy_decision_failed", extra={"run_id": str(run_id), "error": str(exc)})
+            allocation_plan_by_signal_id = {
+                str(item.get("signal_id") or "").strip(): item
+                for item in (decision_meta.get("allocation_plan") if isinstance(decision_meta, dict) else []) or []
+                if isinstance(item, dict) and str(item.get("signal_id") or "").strip()
+            }
             buy_rows: list[dict[str, Any]] = []
             for row in buy_rows_decided:
                 sid = str(row.get("id") or "")
@@ -2095,14 +2236,16 @@ def run_short_term_production_cycle(
                 entry_price = normalize_vn_price_to_vnd(row.get("entry_price"))
                 planned_qty = int(planned_qty_by_signal_id.get(sid, 0))
                 if entry_price <= 0 or planned_qty < 100:
+                    allocation_detail = allocation_plan_by_signal_id.get(sid) or {}
                     executions_detail.append(
                         {
                             "symbol": symbol,
                             "side": "BUY",
                             "outcome": "skipped",
-                            "reason": "insufficient_cash_for_lot100",
+                            "reason": allocation_detail.get("reason") or "insufficient_cash_for_lot100",
                             "entry_price": entry_price,
                             "planned_quantity": planned_qty,
+                            "allocation_detail": allocation_detail,
                         }
                     )
                     continue
@@ -2217,6 +2360,9 @@ def run_short_term_production_cycle(
                     detail_row = one.get("detail")
                     if isinstance(detail_row, dict):
                         detail_row["remaining_cash_after_order"] = round(float(remaining_cash_runtime), 6)
+                        allocation_detail = allocation_plan_by_signal_id.get(str(sig.get("id") or ""))
+                        if allocation_detail:
+                            detail_row["allocation_detail"] = allocation_detail
                         executions_detail.append(detail_row)
                     else:
                         executions_detail.append({"symbol": symbol, "outcome": "error", "error": "invalid_result"})
@@ -2261,7 +2407,7 @@ def run_short_term_production_cycle(
                 "skipped_insufficient_data": int(batch.get("skipped_insufficient_data") or 0),
                 "scan_mode": str(batch.get("scan_mode") or "full"),
                 "executions": executions_detail,
-                "allocation_method": "claude_decision_with_score_fallback",
+                "allocation_method": "score_weighted_deterministic",
                 "allocation_nav_total": float(nav),
                 "remaining_cash_after_cycle": round(float(remaining_cash_runtime), 6),
                 "buy_decision_meta": decision_meta_enriched,

@@ -1,7 +1,44 @@
 from __future__ import annotations
 
+import pytest
+
 from app.services import real_recommendation_service as service
 from app.services.real_recommendation_service import preflight_real_recommendations
+
+
+@pytest.fixture(autouse=True)
+def _mock_real_preflight_db_snapshots(monkeypatch) -> None:
+    monkeypatch.setattr(
+        service,
+        "get_real_t2_settlement_pressure",
+        lambda: {
+            "available": True,
+            "market_rule": "VN_T_PLUS_2",
+            "total_pending_qty": 0,
+            "total_pending_notional": 0.0,
+            "next_settle_date": None,
+            "by_symbol": {},
+        },
+    )
+    monkeypatch.setattr(
+        service,
+        "get_real_account_preflight_context",
+        lambda cash_base: {
+            "available": True,
+            "source": "test",
+            "cash_base": float(cash_base),
+            "daily_new_orders": 0,
+            "orders_today": 0,
+            "open_orders": 0,
+            "open_buy_orders": 0,
+            "max_daily_new_orders": int(service.settings.strategy_max_daily_new_orders),
+            "open_buy_symbols": [],
+            "symbol_exposure": {},
+            "sector_exposure": {},
+            "max_symbol_exposure_pct": float(service.settings.strategy_max_symbol_exposure_pct),
+            "max_sector_exposure_pct": float(service.settings.strategy_max_sector_exposure_pct),
+        },
+    )
 
 
 def test_preflight_real_recommendations_rejects_low_reward_risk() -> None:
@@ -9,9 +46,9 @@ def test_preflight_real_recommendations_rejects_low_reward_risk() -> None:
         [
             {
                 "symbol": "AAA",
-                "entry": 100.0,
-                "take_profit": 104.0,
-                "stop_loss": 97.0,
+                "entry": 50.0,
+                "take_profit": 52.0,
+                "stop_loss": 48.0,
                 "confidence": 70,
                 "reason": "fixture",
             }
@@ -30,9 +67,9 @@ def test_preflight_real_recommendations_marks_buyable_and_sizes_board_lot() -> N
         [
             {
                 "symbol": "AAA",
-                "entry": 100.0,
-                "take_profit": 108.0,
-                "stop_loss": 96.0,
+                "entry": 50.0,
+                "take_profit": 60.0,
+                "stop_loss": 48.0,
                 "confidence": 70,
                 "reason": "fixture",
             }
@@ -52,9 +89,9 @@ def test_preflight_real_recommendations_rejects_stale_data() -> None:
         [
             {
                 "symbol": "AAA",
-                "entry": 100.0,
-                "take_profit": 108.0,
-                "stop_loss": 96.0,
+                "entry": 50.0,
+                "take_profit": 60.0,
+                "stop_loss": 48.0,
                 "confidence": 70,
                 "reason": "fixture",
                 "freshness": {"is_fresh": False, "latest_trading_date": "2026-01-01"},
@@ -86,9 +123,9 @@ def test_preflight_real_recommendations_rejects_high_t2_pressure(monkeypatch) ->
         [
             {
                 "symbol": "AAA",
-                "entry": 100.0,
-                "take_profit": 108.0,
-                "stop_loss": 96.0,
+                "entry": 50.0,
+                "take_profit": 60.0,
+                "stop_loss": 48.0,
                 "confidence": 70,
                 "reason": "fixture",
             }
@@ -128,9 +165,9 @@ def test_preflight_real_recommendations_rejects_same_symbol_pending_t2(monkeypat
         [
             {
                 "symbol": "AAA",
-                "entry": 100.0,
-                "take_profit": 108.0,
-                "stop_loss": 96.0,
+                "entry": 50.0,
+                "take_profit": 60.0,
+                "stop_loss": 48.0,
                 "confidence": 70,
                 "reason": "fixture",
                 "setup_type": "BREAKOUT",
@@ -143,3 +180,44 @@ def test_preflight_real_recommendations_rejects_same_symbol_pending_t2(monkeypat
     assert rejected[0]["risk_status"] == "REJECTED"
     assert rejected[0]["risk_reason"] == "same_symbol_pending_t2"
     assert rejected[0]["settlement_pressure"]["symbol_pending_qty"] == 2_000
+
+
+def test_preflight_real_recommendations_marks_unknown_cash_when_dnse_cash_unavailable(monkeypatch) -> None:
+    monkeypatch.setattr(
+        service,
+        "get_real_cash_snapshot",
+        lambda: {"available": False, "source": "config_cash", "reason": "dnse_balance_unavailable", "cash": None},
+    )
+
+    buyable, rejected = preflight_real_recommendations(
+        [
+            {
+                "symbol": "AAA",
+                "entry": 50.0,
+                "take_profit": 60.0,
+                "stop_loss": 48.0,
+                "confidence": 70,
+                "reason": "fixture",
+            }
+        ],
+        settlement_pressure={
+            "available": True,
+            "total_pending_qty": 0,
+            "total_pending_notional": 0.0,
+            "by_symbol": {},
+        },
+        account_context={
+            "available": True,
+            "cash_base": 100_000_000.0,
+            "daily_new_orders": 0,
+            "max_daily_new_orders": 10,
+            "open_buy_symbols": [],
+            "symbol_exposure": {},
+            "sector_exposure": {},
+        },
+    )
+
+    assert buyable == []
+    assert rejected[0]["risk_status"] == "PREFLIGHT_UNKNOWN_CASH"
+    assert rejected[0]["risk_reason"] == "cash_snapshot_unavailable"
+    assert rejected[0]["suggested_quantity"] == 0

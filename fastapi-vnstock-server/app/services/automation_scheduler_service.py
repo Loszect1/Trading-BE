@@ -14,10 +14,8 @@ from app.core.config import get_vn_market_holiday_dates, settings
 from app.services.alert_dispatcher_service import dispatch_alert_to_channels
 from app.services.demo_trading_service import (
     get_demo_session_cash_balance,
-    get_demo_strategy_remaining_cash,
     run_demo_auto_exit_cycle,
 )
-from app.services.mail_signal_scheduler_service import run_mail_signal_pipeline
 from app.services.short_term_automation_service import run_short_term_production_cycle
 from app.services.short_term_automation_service import mark_stale_short_term_running_runs
 from app.services.short_term_scan_schedule import (
@@ -26,19 +24,12 @@ from app.services.short_term_scan_schedule import (
 )
 from app.services.redis_cache import RedisCacheService
 from app.services.signal_engine_service import (
-    extract_short_term_scan_diagnostics,
-    run_short_term_scan_batch,
-    run_short_term_scan_batch_light,
     refresh_short_term_liquidity_cache_from_db,
     scan_and_persist_symbol_news_from_liquidity_cache,
     warm_daily_volume_for_saved_symbols,
     warm_short_term_liquidity_cache,
 )
-from app.services.real_recommendation_service import (
-    build_recommendation_from_signal,
-    normalize_real_recommendation_rows,
-    preflight_real_recommendations,
-)
+from app.services.real_recommendation_scan_service import run_real_recommendations_scan
 
 logger = logging.getLogger(__name__)
 
@@ -58,9 +49,6 @@ _POST_CLOSE_REFRESH_LOCK_KEY = "lock:short-term:post-close-refresh"
 _POST_CLOSE_REFRESH_LOCK_TTL_SECONDS = 1800
 
 # REAL scan-only scheduler persistence + execution.
-_REAL_RECOMMENDATIONS_REDIS_KEY = "signals:real:short-term:recommendations:latest"
-_REAL_RECOMMENDATIONS_REDIS_LOG_PREFIX = "signals:real:short-term:recommendations:run:"
-_REAL_RECOMMENDATIONS_TTL_SECONDS = 86_400
 _real_scan_only_loop_task: asyncio.Task | None = None
 _real_scan_only_last_slot_marker: str | None = None
 _runtime_real_scan_only_enabled: bool = False
@@ -84,18 +72,9 @@ def _to_float(value: Any) -> float | None:
         return None
 
 
-def _normalize_real_recommendation_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return normalize_real_recommendation_rows(rows)
-
-
 def _real_scan_only_slot_marker(now_local: datetime) -> str:
     # Unique per VN slot grid boundary.
     return f"{now_local.date().isoformat()}-{now_local.hour:02d}:{now_local.minute:02d}"
-
-
-def _real_recommendations_run_key(now_local: datetime | None = None) -> str:
-    ts = now_local or datetime.now(tz=ZoneInfo(settings.short_term_scan_timezone))
-    return f"{_REAL_RECOMMENDATIONS_REDIS_LOG_PREFIX}{ts.strftime('%Y%m%d-%H%M%S')}"
 
 
 def _is_vn_market_open(now_local: datetime) -> bool:
@@ -179,69 +158,21 @@ async def _stop_demo_auto_exit_scheduler() -> None:
     logger.warning("demo_auto_exit_scheduler_task_stopped")
 
 
-def _run_real_scan_only_and_persist() -> None:
-    mail_recommendations: list[dict[str, Any]] = []
-    try:
-        mail_out = run_mail_signal_pipeline()
-        raw_mail_items = mail_out.get("items") if isinstance(mail_out, dict) else []
-        if isinstance(raw_mail_items, list):
-            mail_recommendations = _normalize_real_recommendation_rows(raw_mail_items)
-        logger.warning(
-            "real_scan_only_mail_pipeline_completed",
-            extra={
-                "mail_success": bool(mail_out.get("success")),
-                "mail_count": int(mail_out.get("mail_count") or 0),
-                "items": len(mail_out.get("items") or []) if isinstance(mail_out.get("items"), list) else 0,
-            },
-        )
-    except Exception as exc:
-        logger.warning(
-            "real_scan_only_mail_pipeline_failed",
-            extra={"error": str(exc)},
-        )
-
-    try:
-        scan_result = run_short_term_scan_batch(limit_symbols=0, exchange_scope="ALL")
-    except Exception as exc:
-        fallback_cap = int(settings.automation_short_term_scan_fallback_light_max_symbols)
-        logger.warning(
-            "real_scan_only_full_scan_failed_fallback_light",
-            extra={
-                "error": str(exc),
-                "fallback_limit_symbols": fallback_cap,
-            },
-        )
-        scan_result = run_short_term_scan_batch_light(limit_symbols=fallback_cap, exchange_scope="ALL")
-    raw_signals = scan_result.get("signals") or []
-    raw_recommendations: list[dict[str, Any]] = []
-    for signal in raw_signals:
-        if not isinstance(signal, dict) or str(signal.get("action") or "").upper() != "BUY":
-            continue
-        raw_recommendations.append(build_recommendation_from_signal(signal))
-
-    normalized, rejected_recommendations = preflight_real_recommendations(raw_recommendations)
-    payload = {
-        "generated_at": scan_result.get("scan_finished_at"),
-        "exchange_scope": "ALL",
-        "limit_symbols": 0,
-        "scanned": int(scan_result.get("scanned") or 0),
-        "recommendations": normalized,
-        "count": len(normalized),
-        "short_term_recommendations": normalized,
-        "short_term_count": len(normalized),
-        "all_short_term_recommendations": normalized + rejected_recommendations,
-        "rejected_recommendations": rejected_recommendations,
-        "rejected_count": len(rejected_recommendations),
-        "mail_signal_recommendations": mail_recommendations,
-        "mail_signal_count": len(mail_recommendations),
-        "scan_diagnostics": extract_short_term_scan_diagnostics(scan_result),
-    }
-    _redis_cache.set_json(_REAL_RECOMMENDATIONS_REDIS_KEY, payload, ttl_seconds=_REAL_RECOMMENDATIONS_TTL_SECONDS)
-    _redis_cache.set_json(
-        _real_recommendations_run_key(),
-        payload,
-        ttl_seconds=_REAL_RECOMMENDATIONS_TTL_SECONDS,
+def _run_real_scan_only_and_persist(slot_marker: str | None = None) -> dict[str, Any]:
+    payload = run_real_recommendations_scan(
+        exchange_scope="ALL",
+        limit_symbols=0,
+        slot_marker=slot_marker,
+        source="scheduler",
     )
+    return {
+        "generated_at": payload.get("generated_at"),
+        "scanned": payload.get("scanned"),
+        "short_term_count": payload.get("short_term_count"),
+        "rejected_count": payload.get("rejected_count"),
+        "watch_count": payload.get("watch_count"),
+        "mail_signal_count": payload.get("mail_signal_count"),
+    }
 
 
 def _is_backend_scheduler_supported(account_mode: AccountMode) -> bool:
@@ -257,13 +188,9 @@ def _short_term_allocated_nav() -> float:
 
 def _short_term_allocated_nav_for_mode(account_mode: AccountMode, demo_session_id: str | None) -> float:
     if str(account_mode).upper() == "DEMO":
-        cash = get_demo_strategy_remaining_cash(str(demo_session_id or ""), "SHORT_TERM")
-        if cash > 0:
-            return max(1_000_000.0, cash)
         cash = get_demo_session_cash_balance(demo_session_id)
         if cash is not None and cash > 0:
-            alloc = cash * float(settings.strategy_alloc_short_term_pct)
-            return max(1_000_000.0, alloc)
+            return max(1_000_000.0, cash)
     return _short_term_allocated_nav()
 
 
@@ -901,9 +828,10 @@ async def _real_scan_only_scheduler_loop() -> None:
                 if isinstance(now_local, datetime):
                     marker = _real_scan_only_slot_marker(now_local)
                     if marker != _real_scan_only_last_slot_marker:
-                        await asyncio.to_thread(_run_real_scan_only_and_persist)
+                        _log_task_state("real_scan_only_scheduler", "RUNNING", marker=marker)
+                        summary = await asyncio.to_thread(_run_real_scan_only_and_persist, marker)
                         _real_scan_only_last_slot_marker = marker
-                        _log_task_state("real_scan_only_scheduler", "FINISHED", marker=marker)
+                        _log_task_state("real_scan_only_scheduler", "FINISHED", marker=marker, **summary)
         except Exception as exc:
             _log_task_state("real_scan_only_scheduler", "FAILED", error=str(exc))
             logger.warning(

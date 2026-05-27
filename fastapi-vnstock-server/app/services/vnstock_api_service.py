@@ -6,8 +6,9 @@ import json
 import math
 import threading
 import time
+from collections import deque
 from hashlib import sha256
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import pandas as pd
 from tenacity import RetryError
@@ -37,8 +38,7 @@ class VNStockApiService:
         self._api_key_registered = False
         self._cache = RedisCacheService()
         self._throttle_lock = threading.Lock()
-        self._request_window_started = time.monotonic()
-        self._request_count_in_window = 0
+        self._request_timestamps: deque[float] = deque()
 
     def _throttle_before_call(self) -> None:
         """
@@ -50,16 +50,22 @@ class VNStockApiService:
             sleep_seconds = 0.0
             with self._throttle_lock:
                 now = time.monotonic()
-                elapsed = now - self._request_window_started
-                if elapsed >= 60.0:
-                    self._request_window_started = now
-                    self._request_count_in_window = 0
-                    elapsed = 0.0
-                if self._request_count_in_window < max_per_minute:
-                    self._request_count_in_window += 1
+                while self._request_timestamps and now - self._request_timestamps[0] >= 60.0:
+                    self._request_timestamps.popleft()
+                if len(self._request_timestamps) < max_per_minute:
+                    self._request_timestamps.append(now)
                     return
-                sleep_seconds = max(0.05, 60.0 - elapsed)
+                sleep_seconds = max(0.05, 60.0 - (now - self._request_timestamps[0]))
             time.sleep(sleep_seconds)
+
+    @staticmethod
+    def _run_silent_provider_call(callback: Callable[[], Any]) -> Any:
+        sink = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                return callback()
+        except SystemExit as exc:
+            raise RuntimeError(f"vnstock provider aborted: {exc}") from exc
 
     @staticmethod
     def _build_financial_cache_key(
@@ -92,9 +98,7 @@ class VNStockApiService:
         # vnstock/vnai may print unicode markers (e.g. check/cross) which can crash on Windows
         # consoles when stdout encoding is not UTF-8. Silence stdout/stderr and only surface
         # a clean Python exception upstream.
-        sink = io.StringIO()
-        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-            register_user(api_key=api_key)
+        self._run_silent_provider_call(lambda: register_user(api_key=api_key))
         self._api_key_registered = True
 
     @staticmethod
@@ -136,8 +140,7 @@ class VNStockApiService:
             try:
                 # Some vnstock internals still print non-ASCII markers; silence to avoid
                 # Windows cp1252 UnicodeEncodeError bubbling up as source failure.
-                sink = io.StringIO()
-                with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                def _invoke() -> Any:
                     quote = Quote(
                         source=candidate_source,
                         symbol=symbol,
@@ -145,9 +148,11 @@ class VNStockApiService:
                         show_log=show_log,
                     )
                     method = getattr(quote, method_name)
-                    result = method(**call_kwargs)
+                    return method(**call_kwargs)
+
+                result = self._run_silent_provider_call(_invoke)
                 return self._serialize_result(result)
-            except BaseException as exc:
+            except Exception as exc:
                 errors.append(f"{candidate_source}: {self._stringify_exception(exc)}")
 
         raise RuntimeError(
@@ -200,7 +205,7 @@ class VNStockApiService:
         return ["VCI", "KBS"]
 
     @staticmethod
-    def _stringify_exception(exc: Exception) -> str:
+    def _stringify_exception(exc: BaseException) -> str:
         if isinstance(exc, RetryError) and exc.last_attempt is not None:
             last_exc = exc.last_attempt.exception()
             if last_exc is not None:
@@ -218,9 +223,13 @@ class VNStockApiService:
     ) -> JSONValue:
         self._ensure_api_key()
         self._throttle_before_call()
-        company = Company(source=source, symbol=symbol, random_agent=random_agent, show_log=show_log)
-        method = getattr(company, method_name)
-        result = method(**(method_kwargs or {}))
+
+        def _invoke() -> Any:
+            company = Company(source=source, symbol=symbol, random_agent=random_agent, show_log=show_log)
+            method = getattr(company, method_name)
+            return method(**(method_kwargs or {}))
+
+        result = self._run_silent_provider_call(_invoke)
         return self._serialize_result(result)
 
     def call_financial(
@@ -251,15 +260,18 @@ class VNStockApiService:
 
         for candidate_source in self._financial_source_order(source):
             try:
-                financial = Finance(
-                    source=candidate_source,
-                    symbol=symbol,
-                    period=period,
-                    get_all=get_all,
-                    show_log=show_log,
-                )
-                method = getattr(financial, method_name)
-                result = method(**call_kwargs)
+                def _invoke() -> Any:
+                    financial = Finance(
+                        source=candidate_source,
+                        symbol=symbol,
+                        period=period,
+                        get_all=get_all,
+                        show_log=show_log,
+                    )
+                    method = getattr(financial, method_name)
+                    return method(**call_kwargs)
+
+                result = self._run_silent_provider_call(_invoke)
                 serialized = self._serialize_result(result)
                 self._cache.set_json(
                     cache_key,
@@ -292,9 +304,13 @@ class VNStockApiService:
     ) -> JSONValue:
         self._ensure_api_key()
         self._throttle_before_call()
-        listing = Listing(source=source, random_agent=random_agent, show_log=show_log)
-        method = getattr(listing, method_name)
-        result = method(**(method_kwargs or {}))
+
+        def _invoke() -> Any:
+            listing = Listing(source=source, random_agent=random_agent, show_log=show_log)
+            method = getattr(listing, method_name)
+            return method(**(method_kwargs or {}))
+
+        result = self._run_silent_provider_call(_invoke)
         return self._serialize_result(result)
 
     @staticmethod
@@ -318,13 +334,16 @@ class VNStockApiService:
         show_log: bool,
     ) -> Optional[pd.Series]:
         try:
-            company = Company(
-                source="vci",
-                symbol=symbol,
-                random_agent=random_agent,
-                show_log=show_log,
-            )
-            df = company.trading_stats()
+            def _invoke() -> Any:
+                company = Company(
+                    source="vci",
+                    symbol=symbol,
+                    random_agent=random_agent,
+                    show_log=show_log,
+                )
+                return company.trading_stats()
+
+            df = self._run_silent_provider_call(_invoke)
             if df is None or getattr(df, "empty", True):
                 return None
             return df.iloc[0]
@@ -338,18 +357,21 @@ class VNStockApiService:
         show_log: bool,
     ) -> Optional[pd.DataFrame]:
         try:
-            trading = Trading(
-                source="vci",
-                symbol=symbol,
-                random_agent=random_agent,
-                show_log=show_log,
-            )
-            return trading.price_board(
-                symbols_list=[symbol],
-                show_log=False,
-                flatten_columns=True,
-                separator="_",
-            )
+            def _invoke() -> Any:
+                trading = Trading(
+                    source="vci",
+                    symbol=symbol,
+                    random_agent=random_agent,
+                    show_log=show_log,
+                )
+                return trading.price_board(
+                    symbols_list=[symbol],
+                    show_log=False,
+                    flatten_columns=True,
+                    separator="_",
+                )
+
+            return self._run_silent_provider_call(_invoke)
         except Exception:
             return None
 
@@ -519,7 +541,10 @@ class VNStockApiService:
             )
             return self._serialize_result(result)
 
-        trading = Trading(source=source, symbol=symbol, random_agent=random_agent, show_log=show_log)
-        method = getattr(trading, method_name)
-        result = method(**(method_kwargs or {}))
+        def _invoke() -> Any:
+            trading = Trading(source=source, symbol=symbol, random_agent=random_agent, show_log=show_log)
+            method = getattr(trading, method_name)
+            return method(**(method_kwargs or {}))
+
+        result = self._run_silent_provider_call(_invoke)
         return self._serialize_result(result)

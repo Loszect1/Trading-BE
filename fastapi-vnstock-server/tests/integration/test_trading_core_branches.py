@@ -11,6 +11,12 @@ import pytest
 from psycopg import connect
 from psycopg.rows import dict_row
 
+from app.schemas.auto_trading import DemoTradeRequest
+from app.services.demo_trading_service import (
+    delete_demo_session,
+    execute_demo_trade,
+    get_demo_shared_remaining_cash,
+)
 from app.services.execution.types import ExecutionOutcome, OrderExecutionContext
 from app.services.trading_core_service import (
     cancel_order,
@@ -882,6 +888,80 @@ def test_sold_lot_is_not_reopened_by_settlement_roll(trading_db: str, monkeypatc
     )
     assert second_sell["status"] == "REJECTED"
     assert second_sell["reason"] == "settlement_guard_failed"
+
+
+@pytest.mark.postgres
+def test_demo_service_sell_consumes_core_lots_before_later_core_sell(
+    trading_db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import app.services.trading_core_service as tcs
+
+    monkeypatch.setattr(tcs, "_settlement_effective_today", lambda: date(2025, 6, 15))
+
+    session_id = "tst-demo-service-sell-core-lots"
+    sym = "TSTDEMODBL"
+    delete_demo_session(session_id)
+    try:
+        assert get_demo_shared_remaining_cash(session_id) == 100_000_000.0
+        buy = place_order(
+            {
+                "account_mode": "DEMO",
+                "symbol": sym,
+                "side": "BUY",
+                "quantity": 100,
+                "price": 10_000.0,
+                "idempotency_key": "idem-tstdemodbl-buy",
+                "auto_process": True,
+                "metadata": {"demo_session_id": session_id, "source": "test"},
+            }
+        )
+        resolved_buy = buy.get("order") if isinstance(buy.get("order"), dict) else buy
+        assert resolved_buy["status"] == "FILLED"
+
+        with connect(trading_db) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE position_lots
+                    SET settle_date = %(settle_date)s, available_qty = qty
+                    WHERE account_mode = 'DEMO' AND symbol = %(symbol)s
+                    """,
+                    {"settle_date": date(2020, 1, 1), "symbol": sym},
+                )
+            conn.commit()
+
+        first_sell = execute_demo_trade(
+            session_id,
+            DemoTradeRequest(
+                side="SELL",
+                symbol=sym,
+                quantity=100,
+                price=11_000.0,
+                market_context={"source": "demo_auto_sell_threshold", "trigger": "take_profit_hit"},
+            ),
+        )
+        assert first_sell.cash_after == 100_100_000.0
+        assert get_demo_shared_remaining_cash(session_id) == 100_100_000.0
+
+        second_sell = place_order(
+            {
+                "account_mode": "DEMO",
+                "symbol": sym,
+                "side": "SELL",
+                "quantity": 100,
+                "price": 12_000.0,
+                "idempotency_key": "idem-tstdemodbl-sell-again",
+                "auto_process": True,
+                "metadata": {"demo_session_id": session_id, "source": "short_term_schedule_exit"},
+            }
+        )
+        resolved_second_sell = (
+            second_sell.get("order") if isinstance(second_sell.get("order"), dict) else second_sell
+        )
+        assert resolved_second_sell["status"] == "REJECTED"
+        assert get_demo_shared_remaining_cash(session_id) == 100_100_000.0
+    finally:
+        delete_demo_session(session_id)
 
 
 @pytest.mark.postgres
