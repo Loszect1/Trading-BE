@@ -14,7 +14,7 @@ from app.services.real_recommendation_service import (
 )
 from app.services.redis_cache import RedisCacheService
 from app.services.short_term_automation_service import run_short_term_scan_batch_resilient
-from app.services.signal_engine_service import extract_short_term_scan_diagnostics
+from app.services.signal_engine_service import extract_short_term_scan_diagnostics, get_cached_symbol_liquidity_status
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +65,15 @@ def extract_mail_signal_recommendations(mail_out: Any) -> list[dict[str, Any]]:
         if confidence is not None and 0.0 <= confidence <= 1.0:
             row["confidence"] = confidence * 100.0
         row.setdefault("source_strategy", "MAIL_SIGNAL")
+        symbol = str(row.get("symbol") or "").strip().upper()
+        liquidity = get_cached_symbol_liquidity_status(symbol)
+        if not bool(liquidity.get("eligible_liquidity", False)):
+            logger.warning(
+                "real_recommendations_mail_signal_filtered_low_liquidity",
+                extra={"symbol": symbol, "reason": liquidity.get("reason")},
+            )
+            continue
+        row["liquidity"] = liquidity
         rows.append(row)
     return normalize_real_recommendation_rows(rows)
 
@@ -135,6 +144,23 @@ def _scan_only_recommendation_rows(rows: list[dict[str, Any]]) -> tuple[list[dic
     recommendations: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
     for item in normalize_real_recommendation_rows(rows):
+        liquidity = item.get("liquidity") if isinstance(item.get("liquidity"), dict) else {}
+        if liquidity and not bool(liquidity.get("eligible_liquidity", True)):
+            rejected.append(
+                {
+                    **item,
+                    "risk_status": "REJECTED",
+                    "risk_reason": str(liquidity.get("reason") or "low_or_irregular_liquidity"),
+                    "risk_result": {
+                        "pass": False,
+                        "reason": str(liquidity.get("reason") or "low_or_irregular_liquidity"),
+                        "liquidity": liquidity,
+                    },
+                    "suggested_quantity": 0,
+                    "suggested_notional": 0.0,
+                }
+            )
+            continue
         entry = float(item["entry"])
         take_profit = float(item["take_profit"])
         stop_loss = float(item["stop_loss"])

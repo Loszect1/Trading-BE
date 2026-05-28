@@ -153,6 +153,14 @@ class AppSettings(BaseSettings):
     short_term_scan_min_avg_daily_volume: float = Field(default=20_000.0, ge=0.0, le=100_000_000.0)
     #: Minimum latest-session volume to consider a symbol actively traded for short-term analysis.
     short_term_scan_min_latest_volume: float = Field(default=10_000.0, ge=0.0, le=100_000_000.0)
+    #: Recent sessions checked to reject symbols that do not trade regularly.
+    short_term_scan_liquidity_regular_window_sessions: int = Field(default=20, ge=5, le=60)
+    #: Minimum per-session volume counted as an active recent trading session.
+    short_term_scan_min_regular_session_volume: float = Field(default=10_000.0, ge=0.0, le=100_000_000.0)
+    #: Minimum active sessions inside the regular liquidity window.
+    short_term_scan_min_active_sessions: int = Field(default=12, ge=1, le=60)
+    #: Maximum zero-volume sessions tolerated inside the regular liquidity window.
+    short_term_scan_max_zero_volume_sessions: int = Field(default=2, ge=0, le=60)
     #: Minimum volume spike ratio (latest / 30-session baseline) required before running short-term analysis.
     short_term_scan_min_volume_spike_ratio: float = Field(default=1.5, ge=1.0, le=20.0)
     #: Redis TTL for per-symbol liquidity gate cache (symbol + exchange).

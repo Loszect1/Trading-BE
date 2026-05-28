@@ -9,7 +9,7 @@ import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
-from statistics import mean
+from statistics import mean, median
 from typing import Any, Literal
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -1268,10 +1268,115 @@ def _append_rejected_candidate(
     )
 
 
-def _is_short_term_liquid_enough(baseline_vol: float, latest_vol: float) -> bool:
+def _max_consecutive_true(values: list[bool]) -> int:
+    longest = 0
+    current = 0
+    for value in values:
+        if value:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return longest
+
+
+def _short_term_volume_regularity_detail(volumes: list[float] | None) -> dict[str, Any]:
+    if volumes is None:
+        return {"regular_liquidity": True, "reason": "not_evaluated_no_history"}
+    clean_volumes = [max(0.0, _to_float(value)) for value in volumes]
+    window_sessions = max(1, int(settings.short_term_scan_liquidity_regular_window_sessions))
+    required_active_sessions = min(
+        window_sessions,
+        max(1, int(settings.short_term_scan_min_active_sessions)),
+    )
+    min_active_volume = max(0.0, float(settings.short_term_scan_min_regular_session_volume))
+    max_zero_sessions = min(
+        window_sessions,
+        max(0, int(settings.short_term_scan_max_zero_volume_sessions)),
+    )
+    window = clean_volumes[-window_sessions:]
+    if len(window) < required_active_sessions:
+        return {
+            "regular_liquidity": False,
+            "reason": "insufficient_volume_history_for_regularity",
+            "window_sessions": window_sessions,
+            "observed_sessions": len(window),
+            "required_active_sessions": required_active_sessions,
+            "min_active_session_volume": min_active_volume,
+            "max_zero_volume_sessions": max_zero_sessions,
+        }
+
+    active_sessions = sum(1 for value in window if value >= min_active_volume)
+    positive_sessions = sum(1 for value in window if value > 0)
+    zero_sessions = sum(1 for value in window if value <= 0)
+    max_zero_streak = _max_consecutive_true([value <= 0 for value in window])
+    regular = bool(active_sessions >= required_active_sessions and zero_sessions <= max_zero_sessions)
+    return {
+        "regular_liquidity": regular,
+        "reason": "ok" if regular else "irregular_volume_history",
+        "window_sessions": window_sessions,
+        "observed_sessions": len(window),
+        "active_sessions": active_sessions,
+        "positive_sessions": positive_sessions,
+        "zero_volume_sessions": zero_sessions,
+        "max_zero_volume_streak": max_zero_streak,
+        "required_active_sessions": required_active_sessions,
+        "min_active_session_volume": min_active_volume,
+        "max_zero_volume_sessions": max_zero_sessions,
+        "median_volume": round(float(median(window)), 4) if window else 0.0,
+        "min_volume": round(float(min(window)), 4) if window else 0.0,
+        "max_volume": round(float(max(window)), 4) if window else 0.0,
+    }
+
+
+def _short_term_liquidity_detail(
+    baseline_vol: float,
+    latest_vol: float,
+    *,
+    volumes: list[float] | None = None,
+) -> dict[str, Any]:
+    min_avg = float(settings.short_term_scan_min_avg_daily_volume)
+    min_latest = float(settings.short_term_scan_min_latest_volume)
+    baseline_ok = bool(float(baseline_vol) >= min_avg)
+    latest_ok = bool(float(latest_vol) >= min_latest)
+    regularity = _short_term_volume_regularity_detail(volumes)
+    regularity_reason = str(regularity.pop("reason", "") or "")
+    regular_ok = bool(regularity.get("regular_liquidity", True))
+    eligible = bool(baseline_ok and latest_ok and regular_ok)
+    if eligible:
+        reason = "ok"
+    elif not baseline_ok:
+        reason = "avg_volume_below_floor"
+    elif not latest_ok:
+        reason = "latest_volume_below_floor"
+    else:
+        reason = regularity_reason or "irregular_volume_history"
+    return {
+        "eligible_liquidity": eligible,
+        "reason": reason,
+        "regularity_reason": regularity_reason,
+        "baseline_vol": round(float(baseline_vol), 4),
+        "latest_vol": round(float(latest_vol), 4),
+        "min_avg_daily_volume": min_avg,
+        "min_latest_volume": min_latest,
+        "baseline_volume_ok": baseline_ok,
+        "latest_volume_ok": latest_ok,
+        **regularity,
+    }
+
+
+def _is_short_term_liquid_enough(
+    baseline_vol: float,
+    latest_vol: float,
+    *,
+    volumes: list[float] | None = None,
+) -> bool:
     return bool(
-        baseline_vol >= float(settings.short_term_scan_min_avg_daily_volume)
-        and latest_vol >= float(settings.short_term_scan_min_latest_volume)
+        _short_term_liquidity_detail(
+            baseline_vol,
+            latest_vol,
+            volumes=volumes,
+        ).get("eligible_liquidity")
     )
 
 
@@ -1586,7 +1691,9 @@ def _write_liquidity_gate_cache(
     spike_ratio: float,
     eligible_liquidity: bool,
     eligible_spike: bool,
+    liquidity_detail: dict[str, Any] | None = None,
 ) -> None:
+    detail = liquidity_detail if isinstance(liquidity_detail, dict) else {}
     _redis_cache.set_json(
         _liquidity_cache_key(symbol, exchange),
         {
@@ -1597,9 +1704,61 @@ def _write_liquidity_gate_cache(
             "spike_ratio": spike_ratio,
             "eligible_liquidity": bool(eligible_liquidity),
             "eligible_spike": bool(eligible_spike),
+            "regular_liquidity": detail.get("regular_liquidity"),
+            "liquidity_detail": detail,
         },
         ttl_seconds=int(settings.short_term_symbol_liquidity_cache_ttl_seconds),
     )
+
+
+def get_cached_symbol_liquidity_status(symbol: str) -> dict[str, Any]:
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return {"eligible_liquidity": False, "reason": "invalid_symbol"}
+    keys = _redis_cache.scan_keys(f"scan:liquidity:*:{sym}", limit=20)
+    if not keys:
+        return {"symbol": sym, "eligible_liquidity": False, "reason": "missing_liquidity_cache"}
+
+    payload_by_key = _redis_cache.get_many_json([str(key) for key in keys])
+    rows: list[dict[str, Any]] = []
+    eligible_rows: list[dict[str, Any]] = []
+    for key in keys:
+        payload = payload_by_key.get(str(key))
+        if payload is None:
+            payload = _redis_cache.get_json(str(key))
+        if not isinstance(payload, dict):
+            continue
+        row = {
+            "redis_key": str(key),
+            "symbol": sym,
+            "exchange": str(payload.get("exchange") or "").strip().upper(),
+            "baseline_vol": payload.get("baseline_vol"),
+            "latest_vol": payload.get("latest_vol"),
+            "spike_ratio": payload.get("spike_ratio"),
+            "eligible_liquidity": bool(payload.get("eligible_liquidity", False)),
+            "eligible_spike": bool(payload.get("eligible_spike", False)),
+            "regular_liquidity": payload.get("regular_liquidity"),
+            "liquidity_detail": payload.get("liquidity_detail") if isinstance(payload.get("liquidity_detail"), dict) else {},
+        }
+        rows.append(row)
+        if bool(row["eligible_liquidity"]):
+            eligible_rows.append(row)
+
+    if not rows:
+        return {"symbol": sym, "eligible_liquidity": False, "reason": "missing_liquidity_cache_payload"}
+    if eligible_rows:
+        best = max(eligible_rows, key=lambda row: float(row.get("baseline_vol") or 0.0))
+        return {
+            **best,
+            "reason": "cached_liquidity_ok",
+            "cache_rows": rows,
+        }
+    return {
+        "symbol": sym,
+        "eligible_liquidity": False,
+        "reason": "low_or_irregular_liquidity",
+        "cache_rows": rows,
+    }
 
 
 def _insert_signal(
@@ -1928,7 +2087,8 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
         latest_vol = volumes[-1]
         spike = (latest_vol / baseline_vol) if baseline_vol > 0 else 0.0
 
-        eligible_liquidity = _is_short_term_liquid_enough(baseline_vol, latest_vol)
+        liquidity_detail = _short_term_liquidity_detail(baseline_vol, latest_vol, volumes=volumes)
+        eligible_liquidity = bool(liquidity_detail.get("eligible_liquidity"))
         eligible_spike = _is_short_term_volume_spike(spike)
         write_cache_t0 = time.perf_counter()
         _write_liquidity_gate_cache(
@@ -1939,6 +2099,7 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
             spike_ratio=spike,
             eligible_liquidity=eligible_liquidity,
             eligible_spike=eligible_spike,
+            liquidity_detail=liquidity_detail,
         )
         _track_step("_write_liquidity_gate_cache", write_cache_t0)
         if not eligible_liquidity:
@@ -1948,7 +2109,7 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
                 symbol=symbol,
                 exchange=symbol_exchange,
                 reason="low_liquidity",
-                detail={"baseline_vol": round(baseline_vol, 4), "latest_vol": round(latest_vol, 4)},
+                detail=liquidity_detail,
             )
             continue
         if not eligible_spike:
@@ -2100,6 +2261,7 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
         )
         metadata["entry_gate"] = gate_meta
         metadata["freshness"] = freshness
+        metadata["liquidity"] = liquidity_detail
         metadata["setup"] = setup
         metadata["relative_strength"] = relative_strength
         metadata["sector_breadth"] = sector_breadth
@@ -2356,7 +2518,8 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
         latest_vol = volumes[-1]
         spike = (latest_vol / baseline_vol) if baseline_vol > 0 else 0.0
 
-        eligible_liquidity = _is_short_term_liquid_enough(baseline_vol, latest_vol)
+        liquidity_detail = _short_term_liquidity_detail(baseline_vol, latest_vol, volumes=volumes)
+        eligible_liquidity = bool(liquidity_detail.get("eligible_liquidity"))
         eligible_spike = _is_short_term_volume_spike(spike)
         write_cache_t0 = time.perf_counter()
         _write_liquidity_gate_cache(
@@ -2367,6 +2530,7 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
             spike_ratio=spike,
             eligible_liquidity=eligible_liquidity,
             eligible_spike=eligible_spike,
+            liquidity_detail=liquidity_detail,
         )
         _track_step("_write_liquidity_gate_cache", write_cache_t0)
         if not eligible_liquidity:
@@ -2376,7 +2540,7 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
                 symbol=symbol,
                 exchange=symbol_exchange,
                 reason="low_liquidity",
-                detail={"baseline_vol": round(baseline_vol, 4), "latest_vol": round(latest_vol, 4)},
+                detail=liquidity_detail,
             )
             continue
         if not eligible_spike:
@@ -2521,6 +2685,7 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
         )
         metadata["entry_gate"] = gate_meta
         metadata["freshness"] = freshness
+        metadata["liquidity"] = liquidity_detail
         metadata["setup"] = setup
         metadata["relative_strength"] = relative_strength
         metadata["sector_breadth"] = sector_breadth
@@ -2679,7 +2844,7 @@ def run_long_term(limit_symbols: int = 0, exchange_scope: str = "ALL") -> list[d
             continue
         baseline_vol = mean(volumes[-31:-1]) if len(volumes) >= 31 else 0.0
         latest_vol = volumes[-1] if volumes else 0.0
-        if not _is_short_term_liquid_enough(baseline_vol, latest_vol):
+        if not _is_short_term_liquid_enough(baseline_vol, latest_vol, volumes=volumes):
             continue
         last_close = closes[-1]
         ma60 = mean(closes[-60:])
@@ -2784,7 +2949,7 @@ def run_technical(limit_symbols: int = 0, exchange_scope: str = "ALL") -> list[d
             continue
         baseline_vol = mean(volumes[-31:-1]) if len(volumes) >= 31 else 0.0
         latest_vol = volumes[-1] if volumes else 0.0
-        if not _is_short_term_liquid_enough(baseline_vol, latest_vol):
+        if not _is_short_term_liquid_enough(baseline_vol, latest_vol, volumes=volumes):
             continue
         last_close = closes[-1]
         ema20 = mean(closes[-20:])
@@ -2887,7 +3052,8 @@ def warm_short_term_liquidity_cache(limit_symbols: int = 0, exchange_scope: str 
         baseline_vol = mean(volumes[-31:-1]) if len(volumes) >= 31 else 0.0
         latest_vol = volumes[-1]
         spike = (latest_vol / baseline_vol) if baseline_vol > 0 else 0.0
-        eligible_liquidity = _is_short_term_liquid_enough(baseline_vol, latest_vol)
+        liquidity_detail = _short_term_liquidity_detail(baseline_vol, latest_vol, volumes=volumes)
+        eligible_liquidity = bool(liquidity_detail.get("eligible_liquidity"))
         eligible_spike = _is_short_term_volume_spike(spike)
         _write_liquidity_gate_cache(
             symbol=symbol,
@@ -2897,6 +3063,7 @@ def warm_short_term_liquidity_cache(limit_symbols: int = 0, exchange_scope: str 
             spike_ratio=spike,
             eligible_liquidity=eligible_liquidity,
             eligible_spike=eligible_spike,
+            liquidity_detail=liquidity_detail,
         )
         cached_written += 1
         if not eligible_liquidity:
@@ -3161,6 +3328,10 @@ def refresh_short_term_liquidity_cache_from_db(days: int = 30, exchange_scope: s
     for symbol, dated_volumes in volume_by_symbol.items():
         # Eligibility uses the latest completed VN trading day as the latest point.
         # If we don't have that date in DB, latest_vol=0 (do not use stale latest).
+        dated_volume_by_date = {trading_date: float(vol) for trading_date, vol in dated_volumes}
+        if target_latest_date not in dated_volume_by_date:
+            dated_volume_by_date[target_latest_date] = 0.0
+        volume_history = [float(vol) for _, vol in sorted(dated_volume_by_date.items(), key=lambda item: item[0])]
         baseline_slice: list[float] = []
         latest_vol = 0.0
         for trading_date, vol in dated_volumes:
@@ -3177,7 +3348,8 @@ def refresh_short_term_liquidity_cache_from_db(days: int = 30, exchange_scope: s
         scanned += 1
         baseline_vol = float(mean(baseline_slice))
         spike = (latest_vol / baseline_vol) if baseline_vol > 0 else 0.0
-        eligible_liquidity = _is_short_term_liquid_enough(baseline_vol, latest_vol)
+        liquidity_detail = _short_term_liquidity_detail(baseline_vol, latest_vol, volumes=volume_history)
+        eligible_liquidity = bool(liquidity_detail.get("eligible_liquidity"))
         eligible_spike = _is_short_term_volume_spike(spike)
         _write_liquidity_gate_cache(
             symbol=symbol,
@@ -3187,6 +3359,7 @@ def refresh_short_term_liquidity_cache_from_db(days: int = 30, exchange_scope: s
             spike_ratio=spike,
             eligible_liquidity=eligible_liquidity,
             eligible_spike=eligible_spike,
+            liquidity_detail=liquidity_detail,
         )
         cached_written += 1
         if not eligible_liquidity:

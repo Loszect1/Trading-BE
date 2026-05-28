@@ -21,6 +21,7 @@ from app.services.gmail_service import GmailFetchService
 from app.services.price_unit_service import normalize_vn_price_to_vnd
 from app.services.redis_cache import RedisCacheService
 from app.services.short_term_scan_schedule import is_instant_on_short_term_scan_grid
+from app.services.signal_engine_service import get_cached_symbol_liquidity_status
 from app.services.trading_core_service import evaluate_risk, place_order
 from app.services.vnstock_api_service import VNStockApiService
 
@@ -529,6 +530,17 @@ def run_prev_day_entry_auto_trading_once(
                     skipped.append({"symbol": symbol, "reason": "already_executed"})
                     continue
 
+                liquidity = get_cached_symbol_liquidity_status(symbol)
+                if not bool(liquidity.get("eligible_liquidity", False)):
+                    skipped.append(
+                        {
+                            "symbol": symbol,
+                            "reason": "low_or_irregular_liquidity",
+                            "liquidity": liquidity,
+                        }
+                    )
+                    continue
+
                 market_price = _extract_latest_price(symbol)
                 if market_price is None or market_price <= 0:
                     skipped.append({"symbol": symbol, "reason": "missing_market_price"})
@@ -620,6 +632,7 @@ def run_prev_day_entry_auto_trading_once(
                             "reason": item.reason,
                             "market_price_at_check": market_price,
                             "execution_price_source": "latest_market_price",
+                            "liquidity": liquidity,
                         },
                     }
                 )

@@ -315,6 +315,10 @@ def get_short_term_cache_eligible(
                     "spike_ratio": payload.get("spike_ratio"),
                     "eligible_liquidity": True,
                     "eligible_spike": True,
+                    "regular_liquidity": payload.get("regular_liquidity"),
+                    "liquidity_detail": payload.get("liquidity_detail")
+                    if isinstance(payload.get("liquidity_detail"), dict)
+                    else {},
                     "redis_key": str(key),
                 }
             )

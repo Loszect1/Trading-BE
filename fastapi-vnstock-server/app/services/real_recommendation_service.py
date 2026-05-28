@@ -33,6 +33,7 @@ def build_recommendation_from_signal(signal: dict[str, Any]) -> dict[str, Any]:
         "setup_type": setup.get("setup_type"),
         "setup": setup,
         "freshness": metadata.get("freshness") if isinstance(metadata.get("freshness"), dict) else {},
+        "liquidity": metadata.get("liquidity") if isinstance(metadata.get("liquidity"), dict) else {},
         "relative_strength": metadata.get("relative_strength") if isinstance(metadata.get("relative_strength"), dict) else {},
         "sector_breadth": metadata.get("sector_breadth") if isinstance(metadata.get("sector_breadth"), dict) else {},
         "trade_levels": levels,
@@ -68,6 +69,7 @@ def normalize_real_recommendation_rows(rows: list[dict[str, Any]]) -> list[dict[
             "setup_type",
             "setup",
             "freshness",
+            "liquidity",
             "relative_strength",
             "sector_breadth",
             "trade_levels",
@@ -373,6 +375,24 @@ def preflight_real_recommendations(
                 "risk_status": "REJECTED",
                 "risk_reason": "stale_data",
                 "risk_result": {"pass": False, "reason": "stale_data"},
+                "settlement_pressure": item_pressure,
+                "account_preflight": acct,
+                "suggested_quantity": 0,
+                "suggested_notional": 0.0,
+            }
+            rejected.append(enriched)
+            continue
+        liquidity = item.get("liquidity") if isinstance(item.get("liquidity"), dict) else {}
+        if liquidity and not bool(liquidity.get("eligible_liquidity", True)):
+            enriched = {
+                **item,
+                "risk_status": "REJECTED",
+                "risk_reason": str(liquidity.get("reason") or "low_or_irregular_liquidity"),
+                "risk_result": {
+                    "pass": False,
+                    "reason": str(liquidity.get("reason") or "low_or_irregular_liquidity"),
+                    "liquidity": liquidity,
+                },
                 "settlement_pressure": item_pressure,
                 "account_preflight": acct,
                 "suggested_quantity": 0,

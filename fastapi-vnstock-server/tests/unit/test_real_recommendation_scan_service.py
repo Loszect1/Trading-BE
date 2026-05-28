@@ -53,3 +53,41 @@ def test_run_real_recommendations_scan_uses_resilient_scan_and_returns_watch(mon
     assert payload["watch_count"] == 1
     assert payload["watch_candidates"][0]["symbol"] == "ACB"
     assert payload["watch_candidates"][0]["scan_reason"] == "entry_gate_failed"
+
+
+def test_extract_mail_signal_recommendations_filters_low_liquidity(monkeypatch) -> None:
+    monkeypatch.setattr(
+        service,
+        "get_cached_symbol_liquidity_status",
+        lambda symbol: {
+            "symbol": str(symbol).upper(),
+            "eligible_liquidity": str(symbol).upper() == "AAA",
+            "reason": "cached_liquidity_ok" if str(symbol).upper() == "AAA" else "low_or_irregular_liquidity",
+        },
+    )
+
+    rows = service.extract_mail_signal_recommendations(
+        {
+            "items": [
+                {
+                    "symbol": "AAA",
+                    "entry": 10.0,
+                    "take_profit": 12.0,
+                    "stop_loss": 9.0,
+                    "confidence": 0.8,
+                    "reason": "fixture",
+                },
+                {
+                    "symbol": "BNA",
+                    "entry": 6.0,
+                    "take_profit": 7.5,
+                    "stop_loss": 5.5,
+                    "confidence": 0.8,
+                    "reason": "thin fixture",
+                },
+            ]
+        }
+    )
+
+    assert [row["symbol"] for row in rows] == ["AAA"]
+    assert rows[0]["liquidity"]["eligible_liquidity"] is True
