@@ -569,14 +569,16 @@ def get_real_recommendations_recent(limit: int = Query(default=10, ge=1, le=50))
 def post_real_recommendations_action_buy(body: RealRecommendationBuyRequest) -> dict[str, Any]:
     try:
         symbol = str(body.symbol).strip().upper()
-        entry = float(body.entry)
+        recommendation_entry = float(body.entry)
+        order_price = float(body.order_price or body.entry)
         stop_loss = float(body.stop_loss)
         available_cash = float(body.available_cash_vnd)
+        requested_quantity = int(body.quantity) if body.quantity is not None else None
         buyable, rejected = preflight_real_recommendations(
             [
                 {
                     "symbol": symbol,
-                    "entry": entry,
+                    "entry": order_price,
                     "take_profit": float(body.take_profit),
                     "stop_loss": stop_loss,
                     "confidence": float(body.confidence),
@@ -604,8 +606,8 @@ def post_real_recommendations_action_buy(body: RealRecommendationBuyRequest) -> 
             }
         row = buyable[0]
         risk_result = row.get("risk_result") if isinstance(row.get("risk_result"), dict) else {}
-        quantity = int(row.get("suggested_quantity") or 0)
-        if quantity <= 0:
+        max_quantity = int(row.get("suggested_quantity") or 0)
+        if max_quantity <= 0:
             return {
                 "success": False,
                 "data": {
@@ -616,16 +618,34 @@ def post_real_recommendations_action_buy(body: RealRecommendationBuyRequest) -> 
                     "settlement_pressure": row.get("settlement_pressure") or {},
                 },
             }
+        if requested_quantity is not None and requested_quantity > max_quantity:
+            return {
+                "success": False,
+                "data": {
+                    "status": "REJECTED",
+                    "reason": "requested_quantity_exceeds_risk_cap",
+                    "requested_quantity": requested_quantity,
+                    "max_quantity": max_quantity,
+                    "risk_result": risk_result,
+                    "account_preflight": row.get("account_preflight") or {},
+                    "settlement_pressure": row.get("settlement_pressure") or {},
+                },
+            }
+        quantity = requested_quantity if requested_quantity is not None else max_quantity
         order_row = place_order(
             {
                 "account_mode": "REAL",
                 "symbol": symbol,
                 "side": "BUY",
                 "quantity": quantity,
-                "price": entry,
+                "price": order_price,
                 "auto_process": True,
                 "metadata": {
                     "source": "real_recommendation_action_buy",
+                    "recommendation_entry": recommendation_entry,
+                    "order_price": order_price,
+                    "requested_quantity": requested_quantity,
+                    "max_quantity": max_quantity,
                     "take_profit": float(body.take_profit),
                     "stop_loss": stop_loss,
                     "confidence": float(body.confidence),
@@ -639,6 +659,9 @@ def post_real_recommendations_action_buy(body: RealRecommendationBuyRequest) -> 
                 "order": order_row,
                 "risk_result": risk_result,
                 "quantity": quantity,
+                "max_quantity": max_quantity,
+                "order_price": order_price,
+                "recommendation_entry": recommendation_entry,
                 "account_preflight": row.get("account_preflight") or {},
                 "settlement_pressure": row.get("settlement_pressure") or {},
             },

@@ -154,6 +154,8 @@ class RealRecommendationBuyRequest(BaseModel):
     confidence: float = Field(default=50.0, ge=0, le=100)
     reason: str = Field(default="", max_length=2000)
     available_cash_vnd: float = Field(gt=0)
+    order_price: float | None = Field(default=None, gt=0)
+    quantity: int | None = Field(default=None, ge=100, le=1_000_000, multiple_of=100)
     setup_type: str | None = None
     setup: dict[str, Any] | None = None
     freshness: dict[str, Any] | None = None

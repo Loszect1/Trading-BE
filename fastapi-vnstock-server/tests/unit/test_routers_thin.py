@@ -246,6 +246,107 @@ class TestAutomationRouterThin:
         r3 = client.get("/automation/short-term/last-run")
         assert r3.status_code == 500
 
+    def test_real_recommendation_action_buy_uses_manual_price_and_quantity(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        placed: dict = {}
+
+        def _preflight(rows, *, available_cash_vnd, cash_source):
+            assert available_cash_vnd == 50_000_000
+            assert cash_source == "request_cash"
+            assert rows[0]["entry"] == 27_500
+            return (
+                [
+                    {
+                        **rows[0],
+                        "risk_result": {"pass": True, "reason": "ok"},
+                        "suggested_quantity": 500,
+                        "account_preflight": {},
+                        "settlement_pressure": {},
+                    }
+                ],
+                [],
+            )
+
+        def _place_order(payload):
+            placed.update(payload)
+            return {"id": "order-1", "status": "SENT"}
+
+        monkeypatch.setattr("app.routers.automation.preflight_real_recommendations", _preflight)
+        monkeypatch.setattr("app.routers.automation.place_order", _place_order)
+
+        client = _automation_client()
+        r = client.post(
+            "/automation/real/recommendations/action-buy",
+            json={
+                "symbol": "fpt",
+                "entry": 27_000,
+                "order_price": 27_500,
+                "quantity": 300,
+                "take_profit": 30_000,
+                "stop_loss": 26_000,
+                "confidence": 80,
+                "reason": "unit",
+                "available_cash_vnd": 50_000_000,
+            },
+        )
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["success"] is True
+        assert body["data"]["quantity"] == 300
+        assert body["data"]["max_quantity"] == 500
+        assert body["data"]["order_price"] == 27_500
+        assert placed["symbol"] == "FPT"
+        assert placed["quantity"] == 300
+        assert placed["price"] == 27_500
+        assert placed["metadata"]["recommendation_entry"] == 27_000
+        assert placed["metadata"]["requested_quantity"] == 300
+
+    def test_real_recommendation_action_buy_rejects_quantity_above_risk_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        place_calls = []
+
+        def _preflight(rows, *, available_cash_vnd, cash_source):  # noqa: ARG001
+            return (
+                [
+                    {
+                        **rows[0],
+                        "risk_result": {"pass": True, "reason": "ok"},
+                        "suggested_quantity": 200,
+                    }
+                ],
+                [],
+            )
+
+        monkeypatch.setattr("app.routers.automation.preflight_real_recommendations", _preflight)
+        monkeypatch.setattr("app.routers.automation.place_order", lambda payload: place_calls.append(payload))
+
+        client = _automation_client()
+        r = client.post(
+            "/automation/real/recommendations/action-buy",
+            json={
+                "symbol": "FPT",
+                "entry": 27_000,
+                "order_price": 27_500,
+                "quantity": 300,
+                "take_profit": 30_000,
+                "stop_loss": 26_000,
+                "confidence": 80,
+                "reason": "unit",
+                "available_cash_vnd": 50_000_000,
+            },
+        )
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["success"] is False
+        assert body["data"]["reason"] == "requested_quantity_exceeds_risk_cap"
+        assert body["data"]["requested_quantity"] == 300
+        assert body["data"]["max_quantity"] == 200
+        assert place_calls == []
+
     def test_technical_run_cycle_and_history_endpoints(self, monkeypatch: pytest.MonkeyPatch) -> None:
         run_payload = {
             "success": True,
