@@ -91,6 +91,16 @@ class AppSettings(BaseSettings):
     news_firecrawl_fallback_max_total: int = 30
     #: Số worker song song khi gọi Firecrawl cho nhiều feed lỗi.
     news_firecrawl_fallback_max_workers: int = 4
+    #: Gmail query for the daily host-run news mail flow.
+    news_mail_gmail_query: str = "Tin tức chứng khoán"
+    #: Max matching daily news mails read by the host-run flow.
+    news_mail_gmail_max_results: int = Field(default=5, ge=1, le=100)
+    #: Max section links fetched from one daily news-mail run.
+    news_mail_article_fetch_limit: int = Field(default=100, ge=1, le=200)
+    #: Per-article HTTP fetch timeout for news-mail links.
+    news_mail_article_fetch_timeout_seconds: float = Field(default=20.0, ge=2.0, le=120.0)
+    #: Max cleaned article text stored and sent to Codex.
+    news_mail_article_text_max_chars: int = Field(default=8000, ge=1000, le=30000)
     #: Short-term scanner: minutes between runs during VN regular sessions (09:00–11:30, 13:00–14:45 local).
     short_term_scan_interval_minutes: int = Field(default=15, ge=1, le=120)
     #: IANA timezone for session windows and schedule API (VN market local time).

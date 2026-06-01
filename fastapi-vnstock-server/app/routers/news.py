@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from hashlib import sha256
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
+from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query
 from psycopg import connect
@@ -24,6 +25,22 @@ from app.services.firecrawl_search_service import (
     normalize_firecrawl_search_response,
 )
 from app.services.news_aggregator_service import NewsAggregatorService
+from app.schemas.news_mail import (
+    NewsMailCodexResultRequest,
+    NewsMailPrepareRequest,
+    NewsMailRunFailRequest,
+)
+from app.services.news_mail_service import (
+    apply_codex_results,
+    fail_news_mail_run,
+    list_news_mail_articles,
+    get_news_by_symbol,
+    get_sentiment_return_research,
+    get_today_news_mail,
+    get_top_impact_news,
+    prepare_news_mail_run,
+    refresh_news_mail_workflow_from_gmail,
+)
 from app.services.redis_cache import RedisCacheService
 from app.services.signal_engine_service import ensure_market_symbol_tables, persist_symbol_news_rows
 from app.services.vnstock_api_service import VNStockApiService
@@ -38,6 +55,118 @@ _vnstock_api = VNStockApiService()
 NEWS_SOURCES_BY_ID: dict[str, NewsFeedSource] = {src.id: src for src in NEWS_FEED_SOURCES}
 
 NewsCategoryParam = Literal["all", "domestic", "world", "social"]
+
+
+@router.post("/mail/runs/prepare")
+def post_news_mail_prepare(body: NewsMailPrepareRequest = NewsMailPrepareRequest()) -> dict[str, Any]:
+    """Prepare today's Tin tuc chung khoan mail links for host-side Codex analysis."""
+    try:
+        return prepare_news_mail_run(
+            query=body.query,
+            max_results=body.max_results,
+            force_refresh=body.force_refresh,
+            article_fetch_limit=body.article_fetch_limit,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to prepare news mail run: {exc}") from exc
+
+
+@router.post("/mail/refresh")
+def post_news_mail_refresh(body: NewsMailPrepareRequest = NewsMailPrepareRequest()) -> dict[str, Any]:
+    """Run the full mail-news workflow from Gmail through analysis and return research."""
+    try:
+        return refresh_news_mail_workflow_from_gmail(
+            query=body.query,
+            max_results=body.max_results,
+            article_fetch_limit=body.article_fetch_limit,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to refresh news mail: {exc}") from exc
+
+
+@router.post("/mail/runs/{run_id}/codex-results")
+def post_news_mail_codex_results(run_id: UUID, body: NewsMailCodexResultRequest) -> dict[str, Any]:
+    """Persist structured Codex summaries, symbols, sentiment, and impact scores."""
+    try:
+        return apply_codex_results(
+            run_id=run_id,
+            articles=[article.model_dump(mode="json") for article in body.articles],
+            final_batch=body.final_batch,
+            run_metadata=body.run_metadata,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to persist Codex results: {exc}") from exc
+
+
+@router.post("/mail/runs/{run_id}/fail")
+def post_news_mail_fail(run_id: UUID, body: NewsMailRunFailRequest) -> dict[str, Any]:
+    """Mark a host-side news-mail Codex run as failed."""
+    try:
+        return fail_news_mail_run(run_id, body.error, metadata=body.metadata)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to mark news mail run failed: {exc}") from exc
+
+
+@router.get("/today")
+def get_news_today(limit: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
+    """Daily mail-derived news intelligence for dashboard use."""
+    try:
+        return get_today_news_mail(limit=limit)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read today's news mail: {exc}") from exc
+
+
+@router.get("/mail/articles")
+def get_news_mail_articles(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0, le=10000),
+    category: str | None = Query(default=None, max_length=64),
+    symbol: str | None = Query(default=None, max_length=20),
+) -> dict[str, Any]:
+    """Paginated mail-derived news across saved runs."""
+    try:
+        return list_news_mail_articles(
+            limit=limit,
+            offset=offset,
+            category=category,
+            symbol=symbol,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to list news mail articles: {exc}") from exc
+
+
+@router.get("/by-symbol/{symbol}")
+def get_news_by_symbol_route(
+    symbol: str,
+    limit: int = Query(50, ge=1, le=200),
+) -> dict[str, Any]:
+    try:
+        return get_news_by_symbol(symbol, limit=limit)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read news by symbol: {exc}") from exc
+
+
+@router.get("/top-impact")
+def get_news_top_impact(
+    limit: int = Query(20, ge=1, le=100),
+    sentiment: str | None = Query(default=None),
+) -> dict[str, Any]:
+    try:
+        return get_top_impact_news(limit=limit, sentiment=sentiment)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read top-impact news: {exc}") from exc
+
+
+@router.get("/research/sentiment-vs-return")
+def get_news_sentiment_vs_return(
+    refresh: bool = Query(False),
+    days_back: int = Query(90, ge=1, le=2000),
+    limit: int = Query(200, ge=1, le=2000),
+) -> dict[str, Any]:
+    try:
+        return get_sentiment_return_research(refresh=refresh, days_back=days_back, limit=limit)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read sentiment research: {exc}") from exc
 
 
 def _category_set(category: NewsCategoryParam) -> set[NewsCategory] | None:

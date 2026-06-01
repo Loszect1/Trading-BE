@@ -6,6 +6,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nodejs npm ca-certificates \
+    && npm install -g @openai/codex@0.135.0 \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt ./
 RUN pip install --upgrade pip && pip install -r requirements.txt
 

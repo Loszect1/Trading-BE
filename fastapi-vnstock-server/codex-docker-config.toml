@@ -1,0 +1,14 @@
+model_provider = "cliproxyapi"
+model = "gpt-5.5"
+model_reasoning_effort = "xhigh"
+approval_policy = "never"
+
+[model_providers.cliproxyapi]
+name = "cliproxyapi"
+base_url = "http://host.docker.internal:18317/v1"
+wire_api = "responses"
+
+[profiles.cliproxyapi]
+model_provider = "cliproxyapi"
+model = "gpt-5.5"
+models = [ "gpt-5.5", "gpt-5.4", "gpt-5.2", "gpt-5.4-mini", "gpt-5.3-codex" ]

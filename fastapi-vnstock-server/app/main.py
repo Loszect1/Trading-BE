@@ -16,6 +16,7 @@ from app.routers.scanner import router as scanner_router
 from app.routers.signal_engine import router as signal_engine_router
 from app.routers.trading_core import router as trading_core_router
 from app.routers.vnstock_api import router as vnstock_api_router
+from app.routers.watchlist import router as watchlist_router
 from app.services.automation_scheduler_service import (
     start_automation_scheduler,
     stop_automation_scheduler,
@@ -56,6 +57,7 @@ app.include_router(automation_router)
 app.include_router(trading_core_router)
 app.include_router(monitoring_router)
 app.include_router(signal_engine_router)
+app.include_router(watchlist_router)
 
 
 @app.on_event("startup")

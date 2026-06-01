@@ -202,7 +202,7 @@ class GmailFetchService:
                     {
                         "gmail_message_id": gmail_message_id,
                         "subject": subject,
-                        "text": body_text[:12000],
+                        "text": body_text,
                     }
                 )
             return out
@@ -210,6 +210,54 @@ class GmailFetchService:
             raise RuntimeError(f"Gmail API error: {exc}") from exc
         except Exception as exc:
             raise RuntimeError(f"Gmail text fetch failed: {exc}") from exc
+
+    def fetch_today_message_documents(self, *, query: str, max_results: int) -> list[dict[str, Any]]:
+        """
+        Fetch today's matched emails with both text and HTML bodies.
+        The HTML body is used by news-mail ingestion to preserve section links.
+        """
+        try:
+            creds = self._build_creds()
+            service = build("gmail", "v1", credentials=creds)
+            scoped_query = self._build_today_query(query.strip())
+            response = (
+                service.users()
+                .messages()
+                .list(userId="me", q=scoped_query, maxResults=max(1, min(max_results, 100)))
+                .execute()
+            )
+            messages = response.get("messages", []) or []
+            out: list[dict[str, Any]] = []
+            for item in messages:
+                gmail_message_id = str(item.get("id") or "").strip()
+                if not gmail_message_id:
+                    continue
+                full = (
+                    service.users()
+                    .messages()
+                    .get(userId="me", id=gmail_message_id, format="full")
+                    .execute()
+                )
+                payload = full.get("payload", {}) if isinstance(full, dict) else {}
+                headers = payload.get("headers", []) if isinstance(payload, dict) else []
+                subject = _extract_header(headers, "Subject") or ""
+                body_text = self._collect_message_text(service, "me", gmail_message_id, payload)
+                body_html = self._collect_message_html(payload)
+                out.append(
+                    {
+                        "gmail_message_id": gmail_message_id,
+                        "thread_id": str(full.get("threadId") or ""),
+                        "subject": subject,
+                        "internal_date": self._message_datetime(full),
+                        "text": body_text or "(empty)",
+                        "html": body_html or "",
+                    }
+                )
+            return out
+        except HttpError as exc:
+            raise RuntimeError(f"Gmail API error: {exc}") from exc
+        except Exception as exc:
+            raise RuntimeError(f"Gmail document fetch failed: {exc}") from exc
 
     def _download_attachments(
         self,
@@ -313,6 +361,21 @@ class GmailFetchService:
             unique_chunks.append(norm)
         return "\n\n".join(unique_chunks)
 
+    def _collect_message_html(self, payload: dict[str, Any]) -> str:
+        chunks: list[str] = []
+        for part in self._walk_parts(payload):
+            mime = str(part.get("mimeType") or "").lower()
+            if "text/html" not in mime:
+                continue
+            body = part.get("body") if isinstance(part, dict) else {}
+            data = str((body or {}).get("data") or "")
+            if not data:
+                continue
+            decoded = self._decode_text_safely(data)
+            if decoded:
+                chunks.append(decoded)
+        return "\n\n".join(chunks)
+
     def _decode_text_safely(self, encoded: str) -> str:
         try:
             raw = _decode_urlsafe_base64(encoded)
@@ -334,6 +397,14 @@ class GmailFetchService:
         before_text = end.strftime("%Y/%m/%d")
         safe_base = base_query or "in:inbox"
         return f"({safe_base}) after:{after_text} before:{before_text}"
+
+    def _message_datetime(self, message: dict[str, Any]) -> datetime | None:
+        raw_ms = str(message.get("internalDate") or "").strip()
+        try:
+            ts_seconds = int(raw_ms) / 1000.0
+            return datetime.fromtimestamp(ts_seconds, tz=timezone.utc)
+        except Exception:
+            return None
 
     def _message_day_key(self, message: dict[str, Any]) -> str:
         raw_ms = str(message.get("internalDate") or "").strip()
