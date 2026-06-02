@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Annotated, Any, Optional
+from typing import Annotated, Any, Literal, Optional
 
 from fastapi import APIRouter, Header, HTTPException, Query
 
@@ -186,6 +186,10 @@ def get_demo_account(
     ),
     history_limit: int = Query(default=50, ge=1, le=200),
     history_offset: int = Query(default=0, ge=0),
+    history_side: Optional[Literal["BUY", "SELL"]] = Query(
+        default=None,
+        description="Optional demo trade history side filter.",
+    ),
     x_demo_session_id: Annotated[Optional[str], Header(alias="X-Demo-Session-Id")] = None,
 ) -> dict[str, Any]:
     session_id = _resolve_demo_session_id(x_demo_session_id)
@@ -196,6 +200,7 @@ def get_demo_account(
             mark_prices or None,
             history_limit=history_limit,
             history_offset=history_offset,
+            history_side=history_side,
         )
         data = DemoAccountResponseData.model_validate(snapshot)
         return {"success": True, "data": data.model_dump(mode="json")}

@@ -490,10 +490,14 @@ def _get_demo_trade_history_from_core(
     *,
     limit: int,
     offset: int,
+    history_side: str | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     sid = normalize_demo_session_id(session_id)
     safe_limit = max(1, min(int(limit), 200))
     safe_offset = max(0, int(offset))
+    side_filter = str(history_side or "").strip().upper()
+    if side_filter not in {"BUY", "SELL"}:
+        side_filter = None
     with connect(settings.database_url, row_factory=dict_row) as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
@@ -503,8 +507,9 @@ def _get_demo_trade_history_from_core(
                 WHERE account_mode = 'DEMO'
                   AND status = 'FILLED'
                   AND COALESCE(order_metadata->>'demo_session_id', '') = %(session_id)s
+                  AND (%(history_side)s IS NULL OR side = %(history_side)s)
                 """,
-                {"session_id": sid},
+                {"session_id": sid, "history_side": side_filter},
             )
             total_row = cur.fetchone() or {}
             cur.execute(
@@ -523,10 +528,11 @@ def _get_demo_trade_history_from_core(
                 WHERE account_mode = 'DEMO'
                   AND status = 'FILLED'
                   AND COALESCE(order_metadata->>'demo_session_id', '') = %(session_id)s
+                  AND (%(history_side)s IS NULL OR side = %(history_side)s)
                 ORDER BY created_at DESC
                 LIMIT %(limit)s OFFSET %(offset)s
                 """,
-                {"session_id": sid, "limit": safe_limit, "offset": safe_offset},
+                {"session_id": sid, "history_side": side_filter, "limit": safe_limit, "offset": safe_offset},
             )
             rows = cur.fetchall() or []
     return ([dict(row) for row in rows], int(total_row.get("c", 0)))
@@ -1337,11 +1343,15 @@ def get_demo_account_snapshot(
     *,
     history_limit: int = 50,
     history_offset: int = 0,
+    history_side: str | None = None,
 ) -> dict[str, Any]:
     ensure_demo_trading_tables()
     marks = {k.strip().upper(): float(v) for k, v in (mark_prices or {}).items() if v is not None}
     safe_limit = max(1, min(history_limit, 200))
     safe_offset = max(0, history_offset)
+    side_filter = str(history_side or "").strip().upper()
+    if side_filter not in {"BUY", "SELL"}:
+        side_filter = None
 
     with connect(settings.database_url, row_factory=dict_row) as conn:
         _ensure_demo_session_exists(conn, session_id)
@@ -1362,8 +1372,13 @@ def get_demo_account_snapshot(
             )
             position_opened_rows = cur.fetchall()
             cur.execute(
-                "SELECT COUNT(*)::int AS c FROM demo_trades WHERE session_id = %(session_id)s",
-                {"session_id": session_id},
+                """
+                SELECT COUNT(*)::int AS c
+                FROM demo_trades
+                WHERE session_id = %(session_id)s
+                  AND (%(history_side)s IS NULL OR side = %(history_side)s)
+                """,
+                {"session_id": session_id, "history_side": side_filter},
             )
             total_row = cur.fetchone() or {}
             cur.execute(
@@ -1371,10 +1386,11 @@ def get_demo_account_snapshot(
                 SELECT trade_id, created_at, side, symbol, quantity, price, notional, realized_pnl_on_trade, cash_after
                 FROM demo_trades
                 WHERE session_id = %(session_id)s
+                  AND (%(history_side)s IS NULL OR side = %(history_side)s)
                 ORDER BY created_at DESC
                 LIMIT %(limit)s OFFSET %(offset)s
                 """,
-                {"session_id": session_id, "limit": safe_limit, "offset": safe_offset},
+                {"session_id": session_id, "history_side": side_filter, "limit": safe_limit, "offset": safe_offset},
             )
             trade_rows = cur.fetchall()
         conn.commit()
@@ -1413,6 +1429,7 @@ def get_demo_account_snapshot(
             session_id,
             limit=safe_limit,
             offset=safe_offset,
+            history_side=side_filter,
         )
     equity = cash + market_value
     return {
