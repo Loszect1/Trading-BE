@@ -48,6 +48,10 @@ CREATE TABLE IF NOT EXISTS news_mail_articles (
     article_text TEXT NULL,
     article_excerpt TEXT NULL,
     codex_summary TEXT NULL,
+    codex_analysis_status VARCHAR(32) NOT NULL DEFAULT 'pending',
+    codex_analysis_started_at TIMESTAMPTZ NULL,
+    codex_analysis_finished_at TIMESTAMPTZ NULL,
+    codex_analysis_error TEXT NULL,
     key_points JSONB NOT NULL DEFAULT '[]'::jsonb,
     sector_tags JSONB NOT NULL DEFAULT '[]'::jsonb,
     market_tags JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -66,6 +70,9 @@ ON news_mail_articles(updated_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_news_mail_articles_category_slug
 ON news_mail_articles(category_slug);
+
+CREATE INDEX IF NOT EXISTS idx_news_mail_articles_analysis_status
+ON news_mail_articles(run_id, codex_analysis_status, section_index, created_at);
 
 CREATE TABLE IF NOT EXISTS news_mail_symbol_impacts (
     id UUID PRIMARY KEY,

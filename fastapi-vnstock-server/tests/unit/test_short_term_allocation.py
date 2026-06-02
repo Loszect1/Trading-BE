@@ -108,7 +108,7 @@ def test_experience_cooldown_zeroes_symbol_cap(monkeypatch) -> None:
 def test_handle_buy_signal_uses_latest_market_price_for_demo_fill(monkeypatch) -> None:
     placed_payloads: list[dict] = []
 
-    monkeypatch.setattr(service, "_refine_buy_levels_with_claude", lambda _sig: None)
+    monkeypatch.setattr(service, "_refine_buy_levels_with_gpt", lambda _sig: None)
     monkeypatch.setattr(service, "_extract_latest_market_price", lambda _symbol: 4.1)
 
     def fake_place_order(payload: dict) -> dict:
@@ -145,7 +145,7 @@ def test_handle_buy_signal_uses_latest_market_price_for_demo_fill(monkeypatch) -
 
 
 def test_handle_buy_signal_rejects_when_market_price_above_entry(monkeypatch) -> None:
-    monkeypatch.setattr(service, "_refine_buy_levels_with_claude", lambda _sig: None)
+    monkeypatch.setattr(service, "_refine_buy_levels_with_gpt", lambda _sig: None)
     monkeypatch.setattr(service, "_extract_latest_market_price", lambda _symbol: 4.4)
 
     out = service._handle_one_buy_signal(

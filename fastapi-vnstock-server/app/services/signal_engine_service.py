@@ -19,7 +19,11 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 from app.core.config import get_vn_market_holiday_dates, settings
-from app.services.claude_service import ClaudeService
+from app.services.gpt_service import GptService
+from app.services.news_impact_experience_service import (
+    apply_adjustment_to_signal_quality,
+    get_news_impact_adjustment_for_scanner,
+)
 from app.services.redis_cache import RedisCacheService
 from app.services.signal_scoring_pipeline import (
     build_signal_quality_metadata,
@@ -37,7 +41,7 @@ from app.services.vnstock_api_service import VNStockApiService
 from app.services.vn_market_holiday_calendar import is_vn_market_trading_day
 
 vnstock_api_service = VNStockApiService()
-_claude_service = ClaudeService()
+_gpt_service = GptService()
 _redis_cache = RedisCacheService()
 ExchangeScope = Literal["ALL", "HOSE", "HNX", "UPCOM"]
 _market_symbol_tables_ready = False
@@ -56,6 +60,16 @@ _EXCHANGE_ALIASES: dict[str, str] = {
 }
 _MAX_REJECTED_SCAN_CANDIDATES = 40
 _FRESH_DATA_MAX_CALENDAR_DAYS = 5
+_GPT_SIGNAL_SCORING_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "score_commentary": {"type": "string"},
+        "risk_notes": {"type": "array", "items": {"type": "string"}},
+        "confidence_adjustment": {"type": "number"},
+    },
+    "required": ["score_commentary", "risk_notes", "confidence_adjustment"],
+}
 
 
 def ensure_market_symbol_tables() -> None:
@@ -1546,15 +1560,17 @@ def _entry_gate_thresholds_from_experience(exp_meta: dict[str, Any] | None, *, m
     }
     if not isinstance(exp_meta, dict) or not bool(exp_meta.get("applied")):
         return thresholds
-    claude_adaptation = exp_meta.get("claude_market_adaptation")
-    if isinstance(claude_adaptation, dict):
-        regime_row = claude_adaptation.get(str(market_regime).lower())
+    gpt_adaptation = exp_meta.get("gpt_market_adaptation")
+    if not isinstance(gpt_adaptation, dict):
+        gpt_adaptation = exp_meta.get("claude_market_adaptation")
+    if isinstance(gpt_adaptation, dict):
+        regime_row = gpt_adaptation.get(str(market_regime).lower())
         if isinstance(regime_row, dict):
             try:
                 thresholds["min_spike_ratio"] = max(base_spike, float(regime_row.get("min_spike_ratio")))
                 thresholds["min_momentum_5d_pct"] = max(0.0, float(regime_row.get("min_momentum_5d_pct")))
                 thresholds["max_distance_from_ema20_pct"] = max(2.0, float(regime_row.get("max_distance_from_ema20_pct")))
-                thresholds["experience_tightening_level"] = f"claude_{str(market_regime).lower()}"
+                thresholds["experience_tightening_level"] = f"gpt_{str(market_regime).lower()}"
                 return thresholds
             except (TypeError, ValueError):
                 pass
@@ -1821,7 +1837,7 @@ def _extract_json_object(raw_text: str) -> dict[str, Any] | None:
     return None
 
 
-def _claude_scoring_analysis(
+def _gpt_scoring_analysis(
     *,
     strategy_type: str,
     symbol: str,
@@ -1829,7 +1845,7 @@ def _claude_scoring_analysis(
     reason: str,
     metadata: dict[str, Any],
 ) -> dict[str, Any] | None:
-    if not settings.use_claude:
+    if not settings.use_gpt:
         return None
     prompt = (
         "Ban la risk analyst cho scoring trading bot. "
@@ -1842,13 +1858,14 @@ def _claude_scoring_analysis(
         "}\n"
         f"Input:\nstrategy_type={strategy_type}\nsymbol={symbol}\naction={action}\nreason={reason}\nmetadata={metadata}"
     )
-    raw = _claude_service.generate_text_with_resilience(
+    raw = _gpt_service.generate_text_with_resilience(
         prompt=prompt,
         system_prompt="Tra ve JSON dung schema, ngan gon, uu tien canh bao rui ro.",
-        max_tokens=settings.ai_claude_signal_scoring_max_tokens,
+        max_tokens=settings.ai_gpt_signal_scoring_max_tokens,
         temperature=0.1,
         cache_namespace=f"signal-scoring:{strategy_type}",
-        cache_ttl_seconds=settings.ai_claude_signal_scoring_cache_ttl_seconds,
+        cache_ttl_seconds=settings.ai_gpt_signal_scoring_cache_ttl_seconds,
+        output_schema=_GPT_SIGNAL_SCORING_OUTPUT_SCHEMA,
     )
     parsed = _extract_json_object(raw)
     if not parsed:
@@ -1936,11 +1953,12 @@ def _experience_confidence_adjustment(symbol: str, action: str) -> tuple[float, 
         adjustment += min(6.0, 2.0 + win_ratio * 6.0)
     adjustment = max(-15.0, min(8.0, adjustment))
     latest_ctx = samples[0].get("market_context") if samples else None
-    claude_adaptation = (
-        latest_ctx.get("claude_market_adaptation")
-        if isinstance(latest_ctx, dict) and isinstance(latest_ctx.get("claude_market_adaptation"), dict)
-        else None
-    )
+    gpt_adaptation = None
+    if isinstance(latest_ctx, dict):
+        if isinstance(latest_ctx.get("gpt_market_adaptation"), dict):
+            gpt_adaptation = latest_ctx.get("gpt_market_adaptation")
+        elif isinstance(latest_ctx.get("claude_market_adaptation"), dict):
+            gpt_adaptation = latest_ctx.get("claude_market_adaptation")
     return adjustment, {
         "applied": True,
         "samples": n,
@@ -1951,8 +1969,24 @@ def _experience_confidence_adjustment(symbol: str, action: str) -> tuple[float, 
         "win_ratio": round(win_ratio, 4),
         "avg_loss_percent_abs": round(avg_loss_percent_abs, 4),
         "confidence_adjustment": adjustment,
-        "claude_market_adaptation": claude_adaptation,
+        "gpt_market_adaptation": gpt_adaptation,
     }
+
+
+def _apply_news_impact_experience_to_metadata(
+    *,
+    symbol: str,
+    news: dict[str, Any],
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        adjustment = get_news_impact_adjustment_for_scanner(
+            symbol=symbol,
+            news_score=float((news or {}).get("score_0_100") or 50.0),
+        )
+    except Exception as exc:
+        adjustment = {"applied": False, "reason": "news_impact_experience_query_failed", "error": str(exc), "adjustment": 0.0}
+    return apply_adjustment_to_signal_quality(metadata, adjustment)
 
 
 def extract_short_term_scan_diagnostics(scan_result: dict[str, Any]) -> dict[str, Any]:
@@ -1999,7 +2033,7 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
     skipped_experience_cooldown = 0
     skipped_dynamic_buy_floor = 0
     skipped_stale_data = 0
-    experience_threshold_source_claude = 0
+    experience_threshold_source_gpt = 0
     experience_threshold_source_heuristic = 0
     price_history_cache_hits = 0
     price_history_vnstock_calls = 0
@@ -2130,8 +2164,8 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
         except Exception:
             pass
         gate_thresholds = _entry_gate_thresholds_from_experience(exp_meta, market_regime=market_regime)
-        if str(gate_thresholds.get("experience_tightening_level") or "").startswith("claude_"):
-            experience_threshold_source_claude += 1
+        if str(gate_thresholds.get("experience_tightening_level") or "").startswith("gpt_"):
+            experience_threshold_source_gpt += 1
         else:
             experience_threshold_source_heuristic += 1
         action = "HOLD"
@@ -2271,6 +2305,7 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
         }
         metadata["experience_entry_tightening"] = gate_thresholds
         metadata["market_regime_technical_thresholds"] = technical_thresholds
+        metadata = _apply_news_impact_experience_to_metadata(symbol=symbol, news=news, metadata=metadata)
         cooldown_active, cooldown_meta = _experience_buy_cooldown(symbol=symbol, action=action)
         metadata["experience_buy_cooldown"] = cooldown_meta
         if action == "BUY" and cooldown_active:
@@ -2307,7 +2342,7 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
             blend=0.5,
         )
         try:
-            ai_scoring = _claude_scoring_analysis(
+            ai_scoring = _gpt_scoring_analysis(
                 strategy_type="SHORT_TERM",
                 symbol=symbol,
                 action=action,
@@ -2315,7 +2350,7 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
                 metadata=metadata,
             )
             if ai_scoring:
-                metadata["claude_scoring_analysis"] = ai_scoring
+                metadata["gpt_scoring_analysis"] = ai_scoring
                 confidence = max(0.0, min(95.0, confidence + float(ai_scoring.get("confidence_adjustment") or 0.0)))
         except Exception:
             pass
@@ -2368,7 +2403,7 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
             "skipped_dynamic_buy_floor": skipped_dynamic_buy_floor,
             "skipped_stale_data": skipped_stale_data,
             "dynamic_buy_composite_floor": dynamic_buy_floor,
-            "experience_threshold_source_claude": experience_threshold_source_claude,
+            "experience_threshold_source_gpt": experience_threshold_source_gpt,
             "experience_threshold_source_heuristic": experience_threshold_source_heuristic,
             "price_history_cache_hits": price_history_cache_hits,
             "price_history_vnstock_calls": price_history_vnstock_calls,
@@ -2388,7 +2423,7 @@ def run_short_term_scan_batch(limit_symbols: int = 0, exchange_scope: str = "ALL
         "skipped_dynamic_buy_floor": skipped_dynamic_buy_floor,
         "skipped_stale_data": skipped_stale_data,
         "dynamic_buy_composite_floor": dynamic_buy_floor,
-        "experience_threshold_source_claude": experience_threshold_source_claude,
+        "experience_threshold_source_gpt": experience_threshold_source_gpt,
         "experience_threshold_source_heuristic": experience_threshold_source_heuristic,
         "price_history_cache_hits": price_history_cache_hits,
         "price_history_vnstock_calls": price_history_vnstock_calls,
@@ -2405,7 +2440,7 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
     Lightweight fallback scanner:
     - fewer symbols (default up to 12: ~4 per exchange)
     - no heavy macro/fundamental fetches
-    - no Claude scoring (latency budget)
+    - no GPT scoring (latency budget)
     Used when full scanner exceeds hard timeout.
     """
     signals: list[dict[str, Any]] = []
@@ -2417,7 +2452,7 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
     skipped_experience_cooldown = 0
     skipped_dynamic_buy_floor = 0
     skipped_stale_data = 0
-    experience_threshold_source_claude = 0
+    experience_threshold_source_gpt = 0
     experience_threshold_source_heuristic = 0
     price_history_cache_hits = 0
     price_history_vnstock_calls = 0
@@ -2561,8 +2596,8 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
         except Exception:
             pass
         gate_thresholds = _entry_gate_thresholds_from_experience(exp_meta, market_regime=market_regime)
-        if str(gate_thresholds.get("experience_tightening_level") or "").startswith("claude_"):
-            experience_threshold_source_claude += 1
+        if str(gate_thresholds.get("experience_tightening_level") or "").startswith("gpt_"):
+            experience_threshold_source_gpt += 1
         else:
             experience_threshold_source_heuristic += 1
         action = "HOLD"
@@ -2695,6 +2730,7 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
         }
         metadata["experience_entry_tightening"] = gate_thresholds
         metadata["market_regime_technical_thresholds"] = technical_thresholds
+        metadata = _apply_news_impact_experience_to_metadata(symbol=symbol, news=news, metadata=metadata)
         cooldown_active, cooldown_meta = _experience_buy_cooldown(symbol=symbol, action=action)
         metadata["experience_buy_cooldown"] = cooldown_meta
         if action == "BUY" and cooldown_active:
@@ -2778,7 +2814,7 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
             "skipped_dynamic_buy_floor": skipped_dynamic_buy_floor,
             "skipped_stale_data": skipped_stale_data,
             "dynamic_buy_composite_floor": dynamic_buy_floor,
-            "experience_threshold_source_claude": experience_threshold_source_claude,
+            "experience_threshold_source_gpt": experience_threshold_source_gpt,
             "experience_threshold_source_heuristic": experience_threshold_source_heuristic,
             "price_history_cache_hits": price_history_cache_hits,
             "price_history_vnstock_calls": price_history_vnstock_calls,
@@ -2797,7 +2833,7 @@ def run_short_term_scan_batch_light(limit_symbols: int = 10, exchange_scope: str
         "skipped_dynamic_buy_floor": skipped_dynamic_buy_floor,
         "skipped_stale_data": skipped_stale_data,
         "dynamic_buy_composite_floor": dynamic_buy_floor,
-        "experience_threshold_source_claude": experience_threshold_source_claude,
+        "experience_threshold_source_gpt": experience_threshold_source_gpt,
         "experience_threshold_source_heuristic": experience_threshold_source_heuristic,
         "price_history_cache_hits": price_history_cache_hits,
         "price_history_vnstock_calls": price_history_vnstock_calls,
@@ -2894,7 +2930,7 @@ def run_long_term(limit_symbols: int = 0, exchange_scope: str = "ALL") -> list[d
             blend=0.45,
         )
         try:
-            ai_scoring = _claude_scoring_analysis(
+            ai_scoring = _gpt_scoring_analysis(
                 strategy_type="LONG_TERM",
                 symbol=symbol,
                 action=action,
@@ -2902,7 +2938,7 @@ def run_long_term(limit_symbols: int = 0, exchange_scope: str = "ALL") -> list[d
                 metadata=metadata,
             )
             if ai_scoring:
-                metadata["claude_scoring_analysis"] = ai_scoring
+                metadata["gpt_scoring_analysis"] = ai_scoring
                 confidence = max(0.0, min(95.0, confidence + float(ai_scoring.get("confidence_adjustment") or 0.0)))
         except Exception:
             pass
@@ -3003,7 +3039,7 @@ def run_technical(limit_symbols: int = 0, exchange_scope: str = "ALL") -> list[d
             blend=0.5,
         )
         try:
-            ai_scoring = _claude_scoring_analysis(
+            ai_scoring = _gpt_scoring_analysis(
                 strategy_type="TECHNICAL",
                 symbol=symbol,
                 action=action,
@@ -3011,7 +3047,7 @@ def run_technical(limit_symbols: int = 0, exchange_scope: str = "ALL") -> list[d
                 metadata=metadata,
             )
             if ai_scoring:
-                metadata["claude_scoring_analysis"] = ai_scoring
+                metadata["gpt_scoring_analysis"] = ai_scoring
                 confidence = max(0.0, min(95.0, confidence + float(ai_scoring.get("confidence_adjustment") or 0.0)))
         except Exception:
             pass
@@ -3447,8 +3483,8 @@ def generate_all_signals() -> dict[str, Any]:
     }
 
 
-def get_signal_scoring_claude_runtime_metrics() -> dict[str, Any]:
-    return _claude_service.get_runtime_metrics()
+def get_signal_scoring_gpt_runtime_metrics() -> dict[str, Any]:
+    return _gpt_service.get_runtime_metrics()
 
 
 def list_signals(

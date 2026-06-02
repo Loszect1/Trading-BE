@@ -111,8 +111,8 @@ Environment:
 ## API
 
 - Health: `GET /health`
-- AI generate text (Claude): `POST /ai/generate`
-- AI analyze symbol (vnstock + Claude): `POST /ai/analyze-symbol`
+- AI generate text (GPT/Codex): `POST /ai/generate`
+- AI analyze symbol (vnstock + GPT/Codex): `POST /ai/analyze-symbol`
   - Redis cache key is based on symbol + interval + lookback_days + model + max_tokens + temperature
   - Response includes `cached: true|false`
 - Market history: `GET /market/history?symbol=VCI&start=2024-01-01&end=2024-01-31&interval=1D`
@@ -146,7 +146,7 @@ Example AI payload (POST `/ai/generate`):
 {
   "prompt": "Tom tat nhanh tin hieu ky thuat co phieu HPG trong 3 dong.",
   "system_prompt": "Ban la tro ly phan tich tai chinh, tra loi ngan gon, ro rang.",
-  "model": "claude-sonnet-4-6",
+  "model": "gpt-5.5",
   "max_tokens": 300,
   "temperature": 0.2
 }
@@ -160,7 +160,7 @@ Example AI symbol analysis payload (POST `/ai/analyze-symbol`):
   "interval": "1D",
   "lookback_days": 90,
   "source": "VCI",
-  "model": "claude-sonnet-4-6",
+  "model": "gpt-5.5",
   "max_tokens": 700,
   "temperature": 0.2
 }
@@ -168,8 +168,9 @@ Example AI symbol analysis payload (POST `/ai/analyze-symbol`):
 
 Note:
 - Do not send `"model": "string"` from API docs default examples.
-- If `model` is missing or invalid placeholder, backend now auto-falls back to `CLAUDE_MODEL`.
-- All Claude-backed features are gated by one env flag: `USE_CLAUDE=false` disables them.
+- If `model` is missing or an invalid placeholder, backend falls back to `GPT_MODEL`.
+- GPT-backed features run through `codex exec` and are gated by `USE_GPT=false`.
+- Deprecated Claude env names such as `USE_CLAUDE`, `CLAUDE_MODEL`, and `AI_CLAUDE_*` are accepted as migration aliases when the new GPT names are not set.
 
 ## DNSE Trading API
 

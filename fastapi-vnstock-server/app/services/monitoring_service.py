@@ -11,8 +11,8 @@ from psycopg.rows import dict_row
 from app.core.config import settings
 from app.services.alert_dispatcher_service import dispatch_alert_to_channels
 from app.services.alert_message_format import format_alert_plain_text
-from app.services.experience_service import ensure_experience_table, get_experience_claude_runtime_metrics
-from app.services.signal_engine_service import ensure_signals_table, get_signal_scoring_claude_runtime_metrics
+from app.services.experience_service import ensure_experience_table, get_experience_gpt_runtime_metrics
+from app.services.signal_engine_service import ensure_signals_table, get_signal_scoring_gpt_runtime_metrics
 from app.services.short_term_automation_service import ensure_short_term_automation_runs_table
 from app.services.trading_core_service import get_kill_switch, get_monitoring_summary, get_positions, log_risk_event
 from app.services.vnstock_api_service import VNStockApiService
@@ -446,8 +446,8 @@ def build_account_monitoring_dashboard(
     merged["operational_health"] = {"bot_status": bot_status, "kill_switch": kill, "metrics": metrics}
     merged["kpis"] = kpis
     merged["ai_runtime"] = {
-        "claude_signal_scoring": get_signal_scoring_claude_runtime_metrics(),
-        "claude_experience": get_experience_claude_runtime_metrics(),
+        "gpt_signal_scoring": get_signal_scoring_gpt_runtime_metrics(),
+        "gpt_experience": get_experience_gpt_runtime_metrics(),
     }
     return merged
 
@@ -695,8 +695,8 @@ def get_monitoring_summary_all() -> dict[str, Any]:
             "metrics": metrics,
         }
     out["ai_runtime"] = {
-        "claude_signal_scoring": get_signal_scoring_claude_runtime_metrics(),
-        "claude_experience": get_experience_claude_runtime_metrics(),
+        "gpt_signal_scoring": get_signal_scoring_gpt_runtime_metrics(),
+        "gpt_experience": get_experience_gpt_runtime_metrics(),
     }
     return out
 

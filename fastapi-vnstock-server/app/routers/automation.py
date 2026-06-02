@@ -427,7 +427,7 @@ async def post_real_scan_only_toggle(body: RealScanOnlyToggleRequest) -> dict[st
 @router.get("/mail-signals/today")
 def get_mail_signals_today() -> dict[str, Any]:
     """
-    Read today's mail->Claude analyzed picks from Redis key signals:mail:daily:YYYY-MM-DD.
+    Read today's mail->GPT analyzed picks from Redis key signals:mail:daily:YYYY-MM-DD.
     """
     try:
         row = get_today_mail_signals()
@@ -440,7 +440,7 @@ def get_mail_signals_today() -> dict[str, Any]:
 @router.get("/mail-signals/latest")
 def get_mail_signals_latest() -> dict[str, Any]:
     """
-    Read latest mail->Claude analyzed picks from Redis key signals:mail:daily:YYYY-MM-DD.
+    Read latest mail->GPT analyzed picks from Redis key signals:mail:daily:YYYY-MM-DD.
     """
     try:
         row = get_latest_mail_signals()
@@ -453,7 +453,7 @@ def get_mail_signals_latest() -> dict[str, Any]:
 @router.post("/mail-signals/run-once")
 def post_mail_signals_run_once() -> dict[str, Any]:
     """
-    Manually trigger one mail->Claude signal ingestion run and persist into Redis.
+    Manually trigger one mail->GPT signal ingestion run and persist into Redis.
     """
     try:
         raw = run_mail_signal_pipeline()

@@ -2,7 +2,7 @@ from datetime import date
 
 from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -18,27 +18,84 @@ class AppSettings(BaseSettings):
     app_port: int = 8000
     app_reload: bool = True
     vnstock_api_key: str = ""
+    #: Deprecated placeholder kept so existing .env files with CLAUDE_TOKEN do not break settings loading.
     claude_token: str = ""
-    claude_model: str = "claude-sonnet-4-6"
-    claude_fallback_model: str = "claude-3-5-haiku-latest"
-    claude_max_tokens: int = 1024
-    claude_max_retries: int = 3
-    #: Single global switch for all Claude-backed features.
-    use_claude: bool = False
-    #: Max tokens for Claude scoring enrichment responses.
-    ai_claude_signal_scoring_max_tokens: int = Field(default=500, ge=128, le=2048)
-    #: Redis cache TTL (seconds) for Claude scoring enrichment responses.
-    ai_claude_signal_scoring_cache_ttl_seconds: int = Field(default=1800, ge=30, le=86_400)
-    #: Max tokens for Claude experience analysis responses.
-    ai_claude_experience_max_tokens: int = Field(default=400, ge=128, le=2048)
-    #: Redis cache TTL (seconds) for Claude experience analysis responses.
-    ai_claude_experience_cache_ttl_seconds: int = Field(default=3600, ge=30, le=86_400)
-    #: Max tokens for Claude automation level refinement responses.
-    ai_claude_automation_levels_max_tokens: int = Field(default=350, ge=128, le=2048)
-    #: Redis cache TTL (seconds) for Claude automation level refinement.
-    ai_claude_automation_levels_cache_ttl_seconds: int = Field(default=900, ge=30, le=86_400)
-    #: Global cool-down seconds after repeated Claude API failures.
-    ai_claude_failure_cooldown_seconds: int = Field(default=45, ge=5, le=600)
+    #: Single global switch for GPT/Codex-backed features. USE_CLAUDE is accepted as a deprecated alias.
+    use_gpt: bool = Field(default=False, validation_alias=AliasChoices("USE_GPT", "USE_CLAUDE"))
+    #: Default model forwarded to `codex exec --model`. CLAUDE_MODEL is accepted as a deprecated alias.
+    gpt_model: str = Field(default="gpt-5.5", validation_alias=AliasChoices("GPT_MODEL", "CLAUDE_MODEL"))
+    gpt_max_tokens: int = Field(
+        default=1024,
+        ge=1,
+        le=8192,
+        validation_alias=AliasChoices("GPT_MAX_TOKENS", "CLAUDE_MAX_TOKENS"),
+    )
+    gpt_max_retries: int = Field(
+        default=1,
+        ge=0,
+        le=5,
+        validation_alias=AliasChoices("GPT_MAX_RETRIES", "CLAUDE_MAX_RETRIES"),
+    )
+    gpt_codex_timeout_seconds: int = Field(default=1800, ge=5, le=3600)
+    gpt_codex_workdir: str = "/app"
+    #: Max tokens for GPT scoring enrichment responses.
+    ai_gpt_signal_scoring_max_tokens: int = Field(
+        default=500,
+        ge=128,
+        le=2048,
+        validation_alias=AliasChoices("AI_GPT_SIGNAL_SCORING_MAX_TOKENS", "AI_CLAUDE_SIGNAL_SCORING_MAX_TOKENS"),
+    )
+    #: Redis cache TTL (seconds) for GPT scoring enrichment responses.
+    ai_gpt_signal_scoring_cache_ttl_seconds: int = Field(
+        default=1800,
+        ge=30,
+        le=86_400,
+        validation_alias=AliasChoices(
+            "AI_GPT_SIGNAL_SCORING_CACHE_TTL_SECONDS",
+            "AI_CLAUDE_SIGNAL_SCORING_CACHE_TTL_SECONDS",
+        ),
+    )
+    #: Max tokens for GPT experience analysis responses.
+    ai_gpt_experience_max_tokens: int = Field(
+        default=400,
+        ge=128,
+        le=2048,
+        validation_alias=AliasChoices("AI_GPT_EXPERIENCE_MAX_TOKENS", "AI_CLAUDE_EXPERIENCE_MAX_TOKENS"),
+    )
+    #: Redis cache TTL (seconds) for GPT experience analysis responses.
+    ai_gpt_experience_cache_ttl_seconds: int = Field(
+        default=3600,
+        ge=30,
+        le=86_400,
+        validation_alias=AliasChoices("AI_GPT_EXPERIENCE_CACHE_TTL_SECONDS", "AI_CLAUDE_EXPERIENCE_CACHE_TTL_SECONDS"),
+    )
+    #: Max tokens for GPT automation level refinement responses.
+    ai_gpt_automation_levels_max_tokens: int = Field(
+        default=350,
+        ge=128,
+        le=2048,
+        validation_alias=AliasChoices(
+            "AI_GPT_AUTOMATION_LEVELS_MAX_TOKENS",
+            "AI_CLAUDE_AUTOMATION_LEVELS_MAX_TOKENS",
+        ),
+    )
+    #: Redis cache TTL (seconds) for GPT automation level refinement.
+    ai_gpt_automation_levels_cache_ttl_seconds: int = Field(
+        default=900,
+        ge=30,
+        le=86_400,
+        validation_alias=AliasChoices(
+            "AI_GPT_AUTOMATION_LEVELS_CACHE_TTL_SECONDS",
+            "AI_CLAUDE_AUTOMATION_LEVELS_CACHE_TTL_SECONDS",
+        ),
+    )
+    #: Global cool-down seconds after repeated GPT/Codex failures.
+    ai_gpt_failure_cooldown_seconds: int = Field(
+        default=45,
+        ge=5,
+        le=600,
+        validation_alias=AliasChoices("AI_GPT_FAILURE_COOLDOWN_SECONDS", "AI_CLAUDE_FAILURE_COOLDOWN_SECONDS"),
+    )
     dnse_username: str = ""
     dnse_password: str = ""
     #: Gợi ý sub-account mặc định (ví dụ tiền tố TK); FE đọc qua GET /dnse/defaults.
@@ -204,7 +261,7 @@ class AppSettings(BaseSettings):
     gmail_oauth_token_file: str = "credentials/gmail_token.json"
     #: Default local directory for downloaded Gmail .eml/attachments.
     gmail_download_dir: str = "downloads/gmail"
-    #: Enable weekday mail->Claude signal scheduler.
+    #: Enable weekday mail->GPT signal scheduler.
     mail_signal_scheduler_enabled: bool = False
     #: Mail signal scheduler timezone and run time (Mon-Fri).
     mail_signal_scheduler_timezone: str = "Asia/Ho_Chi_Minh"
@@ -214,7 +271,7 @@ class AppSettings(BaseSettings):
     mail_signal_gmail_query: str = "Tín hiệu Cạn Cung"
     #: Max today-matched emails scanned for one scheduler run.
     mail_signal_gmail_max_results: int = Field(default=20, ge=1, le=100)
-    #: Redis key TTL for persisted Claude signal picks.
+    #: Redis key TTL for persisted GPT signal picks.
     mail_signal_redis_ttl_seconds: int = Field(default=604800, ge=300, le=2_592_000)
     #: Enable 15-minute auto-entry execution from previous-day mail signals.
     mail_signal_entry_scheduler_enabled: bool = False
@@ -251,6 +308,7 @@ class AppSettings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        populate_by_name=True,
     )
 
     @field_validator("short_term_scan_timezone")
@@ -261,6 +319,14 @@ class AppSettings(BaseSettings):
         except ZoneInfoNotFoundError as e:
             raise ValueError(f"Invalid IANA timezone: {v!r}") from e
         return v
+
+    @field_validator("gpt_model")
+    @classmethod
+    def _gpt_model_must_not_be_legacy_claude_model(cls, v: str) -> str:
+        model = str(v or "").strip()
+        if not model or model.lower().startswith("claude-"):
+            return "gpt-5.5"
+        return model
 
     @model_validator(mode="after")
     def _short_term_scan_interval_aligns_sessions(self) -> "AppSettings":

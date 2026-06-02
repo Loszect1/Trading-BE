@@ -25,7 +25,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 from app.core.config import get_vn_market_holiday_dates, settings
-from app.services.claude_service import ClaudeService
+from app.services.gpt_service import GptService
 from app.services.experience_service import create_experience_from_trade, ensure_experience_table
 from app.services.price_unit_service import normalize_vn_price_to_vnd
 from app.services.short_term_scan_schedule import is_now_on_short_term_scan_grid
@@ -43,7 +43,18 @@ _ADVISORY_LOCK_KEY_REAL_MAIL_SIGNAL = 771_004
 _ADVISORY_LOCK_KEY_DEMO_MAIL_SIGNAL = 771_005
 _ASYNC_RUNS_LOCK = threading.Lock()
 _ASYNC_RUNS: dict[str, dict[str, Any]] = {}
-_automation_claude_service = ClaudeService()
+_automation_gpt_service = GptService()
+_GPT_AUTOMATION_LEVELS_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "entry_price": {"type": "number"},
+        "take_profit_price": {"type": "number"},
+        "stoploss_price": {"type": "number"},
+        "rationale": {"type": "string"},
+    },
+    "required": ["entry_price", "take_profit_price", "stoploss_price", "rationale"],
+}
 _vnstock_api = VNStockApiService()
 _STALE_RUNNING_RUN_MINUTES = 45
 _ALLOCATION_MIN_REWARD_RISK = 1.5
@@ -88,8 +99,8 @@ def _extract_json_object(raw_text: str) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def _refine_buy_levels_with_claude(sig: dict[str, Any]) -> dict[str, Any] | None:
-    if not settings.use_claude:
+def _refine_buy_levels_with_gpt(sig: dict[str, Any]) -> dict[str, Any] | None:
+    if not settings.use_gpt:
         return None
     symbol = str(sig.get("symbol") or "").strip().upper()
     entry = float(sig.get("entry_price") or 0.0)
@@ -107,13 +118,14 @@ def _refine_buy_levels_with_claude(sig: dict[str, Any]) -> dict[str, Any] | None
         "- keep values realistic and close to input levels\n"
         f"Input signal: symbol={symbol}, entry_price={entry}, take_profit_price={tp}, stoploss_price={sl}, metadata={sig.get('metadata') or {}}"
     )
-    raw = _automation_claude_service.generate_text_with_resilience(
+    raw = _automation_gpt_service.generate_text_with_resilience(
         prompt=prompt,
         system_prompt="Return strict JSON only. No prose outside JSON.",
-        max_tokens=settings.ai_claude_automation_levels_max_tokens,
+        max_tokens=settings.ai_gpt_automation_levels_max_tokens,
         temperature=0.1,
         cache_namespace="automation-levels",
-        cache_ttl_seconds=settings.ai_claude_automation_levels_cache_ttl_seconds,
+        cache_ttl_seconds=settings.ai_gpt_automation_levels_cache_ttl_seconds,
+        output_schema=_GPT_AUTOMATION_LEVELS_OUTPUT_SCHEMA,
     )
     parsed = _extract_json_object(raw)
     if not parsed:
@@ -842,15 +854,15 @@ def _handle_one_buy_signal(
     stoploss = normalize_vn_price_to_vnd(sig.get("stoploss_price"))
     level_source = "signal"
     try:
-        refined = _refine_buy_levels_with_claude(sig)
+        refined = _refine_buy_levels_with_gpt(sig)
     except Exception as exc:
-        logger.warning("short_term_claude_levels_failed", extra={"symbol": symbol, "error": str(exc)})
+        logger.warning("short_term_gpt_levels_failed", extra={"symbol": symbol, "error": str(exc)})
         refined = None
     if isinstance(refined, dict):
         entry = normalize_vn_price_to_vnd(refined.get("entry_price") or entry)
         tp = normalize_vn_price_to_vnd(refined.get("take_profit_price") or tp)
         stoploss = normalize_vn_price_to_vnd(refined.get("stoploss_price") or stoploss)
-        level_source = "claude"
+        level_source = "gpt"
     if entry <= 0 or stoploss <= 0:
         return {
             "risk_rejected": 0,
@@ -2422,7 +2434,7 @@ def run_short_term_production_cycle(
                 "exchange_scope_summary",
                 "skipped_low_liquidity",
                 "skipped_no_volume_spike",
-                "experience_threshold_source_claude",
+                "experience_threshold_source_gpt",
                 "experience_threshold_source_heuristic",
             ):
                 if obs_key in batch and batch.get(obs_key) is not None:

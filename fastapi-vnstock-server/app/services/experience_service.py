@@ -12,12 +12,47 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 from app.core.config import settings
-from app.services.claude_service import ClaudeService
+from app.services.gpt_service import GptService
 
 
 TradeMode = Literal["REAL", "DEMO"]
 StrategyType = Literal["SHORT_TERM", "LONG_TERM", "TECHNICAL", "MAIL_SIGNAL"]
-_claude_service = ClaudeService()
+_gpt_service = GptService()
+_GPT_EXPERIENCE_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "root_cause": {"type": "string"},
+        "mistake_tags": {"type": "array", "items": {"type": "string"}},
+        "improvement_action": {"type": "string"},
+        "confidence_after_review": {"type": "number"},
+        "market_adaptation_by_regime": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                regime: {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "min_spike_ratio": {"type": "number"},
+                        "min_momentum_5d_pct": {"type": "number"},
+                        "max_distance_from_ema20_pct": {"type": "number"},
+                    },
+                    "required": ["min_spike_ratio", "min_momentum_5d_pct", "max_distance_from_ema20_pct"],
+                }
+                for regime in ("risk_on", "neutral", "risk_off")
+            },
+            "required": ["risk_on", "neutral", "risk_off"],
+        },
+    },
+    "required": [
+        "root_cause",
+        "mistake_tags",
+        "improvement_action",
+        "confidence_after_review",
+        "market_adaptation_by_regime",
+    ],
+}
 
 
 @dataclass(frozen=True)
@@ -189,7 +224,7 @@ def _cmt_stoploss_playbook(record: ExperienceRecord, tags: list[str]) -> dict[st
 
 def _heuristic_market_adaptation(tags: list[str], market_context: dict[str, Any]) -> dict[str, Any]:
     """
-    Deterministic fallback for entry-gate adaptation when Claude is disabled or unavailable.
+    Deterministic fallback for entry-gate adaptation when GPT is disabled or unavailable.
     Values mirror the scan gate fields consumed by signal_engine_service.
     """
     tag_set = {str(tag).strip().lower() for tag in tags if str(tag).strip()}
@@ -249,9 +284,9 @@ def _extract_json_object(raw_text: str) -> dict[str, Any] | None:
     return None
 
 
-def _analyze_experience_with_claude(record: ExperienceRecord) -> tuple[str, list[str], str, float, dict[str, Any]]:
-    if not settings.use_claude:
-        raise RuntimeError("claude_experience_disabled")
+def _analyze_experience_with_gpt(record: ExperienceRecord) -> tuple[str, list[str], str, float, dict[str, Any]]:
+    if not settings.use_gpt:
+        raise RuntimeError("gpt_experience_disabled")
 
     prompt = (
         "Phan tich trade khong hieu qua va tra ve JSON hop le, khong them markdown.\n"
@@ -276,20 +311,21 @@ def _analyze_experience_with_claude(record: ExperienceRecord) -> tuple[str, list
         f"- pnl_percent: {record.pnl_percent}\n"
         f"- market_context: {record.market_context}\n"
     )
-    raw = _claude_service.generate_text_with_resilience(
+    raw = _gpt_service.generate_text_with_resilience(
         prompt=prompt,
         system_prompt=(
             "Ban la chuyen gia danh gia giao dich production. "
             "Tra ve JSON dung schema, de xuat hanh dong cu the, ro rang."
         ),
-        max_tokens=settings.ai_claude_experience_max_tokens,
+        max_tokens=settings.ai_gpt_experience_max_tokens,
         temperature=0.1,
         cache_namespace="experience-analysis",
-        cache_ttl_seconds=settings.ai_claude_experience_cache_ttl_seconds,
+        cache_ttl_seconds=settings.ai_gpt_experience_cache_ttl_seconds,
+        output_schema=_GPT_EXPERIENCE_OUTPUT_SCHEMA,
     )
     parsed = _extract_json_object(raw)
     if not parsed:
-        raise RuntimeError("claude_experience_parse_failed")
+        raise RuntimeError("gpt_experience_parse_failed")
 
     root_cause = str(parsed.get("root_cause") or "").strip() or "execution_noise"
     tags_raw = parsed.get("mistake_tags")
@@ -460,12 +496,12 @@ def create_experience_from_trade(payload: dict[str, Any]) -> dict[str, Any]:
     analysis_source = "heuristic_fallback"
     analysis_error = ""
     try:
-        root_cause, tags, improvement_action, confidence_after_review, claude_market_adaptation = _analyze_experience_with_claude(
+        root_cause, tags, improvement_action, confidence_after_review, gpt_market_adaptation = _analyze_experience_with_gpt(
             record
         )
-        if claude_market_adaptation:
-            market_adaptation = claude_market_adaptation
-        analysis_source = "claude"
+        if gpt_market_adaptation:
+            market_adaptation = gpt_market_adaptation
+        analysis_source = "gpt"
     except Exception as exc:
         # Keep heuristic fallback to avoid blocking trade-close pipeline.
         analysis_error = str(exc)
@@ -475,7 +511,7 @@ def create_experience_from_trade(payload: dict[str, Any]) -> dict[str, Any]:
         if analysis_error:
             record.market_context["experience_analysis_error"] = analysis_error
         if market_adaptation:
-            record.market_context["claude_market_adaptation"] = market_adaptation
+            record.market_context["gpt_market_adaptation"] = market_adaptation
             record.market_context["experience_market_adaptation"] = market_adaptation
         if cmt_playbook:
             record.market_context["cmt_stoploss_playbook"] = cmt_playbook
@@ -569,5 +605,5 @@ def list_experience(
     return [dict(row) for row in rows]
 
 
-def get_experience_claude_runtime_metrics() -> dict[str, Any]:
-    return _claude_service.get_runtime_metrics()
+def get_experience_gpt_runtime_metrics() -> dict[str, Any]:
+    return _gpt_service.get_runtime_metrics()

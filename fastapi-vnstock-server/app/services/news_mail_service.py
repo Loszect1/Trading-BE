@@ -698,6 +698,10 @@ def ensure_news_mail_tables() -> None:
         article_text TEXT NULL,
         article_excerpt TEXT NULL,
         codex_summary TEXT NULL,
+        codex_analysis_status VARCHAR(32) NOT NULL DEFAULT 'pending',
+        codex_analysis_started_at TIMESTAMPTZ NULL,
+        codex_analysis_finished_at TIMESTAMPTZ NULL,
+        codex_analysis_error TEXT NULL,
         key_points JSONB NOT NULL DEFAULT '[]'::jsonb,
         sector_tags JSONB NOT NULL DEFAULT '[]'::jsonb,
         market_tags JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -715,8 +719,24 @@ def ensure_news_mail_tables() -> None:
     ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'General';
     ALTER TABLE news_mail_articles
     ADD COLUMN IF NOT EXISTS category_slug VARCHAR(64) NOT NULL DEFAULT 'general';
+    ALTER TABLE news_mail_articles
+    ADD COLUMN IF NOT EXISTS codex_analysis_status VARCHAR(32) NOT NULL DEFAULT 'pending';
+    ALTER TABLE news_mail_articles
+    ADD COLUMN IF NOT EXISTS codex_analysis_started_at TIMESTAMPTZ NULL;
+    ALTER TABLE news_mail_articles
+    ADD COLUMN IF NOT EXISTS codex_analysis_finished_at TIMESTAMPTZ NULL;
+    ALTER TABLE news_mail_articles
+    ADD COLUMN IF NOT EXISTS codex_analysis_error TEXT NULL;
+    UPDATE news_mail_articles
+    SET codex_analysis_status = 'completed',
+        codex_analysis_finished_at = COALESCE(codex_analysis_finished_at, updated_at)
+    WHERE codex_analysis_status <> 'completed'
+      AND codex_summary IS NOT NULL
+      AND BTRIM(codex_summary) <> '';
     CREATE INDEX IF NOT EXISTS idx_news_mail_articles_category_slug
     ON news_mail_articles(category_slug);
+    CREATE INDEX IF NOT EXISTS idx_news_mail_articles_analysis_status
+    ON news_mail_articles(run_id, codex_analysis_status, section_index, created_at);
 
     CREATE TABLE IF NOT EXISTS news_mail_symbol_impacts (
         id UUID PRIMARY KEY,
@@ -760,6 +780,34 @@ def ensure_news_mail_tables() -> None:
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         UNIQUE (symbol_impact_id, horizon_days)
     );
+    ALTER TABLE news_mail_return_research
+    ADD COLUMN IF NOT EXISTS benchmark_symbol VARCHAR(20) NULL;
+    ALTER TABLE news_mail_return_research
+    ADD COLUMN IF NOT EXISTS benchmark_base_trading_date DATE NULL;
+    ALTER TABLE news_mail_return_research
+    ADD COLUMN IF NOT EXISTS benchmark_base_close DOUBLE PRECISION NULL;
+    ALTER TABLE news_mail_return_research
+    ADD COLUMN IF NOT EXISTS benchmark_future_trading_date DATE NULL;
+    ALTER TABLE news_mail_return_research
+    ADD COLUMN IF NOT EXISTS benchmark_future_close DOUBLE PRECISION NULL;
+    ALTER TABLE news_mail_return_research
+    ADD COLUMN IF NOT EXISTS benchmark_return_pct DOUBLE PRECISION NULL;
+    ALTER TABLE news_mail_return_research
+    ADD COLUMN IF NOT EXISTS abnormal_return_pct DOUBLE PRECISION NULL;
+    ALTER TABLE news_mail_return_research
+    ADD COLUMN IF NOT EXISTS base_volume DOUBLE PRECISION NULL;
+    ALTER TABLE news_mail_return_research
+    ADD COLUMN IF NOT EXISTS future_volume DOUBLE PRECISION NULL;
+    ALTER TABLE news_mail_return_research
+    ADD COLUMN IF NOT EXISTS volume_change_pct DOUBLE PRECISION NULL;
+    ALTER TABLE news_mail_return_research
+    ADD COLUMN IF NOT EXISTS outcome_label VARCHAR(32) NULL;
+    ALTER TABLE news_mail_return_research
+    ADD COLUMN IF NOT EXISTS outcome_score DOUBLE PRECISION NULL CHECK (
+        outcome_score IS NULL OR (outcome_score >= 0 AND outcome_score <= 100)
+    );
+    ALTER TABLE news_mail_return_research
+    ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
     CREATE INDEX IF NOT EXISTS idx_news_mail_return_research_symbol_event
     ON news_mail_return_research(symbol, event_date DESC);
     """
@@ -1259,14 +1307,21 @@ def _articles_for_codex(
     if not include_failed:
         where_parts.append("fetch_status = 'fetched'")
     if only_missing_analysis:
-        where_parts.append("(codex_summary IS NULL OR BTRIM(codex_summary) = '')")
+        where_parts.append(
+            "("
+            "codex_analysis_status IS DISTINCT FROM 'completed' "
+            "AND (codex_summary IS NULL OR BTRIM(codex_summary) = '' OR codex_analysis_status IN ('pending', 'failed'))"
+            ")"
+        )
     where = " AND ".join(where_parts)
     with connect(settings.database_url, row_factory=dict_row) as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 f"""
                 SELECT id, section_index, section_title, url, source_host, fetch_status,
-                       fetch_error, title, article_text, article_excerpt
+                       fetch_error, title, article_text, article_excerpt,
+                       codex_analysis_status, codex_analysis_started_at,
+                       codex_analysis_finished_at, codex_analysis_error
                 FROM news_mail_articles
                 WHERE {where}
                 ORDER BY section_index ASC, created_at ASC
@@ -1457,6 +1512,73 @@ def _run_codex_cli_json(prompt: str, *, batch_number: int) -> str:
         return output_path.read_text(encoding="utf-8")
 
 
+def _article_ids_from_rows(rows: list[dict[str, Any]]) -> list[str]:
+    out: list[str] = []
+    for row in rows:
+        article_id = str(row.get("article_id") or row.get("id") or "").strip()
+        if article_id:
+            out.append(article_id)
+    return out
+
+
+def _article_analysis_is_done(row: dict[str, Any]) -> bool:
+    status = str(row.get("codex_analysis_status") or "").strip().lower()
+    summary = str(row.get("codex_summary") or "").strip()
+    return status == "completed" or bool(summary)
+
+
+def _mark_articles_analysis_status(
+    *,
+    run_id: UUID | str,
+    article_ids: list[str],
+    status: str,
+    error: str | None = None,
+) -> int:
+    normalized = [str(article_id).strip() for article_id in article_ids if str(article_id).strip()]
+    if not normalized:
+        return 0
+    safe_status = str(status or "").strip().lower()
+    if safe_status not in {"pending", "codex_running", "completed", "failed"}:
+        safe_status = "pending"
+    with connect(settings.database_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE news_mail_articles
+                SET codex_analysis_status = %(status)s,
+                    codex_analysis_started_at = CASE
+                        WHEN %(status)s = 'codex_running' THEN NOW()
+                        ELSE codex_analysis_started_at
+                    END,
+                    codex_analysis_finished_at = CASE
+                        WHEN %(status)s IN ('completed', 'failed') THEN NOW()
+                        ELSE codex_analysis_finished_at
+                    END,
+                    codex_analysis_error = CASE
+                        WHEN %(status)s = 'failed' THEN %(error)s
+                        WHEN %(status)s = 'completed' THEN NULL
+                        ELSE codex_analysis_error
+                    END,
+                    updated_at = NOW()
+                WHERE run_id = %(run_id)s
+                  AND id = ANY(%(article_ids)s::uuid[])
+                  AND (
+                    %(status)s <> 'codex_running'
+                    OR codex_analysis_status IS DISTINCT FROM 'completed'
+                  )
+                """,
+                {
+                    "run_id": run_id,
+                    "article_ids": normalized,
+                    "status": safe_status,
+                    "error": str(error or "")[:4000] or None,
+                },
+            )
+            count = int(cur.rowcount or 0)
+        conn.commit()
+    return count
+
+
 def _run_news_mail_analysis_workflow(
     *,
     run_id: UUID | str,
@@ -1479,25 +1601,43 @@ def _run_news_mail_analysis_workflow(
     updated_articles = 0
     written_impacts = 0
     for start in range(0, len(articles), batch_size):
-        batch = articles[start : start + batch_size]
+        batch = [row for row in articles[start : start + batch_size] if not _article_analysis_is_done(row)]
+        if not batch:
+            continue
         batch_count += 1
         final_batch = start + batch_size >= len(articles)
-        raw = _run_codex_cli_json(build_codex_prompt(batch), batch_number=batch_count)
-        expected_ids = [str(row.get("article_id") or row.get("id") or "") for row in batch]
-        parsed_articles = _parse_news_mail_analysis_output(raw, expected_ids)
-        result = apply_codex_results(
+        expected_ids = _article_ids_from_rows(batch)
+        claimed = _mark_articles_analysis_status(
             run_id=run_id,
-            articles=parsed_articles,
-            final_batch=final_batch,
-            run_metadata={
-                "analysis_source": source,
-                "analysis_status": "completed" if final_batch else "running",
-                "batch_number": batch_count,
-                "batch_size": len(batch),
-                "analysis_article_count": len(articles),
-                "completed_at": _utc_now().isoformat() if final_batch else None,
-            },
+            article_ids=expected_ids,
+            status="codex_running",
         )
+        if claimed <= 0:
+            continue
+        try:
+            raw = _run_codex_cli_json(build_codex_prompt(batch), batch_number=batch_count)
+            parsed_articles = _parse_news_mail_analysis_output(raw, expected_ids)
+            result = apply_codex_results(
+                run_id=run_id,
+                articles=parsed_articles,
+                final_batch=final_batch,
+                run_metadata={
+                    "analysis_source": source,
+                    "analysis_status": "completed" if final_batch else "running",
+                    "batch_number": batch_count,
+                    "batch_size": len(batch),
+                    "analysis_article_count": len(articles),
+                    "completed_at": _utc_now().isoformat() if final_batch else None,
+                },
+            )
+        except Exception as exc:
+            _mark_articles_analysis_status(
+                run_id=run_id,
+                article_ids=expected_ids,
+                status="failed",
+                error=str(exc),
+            )
+            raise
         updated_articles += int(result.get("updated_articles") or 0)
         written_impacts += int(result.get("written_impacts") or 0)
 
@@ -1617,6 +1757,9 @@ def apply_codex_results(
                         sector_tags = %(sector_tags)s,
                         market_tags = %(market_tags)s,
                         data_gaps = %(data_gaps)s,
+                        codex_analysis_status = 'completed',
+                        codex_analysis_finished_at = NOW(),
+                        codex_analysis_error = NULL,
                         updated_at = NOW()
                     WHERE id = %(article_id)s AND run_id = %(run_id)s
                     """,
@@ -2174,7 +2317,7 @@ def _price_rows_for_symbol(symbol: str, event_date: date, horizon: int) -> list[
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 """
-                SELECT trading_date, close_price
+                SELECT trading_date, close_price, volume
                 FROM market_symbol_daily_volume
                 WHERE symbol = %(symbol)s
                   AND trading_date >= %(event_date)s
@@ -2186,6 +2329,60 @@ def _price_rows_for_symbol(symbol: str, event_date: date, horizon: int) -> list[
                 {"symbol": symbol, "event_date": event_date, "limit": horizon + 1},
             )
             return [dict(row) for row in cur.fetchall()]
+
+
+def _return_pct(base_close: float | None, future_close: float | None) -> float | None:
+    if base_close is None or future_close is None or base_close <= 0 or future_close <= 0:
+        return None
+    return ((future_close - base_close) / base_close) * 100.0
+
+
+def _volume_change_pct(base_volume: float | None, future_volume: float | None) -> float | None:
+    if base_volume is None or future_volume is None or base_volume <= 0 or future_volume < 0:
+        return None
+    return ((future_volume - base_volume) / base_volume) * 100.0
+
+
+def _news_event_outcome(
+    *,
+    sentiment_label: str,
+    sentiment_score: float,
+    return_pct: float | None,
+    abnormal_return_pct: float | None,
+    volume_change_pct: float | None,
+) -> tuple[str | None, float | None]:
+    directional = abnormal_return_pct if abnormal_return_pct is not None else return_pct
+    if directional is None:
+        return None, None
+    label = str(sentiment_label or "neutral").strip().lower()
+    score = 50.0
+    if label == "positive":
+        score = 50.0 + directional * 6.0
+        if directional >= 0.75:
+            outcome = "sentiment_confirmed"
+        elif directional <= -0.75:
+            outcome = "sentiment_failed"
+        else:
+            outcome = "flat_after_positive_news"
+    elif label == "negative":
+        score = 50.0 - directional * 6.0
+        if directional <= -0.75:
+            outcome = "avoidance_confirmed"
+        elif directional >= 0.75:
+            outcome = "negative_news_rebounded"
+        else:
+            outcome = "flat_after_negative_news"
+    else:
+        vol = abs(volume_change_pct or 0.0)
+        if abs(directional) < 0.75:
+            outcome = "neutral_confirmed"
+            score = 62.0 - min(12.0, vol / 10.0)
+        else:
+            outcome = "mixed_directional_move"
+            score = 45.0 + min(12.0, vol / 12.0)
+    conviction = min(1.0, abs(float(sentiment_score)) / 100.0) if label in {"positive", "negative"} else 0.55
+    adjusted_score = max(0.0, min(100.0, 50.0 + (score - 50.0) * max(0.35, conviction)))
+    return outcome, round(adjusted_score, 4)
 
 
 def refresh_sentiment_return_research(
@@ -2209,6 +2406,10 @@ def refresh_sentiment_return_research(
                     i.run_id,
                     i.article_id,
                     i.symbol,
+                    i.sentiment_label,
+                    i.sentiment_score,
+                    i.impact_score,
+                    i.confidence,
                     r.run_date AS event_date
                 FROM news_mail_symbol_impacts i
                 JOIN news_mail_runs r ON r.id = i.run_id
@@ -2228,8 +2429,21 @@ def refresh_sentiment_return_research(
             continue
         for horizon in (1, 3, 5):
             prices = _price_rows_for_symbol(symbol, event_date, horizon)
+            benchmark_prices = _price_rows_for_symbol("VNINDEX", event_date, horizon)
             status = "ready"
             base_date = base_close = future_date = future_close = return_pct = None
+            base_volume = future_volume = volume_change = None
+            benchmark_symbol = "VNINDEX"
+            benchmark_base_date = benchmark_base_close = benchmark_future_date = benchmark_future_close = None
+            benchmark_return_pct = None
+            abnormal_return_pct = None
+            outcome_label = None
+            outcome_score = None
+            metadata: dict[str, Any] = {
+                "event_study_version": "1.0.0",
+                "benchmark_symbol": benchmark_symbol,
+                "benchmark_missing": True,
+            }
             if not prices:
                 status = "pending_base"
                 pending += 1
@@ -2237,6 +2451,7 @@ def refresh_sentiment_return_research(
                 status = "pending_future"
                 base_date = prices[0]["trading_date"]
                 base_close = _safe_float(prices[0]["close_price"])
+                base_volume = _safe_float(prices[0].get("volume"))
                 pending += 1
             else:
                 base = prices[0]
@@ -2245,8 +2460,28 @@ def refresh_sentiment_return_research(
                 future_date = future["trading_date"]
                 base_close = _safe_float(base["close_price"])
                 future_close = _safe_float(future["close_price"])
-                if base_close and future_close:
-                    return_pct = ((future_close - base_close) / base_close) * 100.0
+                base_volume = _safe_float(base.get("volume"))
+                future_volume = _safe_float(future.get("volume"))
+                return_pct = _return_pct(base_close, future_close)
+                volume_change = _volume_change_pct(base_volume, future_volume)
+                if len(benchmark_prices) > horizon:
+                    benchmark_base = benchmark_prices[0]
+                    benchmark_future = benchmark_prices[horizon]
+                    benchmark_base_date = benchmark_base.get("trading_date")
+                    benchmark_future_date = benchmark_future.get("trading_date")
+                    benchmark_base_close = _safe_float(benchmark_base.get("close_price"))
+                    benchmark_future_close = _safe_float(benchmark_future.get("close_price"))
+                    benchmark_return_pct = _return_pct(benchmark_base_close, benchmark_future_close)
+                    metadata["benchmark_missing"] = benchmark_return_pct is None
+                if return_pct is not None:
+                    abnormal_return_pct = return_pct - benchmark_return_pct if benchmark_return_pct is not None else return_pct
+                    outcome_label, outcome_score = _news_event_outcome(
+                        sentiment_label=str(impact.get("sentiment_label") or "neutral"),
+                        sentiment_score=float(_safe_float(impact.get("sentiment_score"), 0.0) or 0.0),
+                        return_pct=return_pct,
+                        abnormal_return_pct=abnormal_return_pct,
+                        volume_change_pct=volume_change,
+                    )
                 else:
                     status = "pending_base"
                     pending += 1
@@ -2257,12 +2492,20 @@ def refresh_sentiment_return_research(
                         INSERT INTO news_mail_return_research (
                             id, run_id, article_id, symbol_impact_id, symbol, event_date,
                             horizon_days, base_trading_date, base_close, future_trading_date,
-                            future_close, return_pct, status
+                            future_close, return_pct, benchmark_symbol, benchmark_base_trading_date,
+                            benchmark_base_close, benchmark_future_trading_date, benchmark_future_close,
+                            benchmark_return_pct, abnormal_return_pct, base_volume, future_volume,
+                            volume_change_pct, outcome_label, outcome_score, status, metadata
                         )
                         VALUES (
                             %(id)s, %(run_id)s, %(article_id)s, %(symbol_impact_id)s, %(symbol)s,
                             %(event_date)s, %(horizon_days)s, %(base_trading_date)s, %(base_close)s,
-                            %(future_trading_date)s, %(future_close)s, %(return_pct)s, %(status)s
+                            %(future_trading_date)s, %(future_close)s, %(return_pct)s, %(benchmark_symbol)s,
+                            %(benchmark_base_trading_date)s, %(benchmark_base_close)s,
+                            %(benchmark_future_trading_date)s, %(benchmark_future_close)s,
+                            %(benchmark_return_pct)s, %(abnormal_return_pct)s, %(base_volume)s,
+                            %(future_volume)s, %(volume_change_pct)s, %(outcome_label)s,
+                            %(outcome_score)s, %(status)s, %(metadata)s
                         )
                         ON CONFLICT (symbol_impact_id, horizon_days)
                         DO UPDATE SET
@@ -2271,7 +2514,20 @@ def refresh_sentiment_return_research(
                             future_trading_date = EXCLUDED.future_trading_date,
                             future_close = EXCLUDED.future_close,
                             return_pct = EXCLUDED.return_pct,
+                            benchmark_symbol = EXCLUDED.benchmark_symbol,
+                            benchmark_base_trading_date = EXCLUDED.benchmark_base_trading_date,
+                            benchmark_base_close = EXCLUDED.benchmark_base_close,
+                            benchmark_future_trading_date = EXCLUDED.benchmark_future_trading_date,
+                            benchmark_future_close = EXCLUDED.benchmark_future_close,
+                            benchmark_return_pct = EXCLUDED.benchmark_return_pct,
+                            abnormal_return_pct = EXCLUDED.abnormal_return_pct,
+                            base_volume = EXCLUDED.base_volume,
+                            future_volume = EXCLUDED.future_volume,
+                            volume_change_pct = EXCLUDED.volume_change_pct,
+                            outcome_label = EXCLUDED.outcome_label,
+                            outcome_score = EXCLUDED.outcome_score,
                             status = EXCLUDED.status,
+                            metadata = EXCLUDED.metadata,
                             updated_at = NOW()
                         """,
                         {
@@ -2287,12 +2543,37 @@ def refresh_sentiment_return_research(
                             "future_trading_date": future_date,
                             "future_close": future_close,
                             "return_pct": return_pct,
+                            "benchmark_symbol": benchmark_symbol,
+                            "benchmark_base_trading_date": benchmark_base_date,
+                            "benchmark_base_close": benchmark_base_close,
+                            "benchmark_future_trading_date": benchmark_future_date,
+                            "benchmark_future_close": benchmark_future_close,
+                            "benchmark_return_pct": benchmark_return_pct,
+                            "abnormal_return_pct": abnormal_return_pct,
+                            "base_volume": base_volume,
+                            "future_volume": future_volume,
+                            "volume_change_pct": volume_change,
+                            "outcome_label": outcome_label,
+                            "outcome_score": outcome_score,
                             "status": status,
+                            "metadata": _as_json(metadata),
                         },
                     )
                 conn.commit()
             written += 1
-    return {"impacts_scanned": len(impacts), "rows_written": written, "pending": pending}
+    experience_refresh: dict[str, Any] | None = None
+    try:
+        from app.services.news_impact_experience_service import refresh_news_impact_experience
+
+        experience_refresh = refresh_news_impact_experience(days_back=max(365, int(days_back)))
+    except Exception as exc:
+        logger.warning("news_impact_experience_refresh_failed", extra={"error": str(exc)})
+    return {
+        "impacts_scanned": len(impacts),
+        "rows_written": written,
+        "pending": pending,
+        "experience_refresh": experience_refresh,
+    }
 
 
 def get_sentiment_return_research(
@@ -2316,6 +2597,15 @@ def get_sentiment_return_research(
                     rr.future_trading_date,
                     rr.future_close,
                     rr.return_pct,
+                    rr.benchmark_symbol,
+                    rr.benchmark_return_pct,
+                    rr.abnormal_return_pct,
+                    rr.base_volume,
+                    rr.future_volume,
+                    rr.volume_change_pct,
+                    rr.outcome_label,
+                    rr.outcome_score,
+                    rr.metadata,
                     rr.status,
                     i.sentiment_label,
                     i.sentiment_score,
@@ -2339,7 +2629,10 @@ def get_sentiment_return_research(
             cur.execute(
                 """
                 SELECT i.sentiment_label, rr.horizon_days, COUNT(*)::INT AS count,
-                       AVG(rr.return_pct) AS avg_return_pct
+                       AVG(rr.return_pct) AS avg_return_pct,
+                       AVG(rr.abnormal_return_pct) AS avg_abnormal_return_pct,
+                       AVG(rr.volume_change_pct) AS avg_volume_change_pct,
+                       AVG(rr.outcome_score) AS avg_outcome_score
                 FROM news_mail_return_research rr
                 JOIN news_mail_symbol_impacts i ON i.id = rr.symbol_impact_id
                 WHERE rr.status = 'ready'

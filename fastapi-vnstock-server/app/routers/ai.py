@@ -10,23 +10,23 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 from app.core.config import settings
-from app.services.claude_service import ClaudeService
+from app.services.gpt_service import GptService
 from app.services.redis_cache import RedisCacheService
 from app.services.vnstock_api_service import VNStockApiService
 
 router = APIRouter(prefix="/ai", tags=["ai"])
-claude_service = ClaudeService()
+gpt_service = GptService()
 vnstock_api_service = VNStockApiService()
 redis_cache_service = RedisCacheService()
 
 
-class ClaudeGenerateRequest(BaseModel):
+class GptGenerateRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
     system_prompt: Optional[str] = None
     model: Optional[str] = Field(
         default=None,
-        description="Optional Claude model override. Leave empty to use server default.",
-        examples=["claude-sonnet-4-6"],
+        description="Optional GPT model override. Leave empty to use server default.",
+        examples=["gpt-5.5"],
     )
     max_tokens: Optional[int] = Field(default=None, ge=1, le=8192)
     temperature: float = Field(default=0.2, ge=0, le=1)
@@ -37,7 +37,7 @@ class ClaudeGenerateRequest(BaseModel):
         if value is None:
             return None
         normalized = str(value).strip()
-        if normalized.lower() in {"", "string", "none", "null", "undefined"}:
+        if normalized.lower() in {"", "string", "none", "null", "undefined"} or normalized.lower().startswith("claude-"):
             return None
         return normalized
 
@@ -49,10 +49,10 @@ class AnalyzeSymbolRequest(BaseModel):
     source: str = Field(default="VCI", min_length=1, max_length=10)
     model: Optional[str] = Field(
         default=None,
-        description="Optional Claude model override. Leave empty to use server default.",
-        examples=["claude-sonnet-4-6"],
+        description="Optional GPT model override. Leave empty to use server default.",
+        examples=["gpt-5.5"],
     )
-    max_tokens: Optional[int] = Field(default=700, ge=100, le=5000)
+    max_tokens: Optional[int] = Field(default=20000, ge=100, le=20000)
     temperature: float = Field(default=0.2, ge=0, le=1)
 
     @field_validator("model", mode="before")
@@ -61,7 +61,7 @@ class AnalyzeSymbolRequest(BaseModel):
         if value is None:
             return None
         normalized = str(value).strip()
-        if normalized.lower() in {"", "string", "none", "null", "undefined"}:
+        if normalized.lower() in {"", "string", "none", "null", "undefined"} or normalized.lower().startswith("claude-"):
             return None
         return normalized
 
@@ -71,8 +71,8 @@ class AnalyzeSymbolShortRequest(BaseModel):
     interval: str = Field(default="1D", min_length=1, max_length=5)
     lookback_days: int = Field(default=90, ge=7, le=365)
     source: str = Field(default="VCI", min_length=1, max_length=10)
-    model: Optional[str] = Field(default=None, examples=["claude-sonnet-4-6"])
-    max_tokens: int = Field(default=1200, ge=100, le=1200)
+    model: Optional[str] = Field(default=None, examples=["gpt-5.5"])
+    max_tokens: int = Field(default=5000, ge=100, le=5000)
     temperature: float = Field(default=0.2, ge=0, le=1)
 
     @field_validator("model", mode="before")
@@ -81,7 +81,7 @@ class AnalyzeSymbolShortRequest(BaseModel):
         if value is None:
             return None
         normalized = str(value).strip()
-        if normalized.lower() in {"", "string", "none", "null", "undefined"}:
+        if normalized.lower() in {"", "string", "none", "null", "undefined"} or normalized.lower().startswith("claude-"):
             return None
         return normalized
 
@@ -400,7 +400,7 @@ def _build_structured_from_report(
         "Report:\n"
         f"{report_text}"
     )
-    extracted_text = claude_service.generate_text(
+    extracted_text = gpt_service.generate_text(
         prompt=extraction_prompt,
         system_prompt="Ban la bo chuyen doi du lieu sang JSON. Uu tien dung schema va JSON hop le.",
         model=model,
@@ -516,16 +516,16 @@ def _build_short_analyze_cache_key(payload: AnalyzeSymbolShortRequest, symbol: s
         "model": payload.model or "",
         "max_tokens": payload.max_tokens,
         "temperature": payload.temperature,
-        "prompt_version": "v1_short_technical_entry_exit",
+        "prompt_version": "v2_short_technical_entry_exit_5000_tokens",
     }
     digest = sha256(json.dumps(raw_key_payload, sort_keys=True).encode("utf-8")).hexdigest()
     return f"ai:analyze-symbol-short:{digest}"
 
 
 @router.post("/generate")
-def generate_text(payload: ClaudeGenerateRequest) -> dict:
+def generate_text(payload: GptGenerateRequest) -> dict:
     try:
-        result = claude_service.generate_text(
+        result = gpt_service.generate_text(
             prompt=payload.prompt,
             system_prompt=payload.system_prompt,
             model=payload.model,
@@ -612,7 +612,7 @@ def analyze_symbol(payload: AnalyzeSymbolRequest) -> dict:
             f"{context}"
         )
 
-        analysis_text = claude_service.generate_text(
+        analysis_text = gpt_service.generate_text(
             prompt=prompt,
             system_prompt=system_prompt,
             model=payload.model,
@@ -627,7 +627,7 @@ def analyze_symbol(payload: AnalyzeSymbolRequest) -> dict:
                 "Hay viet lai day du theo dung yeu cau: co Risk matrix, Bias, Confidence va khoi JSON schema hop le.\n\n"
                 f"Yeu cau goc:\n{prompt}"
             )
-            analysis_text = claude_service.generate_text(
+            analysis_text = gpt_service.generate_text(
                 prompt=repair_prompt,
                 system_prompt=system_prompt,
                 model=payload.model,
@@ -702,7 +702,7 @@ def analyze_symbol_short(payload: AnalyzeSymbolShortRequest) -> dict:
             "2) Dieu kien\n"
             "3) Diem ban\n"
             "4) Stop loss\n"
-            "Yeu cau: ngan gon, uu tien so lieu cu the, de lenh giao dich, khong vuot 1800 ky tu.\n\n"
+            "Yeu cau: ngan gon, uu tien so lieu cu the, de lenh giao dich, khong vuot 5000 tokens.\n\n"
             f"Symbol: {symbol}\n"
             f"Interval: {interval}\n"
             f"Lookback days: {payload.lookback_days}\n"
@@ -710,11 +710,11 @@ def analyze_symbol_short(payload: AnalyzeSymbolShortRequest) -> dict:
             f"Recent candles (tail): {recent_candles}"
         )
 
-        analysis_text = claude_service.generate_text(
+        analysis_text = gpt_service.generate_text(
             prompt=prompt,
             system_prompt=system_prompt,
             model=payload.model,
-            max_tokens=min(1200, payload.max_tokens),
+            max_tokens=min(5000, payload.max_tokens),
             temperature=payload.temperature,
         )
         response_data = {

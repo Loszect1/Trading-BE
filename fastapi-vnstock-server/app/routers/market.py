@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import APIRouter, HTTPException, Query
 
 from app.core.config import settings
-from app.services.claude_service import ClaudeService
+from app.services.gpt_service import GptService
 from app.services.news_mail_service import get_morning_brief
 from app.services.redis_cache import RedisCacheService
 from app.services.vnstock_api_service import VNStockApiService
@@ -19,7 +19,20 @@ router = APIRouter(prefix="/market", tags=["market"])
 vnstock_service = VNStockService()
 vnstock_api_service = VNStockApiService()
 redis_cache_service = RedisCacheService()
-claude_service = ClaudeService()
+gpt_service = GptService()
+_SCANNER_AI_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "selected_symbols": {"type": "array", "items": {"type": "string"}},
+        "reasoning": {"type": "string"},
+        "risk_by_symbol": {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+        },
+    },
+    "required": ["selected_symbols", "reasoning", "risk_by_symbol"],
+}
 
 
 def _build_scanner_cache_key(as_of: date, days: int, top_n: int, use_ai: bool) -> str:
@@ -176,14 +189,15 @@ def _ai_pick_top_symbols(
         f"{candidates}"
     )
     try:
-        ai_text = claude_service.generate_text(
+        ai_text = gpt_service.generate_text(
             prompt=prompt,
             system_prompt=(
                 "You are an equity scanner. Be concise, evidence-based, and return strict JSON only."
             ),
-            model=settings.claude_model,
-            max_tokens=min(1200, settings.claude_max_tokens),
+            model=settings.gpt_model,
+            max_tokens=min(1200, settings.gpt_max_tokens),
             temperature=0.2,
+            output_schema=_SCANNER_AI_OUTPUT_SCHEMA,
         )
         parsed = _extract_ai_json(ai_text)
         if not parsed:

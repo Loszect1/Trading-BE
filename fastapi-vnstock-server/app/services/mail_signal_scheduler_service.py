@@ -12,12 +12,13 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel, Field, ValidationError
 
 from app.core.config import get_vn_market_holiday_dates, settings
-from app.services.claude_service import ClaudeService
+from app.services.gpt_service import GptService
 from app.services.demo_trading_service import (
     get_active_scheduler_demo_session_id_from_db,
     get_demo_session_cash_balance,
 )
 from app.services.gmail_service import GmailFetchService
+from app.services.news_impact_experience_service import get_news_impact_adjustment_for_mail_signal
 from app.services.price_unit_service import normalize_vn_price_to_vnd
 from app.services.redis_cache import RedisCacheService
 from app.services.short_term_scan_schedule import is_instant_on_short_term_scan_grid
@@ -46,9 +47,32 @@ class _SignalPick(BaseModel):
 
 
 _gmail = GmailFetchService()
-_claude = ClaudeService()
+_gpt = GptService()
 _redis = RedisCacheService()
 _vnstock = VNStockApiService()
+_GPT_MAIL_SIGNAL_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "symbol": {"type": "string"},
+                    "entry": {"type": "number"},
+                    "take_profit": {"type": "number"},
+                    "stop_loss": {"type": "number"},
+                    "confidence": {"type": "number"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["symbol", "entry", "take_profit", "stop_loss", "confidence", "reason"],
+            },
+        }
+    },
+    "required": ["items"],
+}
 
 
 def _normalize_vn_price_unit(price: float) -> float:
@@ -117,7 +141,7 @@ def _build_prompt(mail_rows: list[dict[str, str]]) -> str:
     )
 
 
-def _parse_claude_json(raw_text: str) -> list[dict[str, Any]]:
+def _parse_gpt_json(raw_text: str) -> list[dict[str, Any]]:
     text = raw_text.strip()
     if not text:
         return []
@@ -133,9 +157,9 @@ def _parse_claude_json(raw_text: str) -> list[dict[str, Any]]:
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Claude JSON parse failed: {exc}") from exc
+        raise RuntimeError(f"GPT JSON parse failed: {exc}") from exc
     if not isinstance(payload, dict):
-        raise RuntimeError("Claude JSON root must be object.")
+        raise RuntimeError("GPT JSON root must be object.")
     raw_items = payload.get("items")
     if not isinstance(raw_items, list):
         return []
@@ -300,22 +324,23 @@ def run_mail_signal_pipeline() -> dict[str, Any]:
         )
         return result
 
-    source = "claude"
+    source = "gpt"
     fallback_error = ""
     try:
         prompt = _build_prompt(mail_rows)
-        response_text = _claude.generate_text_with_resilience(
+        response_text = _gpt.generate_text_with_resilience(
             prompt=prompt,
             system_prompt="Ban la chuyen gia swing trading VN, output chuan JSON va uu tien quan tri rui ro.",
-            model=settings.claude_model,
+            model=settings.gpt_model,
             max_tokens=900,
             temperature=0.1,
             cache_namespace="mail_signal_daily",
             cache_ttl_seconds=900,
+            output_schema=_GPT_MAIL_SIGNAL_OUTPUT_SCHEMA,
         )
-        items = _parse_claude_json(response_text)
+        items = _parse_gpt_json(response_text)
     except Exception as exc:
-        logger.warning("mail_signal_claude_failed_using_fallback", extra={"error": str(exc)})
+        logger.warning("mail_signal_gpt_failed_using_fallback", extra={"error": str(exc)})
         items = _fallback_parse_mail_signal_items(mail_rows)
         source = "deterministic_fallback"
         fallback_error = str(exc)
@@ -475,6 +500,33 @@ def _entry_hit(side: str, market_price: float, entry: float) -> bool:
     return market_price >= entry
 
 
+def _mail_signal_news_adjustment(symbol: str) -> dict[str, Any]:
+    try:
+        return get_news_impact_adjustment_for_mail_signal(symbol)
+    except Exception as exc:
+        return {
+            "applied": False,
+            "reason": "news_impact_experience_query_failed",
+            "error": str(exc),
+            "adjustment": 0.0,
+        }
+
+
+def _mail_signal_priority(item: _SignalPick, adjustment: dict[str, Any]) -> float:
+    return float(item.confidence) + (float(adjustment.get("adjustment") or 0.0) / 100.0)
+
+
+def _apply_negative_news_adjustment_to_qty(raw_qty: int, adjustment: dict[str, Any]) -> int:
+    base_qty = _normalize_board_lot_qty(raw_qty, lot_size=100)
+    if base_qty < 100:
+        return base_qty
+    adj = float(adjustment.get("adjustment") or 0.0) if bool(adjustment.get("applied")) else 0.0
+    if adj >= 0:
+        return base_qty
+    scale = max(0.55, 1.0 + (adj / 20.0))
+    return _normalize_board_lot_qty(int(float(base_qty) * scale), lot_size=100)
+
+
 def run_prev_day_entry_auto_trading_once(
     account_mode_override: str | None = None,
     demo_session_id_override: str | None = None,
@@ -509,25 +561,31 @@ def run_prev_day_entry_auto_trading_once(
     run_success = True
     run_error: str | None = None
 
-    try:
-        for row in raw_items:
-            if not isinstance(row, dict):
-                continue
-            try:
-                item = _SignalPick.model_validate(row)
-            except ValidationError:
-                continue
+    prepared_items: list[tuple[float, _SignalPick, dict[str, Any]]] = []
+    for row in raw_items:
+        if not isinstance(row, dict):
+            continue
+        try:
+            item = _SignalPick.model_validate(row)
+        except ValidationError:
+            continue
+        symbol = item.symbol.upper().strip()
+        adjustment = _mail_signal_news_adjustment(symbol)
+        prepared_items.append((_mail_signal_priority(item, adjustment), item, adjustment))
+    prepared_items.sort(key=lambda row: row[0], reverse=True)
 
+    try:
+        for _priority, item, news_adjustment in prepared_items:
             symbol = item.symbol.upper().strip()
             if not symbol:
                 continue
             try:
                 if account_mode == "DEMO" and not str(active_demo_session_id or "").strip():
-                    skipped.append({"symbol": symbol, "reason": "missing_demo_session_id"})
+                    skipped.append({"symbol": symbol, "reason": "missing_demo_session_id", "news_impact_experience": news_adjustment})
                     continue
                 execution_marker_key = f"signals:mail:executed:{prev_day.strftime('%Y-%m-%d')}:{symbol}:{account_mode}"
                 if _redis.get_json(execution_marker_key) is not None:
-                    skipped.append({"symbol": symbol, "reason": "already_executed"})
+                    skipped.append({"symbol": symbol, "reason": "already_executed", "news_impact_experience": news_adjustment})
                     continue
 
                 liquidity = get_cached_symbol_liquidity_status(symbol)
@@ -537,19 +595,28 @@ def run_prev_day_entry_auto_trading_once(
                             "symbol": symbol,
                             "reason": "low_or_irregular_liquidity",
                             "liquidity": liquidity,
+                            "news_impact_experience": news_adjustment,
                         }
                     )
                     continue
 
                 market_price = _extract_latest_price(symbol)
                 if market_price is None or market_price <= 0:
-                    skipped.append({"symbol": symbol, "reason": "missing_market_price"})
+                    skipped.append({"symbol": symbol, "reason": "missing_market_price", "news_impact_experience": news_adjustment})
                     continue
                 entry_price = normalize_vn_price_to_vnd(item.entry)
                 take_profit_price = normalize_vn_price_to_vnd(item.take_profit)
                 stop_loss_price = normalize_vn_price_to_vnd(item.stop_loss)
                 if not _entry_hit("BUY", market_price, entry_price):
-                    skipped.append({"symbol": symbol, "reason": "entry_not_hit", "market_price": market_price, "entry": entry_price})
+                    skipped.append(
+                        {
+                            "symbol": symbol,
+                            "reason": "entry_not_hit",
+                            "market_price": market_price,
+                            "entry": entry_price,
+                            "news_impact_experience": news_adjustment,
+                        }
+                    )
                     continue
                 if stop_loss_price >= market_price or take_profit_price <= market_price:
                     skipped.append(
@@ -560,6 +627,7 @@ def run_prev_day_entry_auto_trading_once(
                             "entry": entry_price,
                             "stop_loss": stop_loss_price,
                             "take_profit": take_profit_price,
+                            "news_impact_experience": news_adjustment,
                         }
                     )
                     continue
@@ -571,6 +639,7 @@ def run_prev_day_entry_auto_trading_once(
                             "market_price": market_price,
                             "remaining_nav": float(remaining_nav),
                             "required_cash_for_lot100": float(market_price * 100.0),
+                            "news_impact_experience": news_adjustment,
                         }
                     )
                     continue
@@ -590,7 +659,7 @@ def run_prev_day_entry_auto_trading_once(
                     }
                 )
                 raw_qty = min(max_qty, int(risk.get("suggested_size") or 0))
-                qty = _normalize_board_lot_qty(raw_qty, lot_size=100)
+                qty = _apply_negative_news_adjustment_to_qty(raw_qty, news_adjustment)
                 if qty < 100:
                     skipped.append(
                         {
@@ -606,6 +675,7 @@ def run_prev_day_entry_auto_trading_once(
                             "suggested_lot_size": int(risk.get("suggested_lot_size") or 0),
                             "risk_per_share": risk.get("risk_per_share"),
                             "risk_amount": risk.get("risk_amount"),
+                            "news_impact_experience": news_adjustment,
                         }
                     )
                     continue
@@ -633,6 +703,7 @@ def run_prev_day_entry_auto_trading_once(
                             "market_price_at_check": market_price,
                             "execution_price_source": "latest_market_price",
                             "liquidity": liquidity,
+                            "news_impact_experience": news_adjustment,
                         },
                     }
                 )
@@ -647,6 +718,7 @@ def run_prev_day_entry_auto_trading_once(
                             "status": order_status,
                             "order_id": order_id,
                             "order_reason": (resolved_order or {}).get("reason"),
+                            "news_impact_experience": news_adjustment,
                         }
                     )
                     continue
@@ -661,13 +733,28 @@ def run_prev_day_entry_auto_trading_once(
                     },
                     ttl_seconds=max(3600, int(settings.mail_signal_redis_ttl_seconds)),
                 )
-                executed.append({"symbol": symbol, "order_id": order_id, "status": order_status or None, "quantity": qty})
+                executed.append(
+                    {
+                        "symbol": symbol,
+                        "order_id": order_id,
+                        "status": order_status or None,
+                        "quantity": qty,
+                        "news_impact_experience": news_adjustment,
+                    }
+                )
             except Exception as symbol_exc:
                 logger.exception(
                     "mail_signal_entry_symbol_failed",
                     extra={"symbol": symbol, "account_mode": account_mode},
                 )
-                skipped.append({"symbol": symbol, "reason": "symbol_processing_error", "error": str(symbol_exc)})
+                skipped.append(
+                    {
+                        "symbol": symbol,
+                        "reason": "symbol_processing_error",
+                        "error": str(symbol_exc),
+                        "news_impact_experience": news_adjustment,
+                    }
+                )
     except Exception as run_exc:
         run_success = False
         run_error = str(run_exc)
@@ -684,6 +771,7 @@ def run_prev_day_entry_auto_trading_once(
             "effective_nav_vnd": float(nav),
             "remaining_nav_vnd": float(remaining_nav),
             "scanned": len(raw_items),
+            "valid_candidates": len(prepared_items),
             "executed": executed,
             "skipped": skipped,
             "ran_at": now_local.isoformat(),

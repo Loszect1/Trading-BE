@@ -358,6 +358,7 @@ def test_refresh_news_mail_workflow_runs_analysis_after_scan(monkeypatch):
     run_id = uuid4()
     article_id = uuid4()
     applied: list[dict[str, object]] = []
+    status_marks: list[dict[str, object]] = []
 
     monkeypatch.setattr(
         svc,
@@ -424,6 +425,11 @@ def test_refresh_news_mail_workflow_runs_analysis_after_scan(monkeypatch):
         return {"success": True, "updated_articles": 1, "written_impacts": 1}
 
     monkeypatch.setattr(svc, "apply_codex_results", fake_apply_codex_results)
+    monkeypatch.setattr(
+        svc,
+        "_mark_articles_analysis_status",
+        lambda **kwargs: status_marks.append(kwargs) or len(kwargs.get("article_ids") or []),
+    )
     monkeypatch.setattr(svc, "_run_summary", lambda run_id_arg: {"id": str(run_id_arg), "status": "completed"})
 
     result = svc.refresh_news_mail_workflow_from_gmail(article_fetch_limit=2)
@@ -433,3 +439,96 @@ def test_refresh_news_mail_workflow_runs_analysis_after_scan(monkeypatch):
     assert applied
     assert applied[0]["run_id"] == str(run_id)
     assert applied[0]["final_batch"] is True
+    assert status_marks[0]["status"] == "codex_running"
+
+
+def test_news_mail_workflow_marks_failed_article_batch(monkeypatch):
+    import app.services.news_mail_service as svc
+
+    run_id = uuid4()
+    article_id = uuid4()
+    marks: list[dict[str, object]] = []
+
+    monkeypatch.setattr(svc, "refresh_sentiment_return_research", lambda **kwargs: {})
+    monkeypatch.setattr(
+        svc,
+        "_mark_articles_analysis_status",
+        lambda **kwargs: marks.append(kwargs) or len(kwargs.get("article_ids") or []),
+    )
+    monkeypatch.setattr(svc, "_run_codex_cli_json", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("codex boom")))
+
+    try:
+        svc._run_news_mail_analysis_workflow(
+            run_id=run_id,
+            articles=[
+                {
+                    "article_id": str(article_id),
+                    "title": "Bad batch",
+                    "url": "https://example.vn/news",
+                    "fetch_status": "fetched",
+                    "article_text": "FPT co tin moi.",
+                }
+            ],
+            source="unit_test",
+        )
+    except RuntimeError:
+        pass
+
+    assert marks[0]["status"] == "codex_running"
+    assert marks[1]["status"] == "failed"
+    assert marks[1]["article_ids"] == [str(article_id)]
+
+
+def test_news_mail_workflow_skips_completed_articles_inside_batch(monkeypatch):
+    import app.services.news_mail_service as svc
+
+    run_id = uuid4()
+    done_id = uuid4()
+    pending_id = uuid4()
+    marked: list[dict[str, object]] = []
+    applied: list[list[str]] = []
+
+    monkeypatch.setattr(svc, "refresh_sentiment_return_research", lambda **kwargs: {})
+    monkeypatch.setattr(
+        svc,
+        "_mark_articles_analysis_status",
+        lambda **kwargs: marked.append(kwargs) or len(kwargs.get("article_ids") or []),
+    )
+    monkeypatch.setattr(
+        svc,
+        "_run_codex_cli_json",
+        lambda prompt, *, batch_number: json.dumps(
+            {
+                "articles": [
+                    {
+                        "article_id": str(pending_id),
+                        "summary": "Pending article done.",
+                        "key_points": [],
+                        "sector_tags": [],
+                        "market_tags": [],
+                        "data_gaps": [],
+                        "symbols": [],
+                    }
+                ]
+            }
+        ),
+    )
+
+    def fake_apply_codex_results(**kwargs):
+        applied.append([row["article_id"] for row in kwargs["articles"]])
+        return {"success": True, "updated_articles": len(kwargs["articles"]), "written_impacts": 0}
+
+    monkeypatch.setattr(svc, "apply_codex_results", fake_apply_codex_results)
+
+    result = svc._run_news_mail_analysis_workflow(
+        run_id=run_id,
+        articles=[
+            {"article_id": str(done_id), "codex_analysis_status": "completed", "title": "Done"},
+            {"article_id": str(pending_id), "codex_analysis_status": "pending", "title": "Pending"},
+        ],
+        source="unit_test",
+    )
+
+    assert result["updated_articles"] == 1
+    assert marked[0]["article_ids"] == [str(pending_id)]
+    assert applied == [[str(pending_id)]]
