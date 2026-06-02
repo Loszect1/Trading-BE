@@ -123,6 +123,40 @@ class SchedulerStateRow(BaseModel):
     updated_at: datetime
 
 
+class DemoPortfolioReviewRunRequest(BaseModel):
+    demo_session_id: str | None = Field(
+        default=None,
+        description="Optional DEMO session id. Defaults to active scheduler DEMO session.",
+    )
+
+
+class DemoPortfolioReviewRunRow(BaseModel):
+    id: str
+    started_at: datetime
+    finished_at: datetime
+    run_status: str
+    trigger_source: str
+    trigger_marker: str | None = None
+    session_id: str | None = None
+    holdings_count: int
+    applied_count: int
+    skipped_count: int
+    error: str | None = None
+    detail: dict[str, Any] = Field(default_factory=dict)
+
+
+class DemoPortfolioReviewSchedulerStatusResponse(BaseModel):
+    enabled: bool
+    running: bool
+    poll_seconds: int
+    timezone: str
+    schedule_times: list[str]
+    now_local: datetime
+    is_market_workday: bool
+    due: bool
+    active_demo_session_id: str | None = None
+
+
 class MailSignalEntryRunOnceRequest(BaseModel):
     account_mode: Literal["REAL", "DEMO"] = "REAL"
     demo_session_id: str | None = Field(

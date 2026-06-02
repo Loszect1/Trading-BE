@@ -10,6 +10,9 @@ from psycopg.rows import dict_row
 
 from app.core.config import settings
 from app.schemas.automation import (
+    DemoPortfolioReviewRunRequest,
+    DemoPortfolioReviewRunRow,
+    DemoPortfolioReviewSchedulerStatusResponse,
     MailSignalEntryRunOnceRequest,
     RealRecommendationBuyRequest,
     RealRecommendationScanRequest,
@@ -36,6 +39,7 @@ from app.services.demo_trading_service import get_demo_session_cash_balance
 from app.services.automation_scheduler_service import (
     get_active_scheduler_demo_session_id,
     get_automation_scheduler_status,
+    get_demo_portfolio_review_scheduler_status,
     get_persisted_scheduler_states,
     get_real_scan_only_scheduler_status,
     run_short_term_post_close_refresh_once,
@@ -63,6 +67,11 @@ from app.services.mail_signal_scheduler_service import (
     get_today_mail_signals,
     run_mail_signal_pipeline,
     run_prev_day_entry_auto_trading_once,
+)
+from app.services.demo_portfolio_review_service import (
+    get_last_demo_portfolio_review_run,
+    list_recent_demo_portfolio_review_runs,
+    run_demo_portfolio_review_once,
 )
 
 logger = logging.getLogger(__name__)
@@ -352,6 +361,64 @@ def post_short_term_post_close_refresh_run_once() -> dict[str, Any]:
     except Exception as exc:
         logger.exception("automation.short_term_post_close_refresh_run_once_failed")
         raise HTTPException(status_code=500, detail=f"Failed to run post-close refresh once: {exc}") from exc
+
+
+@router.post("/demo-portfolio-review/run-once")
+def post_demo_portfolio_review_run_once(
+    body: DemoPortfolioReviewRunRequest = DemoPortfolioReviewRunRequest(),
+) -> dict[str, Any]:
+    """Manually trigger one Codex review for the active DEMO portfolio."""
+    try:
+        raw = run_demo_portfolio_review_once(
+            demo_session_id=body.demo_session_id,
+            trigger_source="manual",
+        )
+        return {"success": bool(raw.get("success")), "data": raw}
+    except Exception as exc:
+        logger.exception("automation.demo_portfolio_review_run_once_failed")
+        raise HTTPException(status_code=500, detail=f"Failed to run demo portfolio review once: {exc}") from exc
+
+
+@router.get("/demo-portfolio-review/latest")
+def get_demo_portfolio_review_latest() -> dict[str, Any]:
+    """Most recent DEMO portfolio review run."""
+    try:
+        row = get_last_demo_portfolio_review_run()
+        if row is None:
+            return {"success": True, "data": None}
+        data = DemoPortfolioReviewRunRow.model_validate(row).model_dump(mode="json")
+        return {"success": True, "data": data}
+    except Exception as exc:
+        logger.exception("automation.demo_portfolio_review_latest_failed")
+        raise HTTPException(status_code=500, detail=f"Failed to read latest demo portfolio review: {exc}") from exc
+
+
+@router.get("/demo-portfolio-review/recent")
+def get_demo_portfolio_review_recent(
+    limit: int = Query(default=20, ge=1, le=200),
+    demo_session_id: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """Recent DEMO portfolio review runs."""
+    try:
+        rows = list_recent_demo_portfolio_review_runs(limit=limit, session_id=demo_session_id)
+        data = [DemoPortfolioReviewRunRow.model_validate(row).model_dump(mode="json") for row in rows]
+        return {"success": True, "data": data, "limit": limit, "demo_session_id": demo_session_id}
+    except Exception as exc:
+        logger.exception("automation.demo_portfolio_review_recent_failed")
+        raise HTTPException(status_code=500, detail=f"Failed to read demo portfolio review runs: {exc}") from exc
+
+
+@router.get(
+    "/demo-portfolio-review/scheduler/status",
+    response_model=DemoPortfolioReviewSchedulerStatusResponse,
+)
+def get_demo_portfolio_review_scheduler_status_api() -> DemoPortfolioReviewSchedulerStatusResponse:
+    """Read DEMO portfolio review scheduler status."""
+    try:
+        return DemoPortfolioReviewSchedulerStatusResponse.model_validate(get_demo_portfolio_review_scheduler_status())
+    except Exception as exc:
+        logger.exception("automation.demo_portfolio_review_scheduler_status_failed")
+        raise HTTPException(status_code=500, detail=f"Failed to read demo portfolio review scheduler status: {exc}") from exc
 
 
 @router.get("/scheduler/status", response_model=SchedulerStatusResponse)

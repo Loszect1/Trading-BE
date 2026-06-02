@@ -30,6 +30,7 @@ from app.services.signal_engine_service import (
     warm_short_term_liquidity_cache,
 )
 from app.services.real_recommendation_scan_service import run_real_recommendations_scan
+from app.services.demo_portfolio_review_service import run_demo_portfolio_review_once
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,8 @@ _real_scan_only_last_slot_marker: str | None = None
 _runtime_real_scan_only_enabled: bool = False
 _demo_auto_exit_loop_task: asyncio.Task | None = None
 _demo_auto_exit_last_slot_marker: str | None = None
+_demo_portfolio_review_loop_task: asyncio.Task | None = None
+_demo_portfolio_review_run_markers: set[str] = set()
 _redis_cache = RedisCacheService()
 _runtime_enabled: dict[AccountMode, bool] = {
     mode: bool(settings.automation_short_term_scheduler_enabled) for mode in _ACCOUNT_MODES
@@ -75,6 +78,68 @@ def _to_float(value: Any) -> float | None:
 def _real_scan_only_slot_marker(now_local: datetime) -> str:
     # Unique per VN slot grid boundary.
     return f"{now_local.date().isoformat()}-{now_local.hour:02d}:{now_local.minute:02d}"
+
+
+def _parse_demo_portfolio_review_schedule_times(raw: str | None = None) -> tuple[tuple[int, int], ...]:
+    source = str(raw if raw is not None else settings.demo_portfolio_review_schedule_times_csv).strip()
+    if not source:
+        return ((12, 0), (17, 0))
+    parsed: list[tuple[int, int]] = []
+    for token in source.split(","):
+        value = token.strip()
+        if not value:
+            continue
+        parts = value.split(":", 1)
+        try:
+            hour = int(parts[0].strip())
+            minute = int(parts[1].strip()) if len(parts) == 2 else 0
+        except ValueError:
+            logger.warning(
+                "demo_portfolio_review_schedule_invalid_token",
+                extra={"token": value, "raw": source},
+            )
+            continue
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            parsed.append((hour, minute))
+        else:
+            logger.warning(
+                "demo_portfolio_review_schedule_out_of_range",
+                extra={"token": value, "raw": source},
+            )
+    if not parsed:
+        return ((12, 0), (17, 0))
+    return tuple(sorted(set(parsed)))
+
+
+def _is_vn_market_workday(day: date) -> bool:
+    return day.weekday() < 5 and day not in get_vn_market_holiday_dates()
+
+
+def _demo_portfolio_review_slot_marker(now_local: datetime) -> str:
+    return f"{now_local.date().isoformat()}-{now_local.hour:02d}:{now_local.minute:02d}"
+
+
+def _demo_portfolio_review_scheduler_snapshot(now_local: datetime | None = None) -> dict[str, Any]:
+    tz = ZoneInfo(settings.demo_portfolio_review_timezone)
+    local_now = now_local.astimezone(tz) if now_local is not None else datetime.now(tz=tz)
+    schedule_times = _parse_demo_portfolio_review_schedule_times()
+    marker = _demo_portfolio_review_slot_marker(local_now)
+    is_workday = _is_vn_market_workday(local_now.date())
+    due = (
+        bool(settings.demo_portfolio_review_scheduler_enabled)
+        and is_workday
+        and (local_now.hour, local_now.minute) in schedule_times
+        and marker not in _demo_portfolio_review_run_markers
+    )
+    return {
+        "enabled": bool(settings.demo_portfolio_review_scheduler_enabled),
+        "timezone": settings.demo_portfolio_review_timezone,
+        "schedule_times": [f"{hour:02d}:{minute:02d}" for hour, minute in schedule_times],
+        "now_local": local_now,
+        "is_market_workday": is_workday,
+        "due": due,
+        "marker": marker,
+    }
 
 
 def _is_vn_market_open(now_local: datetime) -> bool:
@@ -156,6 +221,102 @@ async def _stop_demo_auto_exit_scheduler() -> None:
     _demo_auto_exit_last_slot_marker = None
     _log_task_state("demo_auto_exit_scheduler", "STOPPED")
     logger.warning("demo_auto_exit_scheduler_task_stopped")
+
+
+async def _demo_portfolio_review_scheduler_loop() -> None:
+    poll_seconds = 30
+    logger.info(
+        "demo_portfolio_review_scheduler_started",
+        extra={
+            "timezone": settings.demo_portfolio_review_timezone,
+            "schedule_times": list(_demo_portfolio_review_scheduler_snapshot()["schedule_times"]),
+            "poll_seconds": poll_seconds,
+        },
+    )
+    while True:
+        try:
+            snapshot = _demo_portfolio_review_scheduler_snapshot()
+            if bool(snapshot["due"]):
+                marker = str(snapshot["marker"])
+                result = await asyncio.to_thread(
+                    run_demo_portfolio_review_once,
+                    demo_session_id=_active_demo_session_id,
+                    trigger_source="scheduler",
+                    trigger_marker=marker,
+                )
+                _demo_portfolio_review_run_markers.add(marker)
+                _log_task_state(
+                    "demo_portfolio_review_scheduler",
+                    "FINISHED",
+                    marker=marker,
+                    session_id=result.get("session_id"),
+                    run_status=result.get("run_status"),
+                    applied_count=int(result.get("applied_count") or 0),
+                    skipped_count=int(result.get("skipped_count") or 0),
+                )
+                logger.warning(
+                    "demo_portfolio_review_scheduler_completed",
+                    extra={
+                        "marker": marker,
+                        "session_id": result.get("session_id"),
+                        "run_status": result.get("run_status"),
+                        "applied_count": int(result.get("applied_count") or 0),
+                        "skipped_count": int(result.get("skipped_count") or 0),
+                    },
+                )
+            if len(_demo_portfolio_review_run_markers) > 20:
+                today_prefix = datetime.now(tz=ZoneInfo(settings.demo_portfolio_review_timezone)).date().isoformat()
+                _demo_portfolio_review_run_markers.intersection_update(
+                    {m for m in _demo_portfolio_review_run_markers if str(m).startswith(today_prefix)}
+                )
+        except Exception as exc:
+            _log_task_state("demo_portfolio_review_scheduler", "FAILED", error=str(exc))
+            logger.warning("demo_portfolio_review_scheduler_failed", extra={"error": str(exc)})
+        await asyncio.sleep(poll_seconds)
+
+
+async def _start_demo_portfolio_review_scheduler() -> None:
+    global _demo_portfolio_review_loop_task
+    if not bool(settings.demo_portfolio_review_scheduler_enabled):
+        logger.info("demo_portfolio_review_scheduler_disabled")
+        return
+    if _demo_portfolio_review_loop_task and not _demo_portfolio_review_loop_task.done():
+        return
+    _demo_portfolio_review_loop_task = asyncio.create_task(
+        _demo_portfolio_review_scheduler_loop(),
+        name="demo-portfolio-review-scheduler",
+    )
+    _log_task_state("demo_portfolio_review_scheduler", "STARTED")
+    logger.warning("demo_portfolio_review_scheduler_task_started")
+
+
+async def _stop_demo_portfolio_review_scheduler() -> None:
+    global _demo_portfolio_review_loop_task
+    if _demo_portfolio_review_loop_task and not _demo_portfolio_review_loop_task.done():
+        _demo_portfolio_review_loop_task.cancel()
+        try:
+            await _demo_portfolio_review_loop_task
+        except asyncio.CancelledError:
+            pass
+    _demo_portfolio_review_loop_task = None
+    _log_task_state("demo_portfolio_review_scheduler", "STOPPED")
+    logger.warning("demo_portfolio_review_scheduler_task_stopped")
+
+
+def get_demo_portfolio_review_scheduler_status() -> dict[str, Any]:
+    snapshot = _demo_portfolio_review_scheduler_snapshot()
+    running = _demo_portfolio_review_loop_task is not None and not _demo_portfolio_review_loop_task.done()
+    return {
+        "enabled": bool(snapshot["enabled"]),
+        "running": running,
+        "poll_seconds": 30,
+        "timezone": snapshot["timezone"],
+        "schedule_times": snapshot["schedule_times"],
+        "now_local": snapshot["now_local"],
+        "is_market_workday": bool(snapshot["is_market_workday"]),
+        "due": bool(snapshot["due"]),
+        "active_demo_session_id": _active_demo_session_id,
+    }
 
 
 def _run_real_scan_only_and_persist(slot_marker: str | None = None) -> dict[str, Any]:
@@ -960,6 +1121,7 @@ async def start_automation_scheduler() -> None:
         await _start_real_scan_only_scheduler()
 
     await _start_cache_warm_scheduler()
+    await _start_demo_portfolio_review_scheduler()
 
 
 async def stop_automation_scheduler() -> None:
@@ -968,6 +1130,7 @@ async def stop_automation_scheduler() -> None:
     await _stop_demo_auto_exit_scheduler()
     await _stop_real_scan_only_scheduler()
     await _stop_cache_warm_scheduler()
+    await _stop_demo_portfolio_review_scheduler()
 
 
 async def _start_mode_scheduler(account_mode: AccountMode) -> None:

@@ -247,6 +247,12 @@ class AppSettings(BaseSettings):
     #: Optional comma-separated local hours for post-close refresh, e.g. "12,16".
     #: When provided, this overrides `automation_short_term_post_close_refresh_hour`.
     automation_short_term_post_close_refresh_hours_csv: str = ""
+    #: Enable DEMO portfolio Codex review scheduler. DEMO-only; never places REAL broker orders.
+    demo_portfolio_review_scheduler_enabled: bool = True
+    #: Comma-separated VN local times for DEMO portfolio review, e.g. "12:00,17:00".
+    demo_portfolio_review_schedule_times_csv: str = "12:00,17:00"
+    demo_portfolio_review_timezone: str = "Asia/Ho_Chi_Minh"
+    demo_portfolio_review_max_tokens: int = Field(default=1200, ge=300, le=5000)
     #: Retention window (days) for market_symbol_daily_volume writes.
     market_symbol_daily_volume_retention_days: int = Field(default=90, ge=5, le=120)
     #: Optional CSV list of VN market holidays: YYYY-MM-DD,YYYY-MM-DD
@@ -314,6 +320,15 @@ class AppSettings(BaseSettings):
     @field_validator("short_term_scan_timezone")
     @classmethod
     def _timezone_must_resolve(cls, v: str) -> str:
+        try:
+            ZoneInfo(v)
+        except ZoneInfoNotFoundError as e:
+            raise ValueError(f"Invalid IANA timezone: {v!r}") from e
+        return v
+
+    @field_validator("demo_portfolio_review_timezone")
+    @classmethod
+    def _demo_review_timezone_must_resolve(cls, v: str) -> str:
         try:
             ZoneInfo(v)
         except ZoneInfoNotFoundError as e:

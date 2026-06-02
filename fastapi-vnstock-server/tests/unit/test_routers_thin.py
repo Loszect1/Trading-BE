@@ -445,6 +445,68 @@ class TestAutomationRouterThin:
         r4 = client.post("/automation/scheduler/toggle", json={"account_mode": "DEMO", "enabled": True})
         assert r4.status_code == 500
 
+    def test_demo_portfolio_review_endpoints(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        row = {
+            "id": "01900000-0000-0000-0000-000000000001",
+            "started_at": datetime(2026, 5, 7, 12, 0, tzinfo=timezone.utc),
+            "finished_at": datetime(2026, 5, 7, 12, 1, tzinfo=timezone.utc),
+            "run_status": "COMPLETED",
+            "trigger_source": "manual",
+            "trigger_marker": None,
+            "session_id": "demo-1",
+            "holdings_count": 1,
+            "applied_count": 1,
+            "skipped_count": 0,
+            "error": None,
+            "detail": {"applied": [{"symbol": "FPT"}]},
+        }
+        monkeypatch.setattr(
+            "app.routers.automation.run_demo_portfolio_review_once",
+            lambda demo_session_id=None, trigger_source="manual": {
+                "success": True,
+                "run_status": "COMPLETED",
+                "session_id": demo_session_id or "demo-1",
+                "applied_count": 1,
+                "skipped_count": 0,
+            },
+        )
+        monkeypatch.setattr("app.routers.automation.get_last_demo_portfolio_review_run", lambda: row)
+        monkeypatch.setattr(
+            "app.routers.automation.list_recent_demo_portfolio_review_runs",
+            lambda limit=20, session_id=None: [row],
+        )
+        monkeypatch.setattr(
+            "app.routers.automation.get_demo_portfolio_review_scheduler_status",
+            lambda: {
+                "enabled": True,
+                "running": False,
+                "poll_seconds": 30,
+                "timezone": "Asia/Ho_Chi_Minh",
+                "schedule_times": ["12:00", "17:00"],
+                "now_local": datetime(2026, 5, 7, 12, 0, tzinfo=timezone.utc),
+                "is_market_workday": True,
+                "due": False,
+                "active_demo_session_id": "demo-1",
+            },
+        )
+        client = _automation_client()
+
+        r_run = client.post("/automation/demo-portfolio-review/run-once", json={"demo_session_id": "demo-1"})
+        assert r_run.status_code == 200
+        assert r_run.json()["data"]["applied_count"] == 1
+
+        r_latest = client.get("/automation/demo-portfolio-review/latest")
+        assert r_latest.status_code == 200
+        assert r_latest.json()["data"]["session_id"] == "demo-1"
+
+        r_recent = client.get("/automation/demo-portfolio-review/recent?limit=5&demo_session_id=demo-1")
+        assert r_recent.status_code == 200
+        assert len(r_recent.json()["data"]) == 1
+
+        r_status = client.get("/automation/demo-portfolio-review/scheduler/status")
+        assert r_status.status_code == 200
+        assert r_status.json()["schedule_times"] == ["12:00", "17:00"]
+
 
 class TestAutoTradingRouterThin:
     def test_demo_deposit_success_and_validation(self, monkeypatch: pytest.MonkeyPatch) -> None:
