@@ -17,7 +17,7 @@ from psycopg import connect
 
 from app.core.config import settings
 
-SCORING_PIPELINE_VERSION = "1.3.0"
+SCORING_PIPELINE_VERSION = "1.4.0"
 
 # Deterministic post-lexical sentiment shaping (no external APIs).
 SENTIMENT_INTERPRETATION_LAYER_VERSION = "1.1.0"
@@ -1216,21 +1216,33 @@ def score_short_term_technical(
     momentum_5d_pct: float | None = None,
     rsi14: float | None = None,
     distance_from_ema20_pct: float | None = None,
+    market_regime: dict[str, Any] | None = None,
+    relative_strength: dict[str, Any] | None = None,
+    sector_breadth: dict[str, Any] | None = None,
+    atrp14: float | None = None,
 ) -> dict[str, Any]:
-    """0-100 CMT-style short-term technical score: participation, trend, momentum, RSI, and stretch."""
+    """0-100 CMT-style short-term score: trend, participation, RS, volatility risk, and regime."""
     spike_c = _clamp(spike, 0.0, 8.0)
-    spike_component = _clamp((spike_c - 1.0) / 2.0 * 35.0, 0.0, 40.0)  # 1x -> 0, ~3x -> strong
-    trend_component = 25.0 if last_close > ema20_proxy and ema20_proxy > 0 else 8.0
+    spike_component = _clamp((spike_c - 1.0) / 2.0 * 16.0, 0.0, 16.0)
     vol_confirm = 0.0
     if len(volumes) >= 2 and len(closes) >= 2:
         v_prev = float(volumes[-2]) if volumes[-2] > 0 else 0.0
         if v_prev > 0 and volumes[-1] >= v_prev:
-            vol_confirm = 5.0
+            vol_confirm = 4.0
+    volume_component = _clamp(spike_component + vol_confirm, 0.0, 20.0)
 
     if momentum_5d_pct is None:
         momentum_5d_pct = _pct_return_slice([float(v) for v in closes], 6)
     mom = float(momentum_5d_pct) if momentum_5d_pct is not None else 0.0
-    momentum_component = _clamp(7.0 + mom * 1.6, 0.0, 18.0)
+    momentum_component = _clamp(5.0 + mom * 1.2, 0.0, 10.0)
+    trend_component = 8.0
+    if last_close > ema20_proxy and ema20_proxy > 0:
+        trend_component = 15.0
+    if len(closes) >= 20 and closes[-20] > 0 and last_close > closes[-20]:
+        trend_component += 5.0
+    if len(closes) >= 50 and sum(float(v) for v in closes[-20:]) / 20.0 > sum(float(v) for v in closes[-50:]) / 50.0:
+        trend_component += 5.0
+    trend_component = _clamp(trend_component, 0.0, 25.0)
 
     if rsi14 is None:
         deltas = [float(closes[i] - closes[i - 1]) for i in range(1, len(closes))]
@@ -1246,11 +1258,11 @@ def score_short_term_technical(
             rsi14 = 100.0 - (100.0 / (1.0 + rs))
     rsi_value = float(rsi14)
     if 50.0 <= rsi_value <= 75.0:
-        rsi_component = 12.0
+        rsi_component = 8.0
     elif 40.0 <= rsi_value < 50.0 or 75.0 < rsi_value <= 80.0:
-        rsi_component = 6.0
+        rsi_component = 4.0
     elif rsi_value < 30.0:
-        rsi_component = 3.0
+        rsi_component = 2.0
     else:
         rsi_component = 0.0
 
@@ -1263,8 +1275,49 @@ def score_short_term_technical(
     elif distance < -6.0:
         stretch_penalty = min(10.0, abs(distance + 6.0))
 
+    rs_meta = relative_strength if isinstance(relative_strength, dict) else {}
+    sector_meta = sector_breadth if isinstance(sector_breadth, dict) else {}
+    rs_rank = _to_float(sector_meta.get("relative_strength_rank_pct"))
+    if rs_rank is None:
+        rs_rank = _to_float(rs_meta.get("relative_strength_rank_pct"))
+    if rs_rank is None:
+        rs_rank = 50.0
+    relative_strength_component = _clamp((float(rs_rank) / 100.0) * 20.0, 0.0, 20.0)
+
+    atrp = _to_float(atrp14)
+    if atrp is None or atrp <= 0:
+        volatility_risk_component = 10.0
+    elif atrp <= 5.0:
+        volatility_risk_component = 15.0
+    elif atrp <= 7.5:
+        volatility_risk_component = 10.0
+    elif atrp <= 10.0:
+        volatility_risk_component = 6.0
+    else:
+        volatility_risk_component = 2.0
+    if distance > 8.0 or rsi_value > 80.0:
+        volatility_risk_component = max(0.0, volatility_risk_component - 5.0)
+
+    regime_meta = market_regime if isinstance(market_regime, dict) else {}
+    regime = str(regime_meta.get("regime") or regime_meta.get("regime_key") or "NEUTRAL").upper()
+    if regime == "RISK_ON":
+        regime_component = 10.0
+    elif regime == "RISK_OFF":
+        regime_component = 2.0
+    else:
+        regime_component = 6.0
+
+    freshness_news_component = 5.0
     technical = _clamp(
-        spike_component + trend_component + vol_confirm + momentum_component + rsi_component - stretch_penalty,
+        trend_component
+        + volume_component
+        + relative_strength_component
+        + volatility_risk_component
+        + regime_component
+        + freshness_news_component
+        + momentum_component
+        + rsi_component
+        - stretch_penalty,
         0.0,
         100.0,
     )
@@ -1272,12 +1325,20 @@ def score_short_term_technical(
         "score_0_100": round(technical, 2),
         "detail": {
             "spike_component": round(spike_component, 2),
+            "volume_component": round(volume_component, 2),
             "trend_component": round(trend_component, 2),
             "volume_confirmation": round(vol_confirm, 2),
             "momentum_5d_component": round(momentum_component, 2),
             "momentum_5d_pct": round(mom, 4),
             "rsi_component": round(rsi_component, 2),
             "rsi14": round(rsi_value, 4),
+            "relative_strength_component": round(relative_strength_component, 2),
+            "relative_strength_rank_pct": round(float(rs_rank), 4),
+            "volatility_risk_component": round(volatility_risk_component, 2),
+            "atrp14": round(float(atrp), 4) if atrp is not None else None,
+            "market_regime_component": round(regime_component, 2),
+            "market_regime": regime,
+            "freshness_news_component": round(freshness_news_component, 2),
             "stretch_penalty": round(stretch_penalty, 2),
             "distance_from_ema20_pct": round(distance, 4),
             "volume_spike_ratio": round(spike, 4),

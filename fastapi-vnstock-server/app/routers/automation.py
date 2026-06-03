@@ -10,6 +10,7 @@ from psycopg.rows import dict_row
 
 from app.core.config import settings
 from app.schemas.automation import (
+    AiDecisionEventRow,
     DemoPortfolioReviewRunRequest,
     DemoPortfolioReviewRunRow,
     DemoPortfolioReviewSchedulerStatusResponse,
@@ -28,6 +29,7 @@ from app.schemas.automation import (
     TechnicalCycleRunRequest,
     TechnicalCycleRunResponse,
 )
+from app.services.ai_decision_event_service import list_recent_ai_decision_events
 from app.services.real_recommendation_service import preflight_real_recommendations
 from app.services.real_recommendation_scan_service import (
     get_latest_real_recommendations_payload,
@@ -195,6 +197,38 @@ def get_short_term_runs(
     except Exception as exc:
         logger.exception("automation.short_term_runs_failed")
         raise HTTPException(status_code=500, detail=f"Failed to read automation runs: {exc}") from exc
+
+
+@router.get("/ai-decisions")
+def get_ai_decisions(
+    limit: int = Query(default=50, ge=1, le=200),
+    workflow_type: str | None = Query(default=None, max_length=64),
+    symbol: str | None = Query(default=None, max_length=20),
+    account_mode: Literal["REAL", "DEMO"] | None = Query(default=None),
+    reuse_status: Literal["NEW", "APPROVED", "REJECTED", "EXPIRED"] | None = Query(default=None),
+) -> dict[str, Any]:
+    """Recent DB-backed GPT/Codex decision events for audit and reusable strategy memory."""
+    try:
+        rows = list_recent_ai_decision_events(
+            workflow_type=workflow_type,
+            symbol=symbol,
+            account_mode=account_mode,
+            reuse_status=reuse_status,
+            limit=limit,
+        )
+        data = [AiDecisionEventRow.model_validate(row).model_dump(mode="json") for row in rows]
+        return {
+            "success": True,
+            "data": data,
+            "limit": limit,
+            "workflow_type": workflow_type,
+            "symbol": symbol,
+            "account_mode": account_mode,
+            "reuse_status": reuse_status,
+        }
+    except Exception as exc:
+        logger.exception("automation.ai_decisions_failed")
+        raise HTTPException(status_code=500, detail=f"Failed to read AI decision events: {exc}") from exc
 
 
 @router.post("/technical/run-cycle", response_model=TechnicalCycleRunResponse)

@@ -11,6 +11,12 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 from app.core.config import settings
+from app.services.ai_decision_event_service import (
+    build_prompt_hash,
+    get_symbol_ai_memory,
+    record_ai_decision_event,
+    summarize_reusable_ai_lessons,
+)
 from app.services.demo_trading_service import (
     get_active_scheduler_demo_session_id_from_db,
     get_demo_session_overview,
@@ -439,8 +445,27 @@ def run_demo_portfolio_review_once(
                 "error": error,
             }
 
+        ai_memory: list[dict[str, Any]] = []
+        for holding in holdings[:10]:
+            symbol = str(holding.get("symbol") or "").strip().upper() if isinstance(holding, dict) else ""
+            strategy_type = str(holding.get("strategy_code") or "SHORT_TERM").strip().upper() if isinstance(holding, dict) else "SHORT_TERM"
+            if not symbol:
+                continue
+            try:
+                ai_memory.extend(
+                    summarize_reusable_ai_lessons(
+                        get_symbol_ai_memory(symbol=symbol, strategy_type=strategy_type, limit=2),
+                        max_items=2,
+                    )
+                )
+            except Exception:
+                continue
+        if ai_memory:
+            payload["ai_memory"] = ai_memory[:10]
+        prompt = _build_review_prompt(payload)
+        prompt_hash = build_prompt_hash(prompt)
         raw = _gpt_service.generate_text(
-            prompt=_build_review_prompt(payload),
+            prompt=prompt,
             system_prompt=(
                 "You are a Vietnam equities portfolio risk reviewer. "
                 "Apply Vietnam market mechanics, risk management, and technical-analysis discipline. "
@@ -479,6 +504,40 @@ def run_demo_portfolio_review_once(
                 )
 
         run_status = "COMPLETED"
+        ai_decision_event_id = ""
+        try:
+            event = record_ai_decision_event(
+                workflow_type="DEMO_PORTFOLIO_REVIEW",
+                account_mode="DEMO",
+                symbol=None,
+                strategy_type=None,
+                source_type="demo_portfolio_review_run",
+                source_id=run_id,
+                session_id=sid,
+                idempotency_key=f"demo-portfolio-review:{sid}:{str(run_id)}:{prompt_hash}",
+                model=settings.gpt_model,
+                schema_version="demo-portfolio-review-v1",
+                prompt_hash=prompt_hash,
+                confidence=None,
+                input_snapshot=payload,
+                llm_recommendation=parsed,
+                final_system_decision={
+                    "run_status": run_status,
+                    "applied_count": len(applied),
+                    "skipped_count": len(skipped),
+                    "applied": applied,
+                    "skipped": skipped,
+                },
+                guardrail_result={
+                    "status": "VALIDATED",
+                    "reason": "demo_exit_level_validation",
+                    "applied_count": len(applied),
+                    "skipped_count": len(skipped),
+                },
+            )
+            ai_decision_event_id = str(event.get("id") or "")
+        except Exception as exc:
+            logger.debug("demo_portfolio_review_ai_decision_event_failed", extra={"session_id": sid, "error": str(exc)})
         detail = {
             "session_id": sid,
             "portfolio": payload,
@@ -487,6 +546,9 @@ def run_demo_portfolio_review_once(
             "applied": applied,
             "skipped": skipped,
         }
+        if ai_decision_event_id:
+            detail["ai_decision_event_id"] = ai_decision_event_id
+            detail["ai_decision_event_ids"] = [ai_decision_event_id]
         return {
             "success": True,
             "run_id": str(run_id),

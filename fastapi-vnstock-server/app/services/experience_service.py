@@ -12,6 +12,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 from app.core.config import settings
+from app.services.ai_decision_event_service import build_prompt_hash, record_ai_decision_event
 from app.services.gpt_service import GptService
 
 
@@ -311,6 +312,7 @@ def _analyze_experience_with_gpt(record: ExperienceRecord) -> tuple[str, list[st
         f"- pnl_percent: {record.pnl_percent}\n"
         f"- market_context: {record.market_context}\n"
     )
+    prompt_hash = build_prompt_hash(prompt)
     raw = _gpt_service.generate_text_with_resilience(
         prompt=prompt,
         system_prompt=(
@@ -355,6 +357,41 @@ def _analyze_experience_with_gpt(record: ExperienceRecord) -> tuple[str, list[st
                 "min_momentum_5d_pct": max(0.0, min(5.0, min_mom)),
                 "max_distance_from_ema20_pct": max(2.0, min(15.0, max_dist)),
             }
+    try:
+        event = record_ai_decision_event(
+            workflow_type="EXPERIENCE_ANALYSIS",
+            account_mode=record.account_mode,
+            symbol=record.symbol,
+            strategy_type=record.strategy_type,
+            source_type="trade",
+            source_id=record.trade_id,
+            idempotency_key=f"experience-analysis:{record.account_mode}:{record.symbol}:{record.strategy_type}:{record.trade_id}:{prompt_hash}",
+            model=settings.gpt_model,
+            schema_version="experience-analysis-v1",
+            prompt_hash=prompt_hash,
+            confidence=confidence,
+            input_snapshot={
+                "trade_id": record.trade_id,
+                "account_mode": record.account_mode,
+                "symbol": record.symbol,
+                "strategy_type": record.strategy_type,
+                "pnl_value": record.pnl_value,
+                "pnl_percent": record.pnl_percent,
+                "market_context": record.market_context,
+            },
+            llm_recommendation=parsed,
+            final_system_decision={
+                "root_cause": root_cause,
+                "mistake_tags": tags,
+                "improvement_action": improvement_action,
+                "confidence_after_review": confidence,
+            },
+            guardrail_result={"status": "APPLIED_TO_EXPERIENCE", "reason": "post_trade_learning"},
+        )
+        if event.get("id") and isinstance(record.market_context, dict):
+            record.market_context["ai_decision_event_id"] = str(event["id"])
+    except Exception:
+        pass
     return root_cause, tags, improvement_action, confidence, adaptation
 
 

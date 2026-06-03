@@ -145,6 +145,29 @@ class DemoPortfolioReviewRunRow(BaseModel):
     detail: dict[str, Any] = Field(default_factory=dict)
 
 
+class AiDecisionEventRow(BaseModel):
+    id: str
+    created_at: datetime
+    updated_at: datetime | None = None
+    workflow_type: str
+    account_mode: str | None = None
+    symbol: str | None = None
+    strategy_type: str | None = None
+    source_type: str | None = None
+    source_id: str | None = None
+    session_id: str | None = None
+    idempotency_key: str
+    model: str | None = None
+    schema_version: str
+    prompt_hash: str
+    confidence: float | None = None
+    reuse_status: str
+    input_snapshot: dict[str, Any] = Field(default_factory=dict)
+    llm_recommendation: dict[str, Any] = Field(default_factory=dict)
+    final_system_decision: dict[str, Any] = Field(default_factory=dict)
+    guardrail_result: dict[str, Any] = Field(default_factory=dict)
+
+
 class DemoPortfolioReviewSchedulerStatusResponse(BaseModel):
     enabled: bool
     running: bool

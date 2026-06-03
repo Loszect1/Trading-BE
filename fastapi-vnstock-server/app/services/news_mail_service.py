@@ -8,6 +8,7 @@ import re
 import subprocess
 import tempfile
 import threading
+import time
 import unicodedata
 from datetime import date, datetime, timezone
 from html.parser import HTMLParser
@@ -1527,6 +1528,57 @@ def _article_analysis_is_done(row: dict[str, Any]) -> bool:
     return status == "completed" or bool(summary)
 
 
+def _news_mail_article_log_label(row: dict[str, Any]) -> str:
+    article_id = str(row.get("article_id") or row.get("id") or "").strip() or "unknown"
+    section_index = row.get("section_index")
+    if section_index is None or section_index == "":
+        section_index = "unknown"
+    source_host = str(row.get("source_host") or "").strip()
+    if not source_host:
+        source_host = _host_from_url(str(row.get("url") or ""))
+    if not source_host:
+        source_host = "unknown"
+    title = _compact_text(str(row.get("title") or row.get("section_title") or row.get("url") or ""), 180)
+    if not title:
+        title = "untitled"
+    return "article_id=%s section_index=%s source_host=%s title=%r" % (
+        article_id,
+        section_index,
+        source_host,
+        title,
+    )
+
+
+def _log_news_mail_analysis_article(
+    event: str,
+    *,
+    run_id: UUID | str,
+    source: str,
+    batch_number: int,
+    article_position: int,
+    total_articles: int,
+    row: dict[str, Any],
+    symbols_count: int | None = None,
+    error: str | None = None,
+) -> None:
+    details = ""
+    if symbols_count is not None:
+        details += f" symbols_count={symbols_count}"
+    if error:
+        details += f" error={_compact_text(error, 300)!r}"
+    logger.info(
+        "%s run_id=%s source=%s batch=%s article_position=%s/%s %s%s",
+        event,
+        run_id,
+        source,
+        batch_number,
+        article_position,
+        total_articles,
+        _news_mail_article_log_label(row),
+        details,
+    )
+
+
 def _mark_articles_analysis_status(
     *,
     run_id: UUID | str,
@@ -1586,6 +1638,11 @@ def _run_news_mail_analysis_workflow(
     source: str,
 ) -> dict[str, Any]:
     if not articles:
+        logger.info(
+            "news_mail_analysis_workflow_skipped run_id=%s source=%s reason=no_missing_articles",
+            run_id,
+            source,
+        )
         research = refresh_sentiment_return_research(run_id=run_id, days_back=365)
         metadata = {
             "analysis_source": source,
@@ -1597,25 +1654,98 @@ def _run_news_mail_analysis_workflow(
         return metadata
 
     batch_size = max(1, min(_NEWS_MAIL_ANALYSIS_BATCH_SIZE, 10))
+    workflow_started_at = time.monotonic()
     batch_count = 0
     updated_articles = 0
     written_impacts = 0
+    logger.info(
+        "news_mail_analysis_workflow_started run_id=%s source=%s article_count=%s batch_size=%s",
+        run_id,
+        source,
+        len(articles),
+        batch_size,
+    )
     for start in range(0, len(articles), batch_size):
-        batch = [row for row in articles[start : start + batch_size] if not _article_analysis_is_done(row)]
+        chunk = articles[start : start + batch_size]
+        batch_with_positions = [
+            (start + offset, row)
+            for offset, row in enumerate(chunk, start=1)
+            if not _article_analysis_is_done(row)
+        ]
+        batch = [row for _, row in batch_with_positions]
         if not batch:
+            logger.info(
+                "news_mail_analysis_batch_skipped run_id=%s source=%s batch_start=%s reason=already_completed",
+                run_id,
+                source,
+                start,
+            )
             continue
         batch_count += 1
         final_batch = start + batch_size >= len(articles)
         expected_ids = _article_ids_from_rows(batch)
+        article_by_id = {
+            str(row.get("article_id") or row.get("id") or "").strip(): row
+            for row in batch
+            if str(row.get("article_id") or row.get("id") or "").strip()
+        }
+        article_position_by_id = {
+            str(row.get("article_id") or row.get("id") or "").strip(): position
+            for position, row in batch_with_positions
+            if str(row.get("article_id") or row.get("id") or "").strip()
+        }
         claimed = _mark_articles_analysis_status(
             run_id=run_id,
             article_ids=expected_ids,
             status="codex_running",
         )
         if claimed <= 0:
+            logger.info(
+                "news_mail_analysis_batch_skipped run_id=%s source=%s batch=%s reason=no_articles_claimed article_count=%s",
+                run_id,
+                source,
+                batch_count,
+                len(batch),
+            )
             continue
+        batch_started_at = time.monotonic()
+        logger.info(
+            "news_mail_analysis_batch_started run_id=%s source=%s batch=%s article_count=%s claimed_articles=%s final_batch=%s",
+            run_id,
+            source,
+            batch_count,
+            len(batch),
+            claimed,
+            final_batch,
+        )
+        for article in batch:
+            article_id = str(article.get("article_id") or article.get("id") or "").strip()
+            _log_news_mail_analysis_article(
+                "news_mail_analysis_article_started",
+                run_id=run_id,
+                source=source,
+                batch_number=batch_count,
+                article_position=article_position_by_id.get(article_id, start + 1),
+                total_articles=len(articles),
+                row=article,
+            )
         try:
+            logger.info(
+                "news_mail_analysis_codex_started run_id=%s source=%s batch=%s article_count=%s timeout_seconds=%s",
+                run_id,
+                source,
+                batch_count,
+                len(batch),
+                _NEWS_MAIL_CODEX_TIMEOUT_SECONDS,
+            )
             raw = _run_codex_cli_json(build_codex_prompt(batch), batch_number=batch_count)
+            logger.info(
+                "news_mail_analysis_codex_finished run_id=%s source=%s batch=%s elapsed_seconds=%.1f",
+                run_id,
+                source,
+                batch_count,
+                time.monotonic() - batch_started_at,
+            )
             parsed_articles = _parse_news_mail_analysis_output(raw, expected_ids)
             result = apply_codex_results(
                 run_id=run_id,
@@ -1631,17 +1761,61 @@ def _run_news_mail_analysis_workflow(
                 },
             )
         except Exception as exc:
+            error_text = str(exc)
             _mark_articles_analysis_status(
                 run_id=run_id,
                 article_ids=expected_ids,
                 status="failed",
-                error=str(exc),
+                error=error_text,
+            )
+            for article in batch:
+                article_id = str(article.get("article_id") or article.get("id") or "").strip()
+                _log_news_mail_analysis_article(
+                    "news_mail_analysis_article_failed",
+                    run_id=run_id,
+                    source=source,
+                    batch_number=batch_count,
+                    article_position=article_position_by_id.get(article_id, start + 1),
+                    total_articles=len(articles),
+                    row=article,
+                    error=error_text,
+                )
+            logger.exception(
+                "news_mail_analysis_batch_failed run_id=%s source=%s batch=%s article_count=%s elapsed_seconds=%.1f",
+                run_id,
+                source,
+                batch_count,
+                len(batch),
+                time.monotonic() - batch_started_at,
             )
             raise
+        for parsed_article in parsed_articles:
+            article_id = str(parsed_article.get("article_id") or "").strip()
+            article = article_by_id.get(article_id, parsed_article)
+            symbols = parsed_article.get("symbols") or []
+            _log_news_mail_analysis_article(
+                "news_mail_analysis_article_completed",
+                run_id=run_id,
+                source=source,
+                batch_number=batch_count,
+                article_position=article_position_by_id.get(article_id, start + 1),
+                total_articles=len(articles),
+                row=article,
+                symbols_count=len(symbols) if isinstance(symbols, list) else 0,
+            )
         updated_articles += int(result.get("updated_articles") or 0)
         written_impacts += int(result.get("written_impacts") or 0)
+        logger.info(
+            "news_mail_analysis_batch_completed run_id=%s source=%s batch=%s updated_articles=%s written_impacts=%s elapsed_seconds=%.1f",
+            run_id,
+            source,
+            batch_count,
+            result.get("updated_articles") or 0,
+            result.get("written_impacts") or 0,
+            time.monotonic() - batch_started_at,
+        )
 
-    return {
+    metadata = {
         "analysis_source": source,
         "analysis_status": "completed",
         "analysis_article_count": len(articles),
@@ -1649,6 +1823,17 @@ def _run_news_mail_analysis_workflow(
         "updated_articles": updated_articles,
         "written_impacts": written_impacts,
     }
+    logger.info(
+        "news_mail_analysis_workflow_completed run_id=%s source=%s article_count=%s batch_count=%s updated_articles=%s written_impacts=%s elapsed_seconds=%.1f",
+        run_id,
+        source,
+        len(articles),
+        batch_count,
+        updated_articles,
+        written_impacts,
+        time.monotonic() - workflow_started_at,
+    )
+    return metadata
 
 
 def refresh_news_mail_workflow_from_gmail(
@@ -1657,6 +1842,11 @@ def refresh_news_mail_workflow_from_gmail(
     max_results: int | None = None,
     article_fetch_limit: int | None = None,
 ) -> dict[str, Any]:
+    logger.info(
+        "news_mail_refresh_workflow_started max_results=%s article_fetch_limit=%s",
+        max_results,
+        article_fetch_limit,
+    )
     refresh = refresh_news_mail_from_gmail(
         query=query,
         max_results=max_results,
@@ -1667,6 +1857,15 @@ def refresh_news_mail_workflow_from_gmail(
         raise RuntimeError("news_mail_refresh_missing_run_id")
 
     articles_for_analysis = _articles_for_codex(run_id, include_failed=True, only_missing_analysis=True)
+    logger.info(
+        "news_mail_refresh_workflow_scan_completed run_id=%s new_article_count=%s duplicate_skipped_count=%s empty_skipped_count=%s links_scanned=%s missing_analysis_count=%s",
+        run_id,
+        refresh.get("new_article_count") or 0,
+        refresh.get("duplicate_skipped_count") or 0,
+        refresh.get("empty_skipped_count") or 0,
+        refresh.get("links_scanned") or 0,
+        len(articles_for_analysis),
+    )
     try:
         workflow = _run_news_mail_analysis_workflow(
             run_id=run_id,
@@ -1674,6 +1873,11 @@ def refresh_news_mail_workflow_from_gmail(
             source="backend_refresh_codex_cli",
         )
     except Exception as exc:
+        logger.exception(
+            "news_mail_refresh_workflow_failed run_id=%s missing_analysis_count=%s",
+            run_id,
+            len(articles_for_analysis),
+        )
         _mark_run(
             run_id,
             "failed",

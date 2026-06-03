@@ -230,6 +230,18 @@ class AppSettings(BaseSettings):
     short_term_scan_max_zero_volume_sessions: int = Field(default=2, ge=0, le=60)
     #: Minimum volume spike ratio (latest / 30-session baseline) required before running short-term analysis.
     short_term_scan_min_volume_spike_ratio: float = Field(default=1.5, ge=1.0, le=20.0)
+    #: CMT/VN setup thresholds used after the broad short-term liquidity/spike pre-filter.
+    short_term_breakout_min_volume_spike_ratio: float = Field(default=1.8, ge=1.0, le=20.0)
+    short_term_pullback_min_volume_spike_ratio: float = Field(default=1.15, ge=1.0, le=20.0)
+    short_term_accumulation_min_volume_spike_ratio: float = Field(default=1.2, ge=1.0, le=20.0)
+    short_term_rsi_hard_reject: float = Field(default=80.0, ge=50.0, le=100.0)
+    short_term_max_distance_from_ema20_pct: float = Field(default=8.0, ge=1.0, le=25.0)
+    short_term_min_stop_distance_pct: float = Field(default=3.5, ge=0.5, le=15.0)
+    short_term_market_breadth_risk_on_pct: float = Field(default=0.55, ge=0.0, le=1.0)
+    short_term_market_breadth_risk_off_pct: float = Field(default=0.45, ge=0.0, le=1.0)
+    short_term_risk_off_min_relative_strength_rank_pct: float = Field(default=60.0, ge=0.0, le=100.0)
+    short_term_risk_off_size_multiplier: float = Field(default=0.5, ge=0.0, le=1.0)
+    short_term_neutral_weak_rs_size_multiplier: float = Field(default=0.75, ge=0.0, le=1.0)
     #: Redis TTL for per-symbol liquidity gate cache (symbol + exchange).
     short_term_symbol_liquidity_cache_ttl_seconds: int = Field(default=86_400, ge=300, le=604_800)
     #: Enable pre-market warmup job to populate short-term liquidity cache each weekday.

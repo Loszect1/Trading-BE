@@ -15,6 +15,7 @@ from app.schemas.auto_trading import DemoTradeRequest
 from app.services.demo_trading_service import (
     delete_demo_session,
     execute_demo_trade,
+    get_demo_account_snapshot,
     get_demo_shared_remaining_cash,
 )
 from app.services.execution.types import ExecutionOutcome, OrderExecutionContext
@@ -960,6 +961,62 @@ def test_demo_service_sell_consumes_core_lots_before_later_core_sell(
         )
         assert resolved_second_sell["status"] == "REJECTED"
         assert get_demo_shared_remaining_cash(session_id) == 100_100_000.0
+    finally:
+        delete_demo_session(session_id)
+
+
+@pytest.mark.postgres
+def test_demo_account_history_merges_manual_and_core_orders_by_side(trading_db: str) -> None:
+    session_id = "tst-demo-history-core"
+    delete_demo_session(session_id)
+    try:
+        assert get_demo_shared_remaining_cash(session_id) == 100_000_000.0
+        manual_buy = execute_demo_trade(
+            session_id,
+            DemoTradeRequest(
+                side="BUY",
+                symbol="TSTHISTM",
+                quantity=100,
+                price=10_000.0,
+                market_context={"source": "manual_demo_trade"},
+            ),
+        )
+        core_buy = place_order(
+            {
+                "account_mode": "DEMO",
+                "symbol": "TSTHISTA",
+                "side": "BUY",
+                "quantity": 100,
+                "price": 12_000.0,
+                "idempotency_key": "idem-tst-demo-history-core-buy",
+                "auto_process": True,
+                "metadata": {"demo_session_id": session_id, "source": "short_term_schedule_entry"},
+            }
+        )
+        resolved_core_buy = core_buy.get("order") if isinstance(core_buy.get("order"), dict) else core_buy
+        assert resolved_core_buy["status"] == "FILLED"
+
+        buy_snapshot = get_demo_account_snapshot(
+            session_id,
+            None,
+            history_limit=10,
+            history_offset=0,
+            history_side="BUY",
+        )
+        buy_ids = {str(row["trade_id"]) for row in buy_snapshot["trade_history"]}
+        assert buy_snapshot["trade_history_total"] == 2
+        assert manual_buy.trade_id in buy_ids
+        assert str(resolved_core_buy["id"]) in buy_ids
+
+        sell_snapshot = get_demo_account_snapshot(
+            session_id,
+            None,
+            history_limit=10,
+            history_offset=0,
+            history_side="SELL",
+        )
+        assert sell_snapshot["trade_history_total"] == 0
+        assert sell_snapshot["trade_history"] == []
     finally:
         delete_demo_session(session_id)
 

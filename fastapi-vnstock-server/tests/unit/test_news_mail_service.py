@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import date
 from uuid import uuid4
 
@@ -352,13 +353,14 @@ def test_refresh_news_mail_skips_existing_urls_and_continues(monkeypatch):
     assert calls == ["https://example.vn/a", "https://example.vn/b", "https://example.vn/c"]
 
 
-def test_refresh_news_mail_workflow_runs_analysis_after_scan(monkeypatch):
+def test_refresh_news_mail_workflow_runs_analysis_after_scan(monkeypatch, caplog):
     import app.services.news_mail_service as svc
 
     run_id = uuid4()
     article_id = uuid4()
     applied: list[dict[str, object]] = []
     status_marks: list[dict[str, object]] = []
+    caplog.set_level(logging.INFO, logger="app.services.news_mail_service")
 
     monkeypatch.setattr(
         svc,
@@ -440,6 +442,9 @@ def test_refresh_news_mail_workflow_runs_analysis_after_scan(monkeypatch):
     assert applied[0]["run_id"] == str(run_id)
     assert applied[0]["final_batch"] is True
     assert status_marks[0]["status"] == "codex_running"
+    log_messages = [record.getMessage() for record in caplog.records]
+    assert any("news_mail_analysis_article_started" in message and str(article_id) in message for message in log_messages)
+    assert any("news_mail_analysis_article_completed" in message and "symbols_count=1" in message for message in log_messages)
 
 
 def test_news_mail_workflow_marks_failed_article_batch(monkeypatch):

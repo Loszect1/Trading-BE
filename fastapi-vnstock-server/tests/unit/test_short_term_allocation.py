@@ -105,6 +105,42 @@ def test_experience_cooldown_zeroes_symbol_cap(monkeypatch) -> None:
     assert out["s1"] == 0
 
 
+def test_market_setup_validation_applies_size_haircut(monkeypatch) -> None:
+    monkeypatch.setattr(service.settings, "strategy_max_symbol_exposure_pct", 0.12)
+    market_haircut = {
+        "setup_validation": {
+            "buyable": True,
+            "position_size_multiplier": 0.5,
+            "relative_strength_rank_pct": 80.0,
+            "reasons": ["risk_off_size_haircut"],
+        },
+        "market_regime": {"regime": "RISK_OFF", "regime_key": "risk_off"},
+        "relative_strength": {"relative_strength_rank_pct": 80.0, "is_leading_benchmark": True},
+    }
+    buy_rows = [_buy_row("s1", symbol="AAA", confidence=95, composite=95, metadata_extra=market_haircut)]
+
+    out = _allocate_quantities_by_score(buy_rows, nav_total=100_000_000, lot_size=100)
+
+    assert out["s1"] == 600
+
+
+def test_setup_validation_not_buyable_zeroes_allocation(monkeypatch) -> None:
+    monkeypatch.setattr(service.settings, "strategy_max_symbol_exposure_pct", 0.12)
+    validation_reject = {
+        "setup_validation": {
+            "buyable": False,
+            "position_size_multiplier": 0.0,
+            "relative_strength_rank_pct": 30.0,
+            "reasons": ["risk_off_requires_relative_strength_leader"],
+        }
+    }
+    buy_rows = [_buy_row("s1", symbol="AAA", confidence=95, composite=95, metadata_extra=validation_reject)]
+
+    out = _allocate_quantities_by_score(buy_rows, nav_total=100_000_000, lot_size=100)
+
+    assert out["s1"] == 0
+
+
 def test_handle_buy_signal_uses_latest_market_price_for_demo_fill(monkeypatch) -> None:
     placed_payloads: list[dict] = []
 

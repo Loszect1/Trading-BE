@@ -36,6 +36,12 @@ def build_recommendation_from_signal(signal: dict[str, Any]) -> dict[str, Any]:
         "liquidity": metadata.get("liquidity") if isinstance(metadata.get("liquidity"), dict) else {},
         "relative_strength": metadata.get("relative_strength") if isinstance(metadata.get("relative_strength"), dict) else {},
         "sector_breadth": metadata.get("sector_breadth") if isinstance(metadata.get("sector_breadth"), dict) else {},
+        "market_regime": metadata.get("market_regime") if isinstance(metadata.get("market_regime"), dict) else {},
+        "market_breadth": metadata.get("market_breadth") if isinstance(metadata.get("market_breadth"), dict) else {},
+        "setup_validation": metadata.get("setup_validation") if isinstance(metadata.get("setup_validation"), dict) else {},
+        "position_size_haircut": metadata.get("position_size_haircut")
+        if isinstance(metadata.get("position_size_haircut"), dict)
+        else {},
         "trade_levels": levels,
         "metadata": metadata,
         "signal_id": signal.get("id"),
@@ -72,6 +78,10 @@ def normalize_real_recommendation_rows(rows: list[dict[str, Any]]) -> list[dict[
             "liquidity",
             "relative_strength",
             "sector_breadth",
+            "market_regime",
+            "market_breadth",
+            "setup_validation",
+            "position_size_haircut",
             "trade_levels",
             "metadata",
             "signal_id",

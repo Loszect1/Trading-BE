@@ -485,7 +485,14 @@ def deposit_demo_cash(session_id: str, amount_vnd: float) -> dict[str, Any]:
     }
 
 
-def _get_demo_trade_history_from_core(
+def _normalize_demo_history_side(history_side: str | None) -> str | None:
+    side_filter = str(history_side or "").strip().upper()
+    if side_filter not in {"BUY", "SELL"}:
+        return None
+    return side_filter
+
+
+def _get_demo_trade_history(
     session_id: str,
     *,
     limit: int,
@@ -495,44 +502,77 @@ def _get_demo_trade_history_from_core(
     sid = normalize_demo_session_id(session_id)
     safe_limit = max(1, min(int(limit), 200))
     safe_offset = max(0, int(offset))
-    side_filter = str(history_side or "").strip().upper()
-    if side_filter not in {"BUY", "SELL"}:
-        side_filter = None
+    side_filter = _normalize_demo_history_side(history_side)
+    params: dict[str, Any] = {"session_id": sid}
+    demo_side_clause = ""
+    core_side_clause = ""
+    if side_filter:
+        params["history_side"] = side_filter
+        demo_side_clause = "AND dt.side = %(history_side)s"
+        core_side_clause = "AND oc.side = %(history_side)s"
+
+    history_cte = f"""
+        WITH history AS (
+            SELECT
+                dt.trade_id::text AS trade_id,
+                dt.created_at,
+                dt.side,
+                dt.symbol,
+                dt.quantity,
+                dt.price,
+                dt.notional,
+                dt.realized_pnl_on_trade,
+                dt.cash_after
+            FROM demo_trades dt
+            WHERE dt.session_id = %(session_id)s
+              {demo_side_clause}
+
+            UNION ALL
+
+            SELECT
+                oc.id::text AS trade_id,
+                oc.created_at,
+                oc.side,
+                oc.symbol,
+                oc.quantity,
+                oc.price,
+                (oc.quantity * oc.price)::double precision AS notional,
+                0::double precision AS realized_pnl_on_trade,
+                0::double precision AS cash_after
+            FROM orders_core oc
+            WHERE oc.account_mode = 'DEMO'
+              AND oc.status = 'FILLED'
+              AND COALESCE(oc.order_metadata->>'demo_session_id', '') = %(session_id)s
+              {core_side_clause}
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM demo_trades dt_dupe
+                  WHERE dt_dupe.session_id = %(session_id)s
+                    AND oc.idempotency_key = ('demo-trade:' || dt_dupe.session_id || ':' || dt_dupe.trade_id)
+              )
+        )
+    """
     with connect(settings.database_url, row_factory=dict_row) as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                """
+                f"""
+                {history_cte}
                 SELECT COUNT(*)::int AS c
-                FROM orders_core
-                WHERE account_mode = 'DEMO'
-                  AND status = 'FILLED'
-                  AND COALESCE(order_metadata->>'demo_session_id', '') = %(session_id)s
-                  AND (%(history_side)s IS NULL OR side = %(history_side)s)
+                FROM history
                 """,
-                {"session_id": sid, "history_side": side_filter},
+                params,
             )
             total_row = cur.fetchone() or {}
+            page_params = {**params, "limit": safe_limit, "offset": safe_offset}
             cur.execute(
-                """
-                SELECT
-                    id::text AS trade_id,
-                    created_at,
-                    side,
-                    symbol,
-                    quantity,
-                    price,
-                    (quantity * price)::double precision AS notional,
-                    0::double precision AS realized_pnl_on_trade,
-                    0::double precision AS cash_after
-                FROM orders_core
-                WHERE account_mode = 'DEMO'
-                  AND status = 'FILLED'
-                  AND COALESCE(order_metadata->>'demo_session_id', '') = %(session_id)s
-                  AND (%(history_side)s IS NULL OR side = %(history_side)s)
+                f"""
+                {history_cte}
+                SELECT trade_id, created_at, side, symbol, quantity, price, notional, realized_pnl_on_trade, cash_after
+                FROM history
                 ORDER BY created_at DESC
                 LIMIT %(limit)s OFFSET %(offset)s
                 """,
-                {"session_id": sid, "history_side": side_filter, "limit": safe_limit, "offset": safe_offset},
+                page_params,
             )
             rows = cur.fetchall() or []
     return ([dict(row) for row in rows], int(total_row.get("c", 0)))
@@ -1349,9 +1389,7 @@ def get_demo_account_snapshot(
     marks = {k.strip().upper(): float(v) for k, v in (mark_prices or {}).items() if v is not None}
     safe_limit = max(1, min(history_limit, 200))
     safe_offset = max(0, history_offset)
-    side_filter = str(history_side or "").strip().upper()
-    if side_filter not in {"BUY", "SELL"}:
-        side_filter = None
+    side_filter = _normalize_demo_history_side(history_side)
 
     with connect(settings.database_url, row_factory=dict_row) as conn:
         _ensure_demo_session_exists(conn, session_id)
@@ -1371,28 +1409,6 @@ def get_demo_account_snapshot(
                 {"session_id": session_id},
             )
             position_opened_rows = cur.fetchall()
-            cur.execute(
-                """
-                SELECT COUNT(*)::int AS c
-                FROM demo_trades
-                WHERE session_id = %(session_id)s
-                  AND (%(history_side)s IS NULL OR side = %(history_side)s)
-                """,
-                {"session_id": session_id, "history_side": side_filter},
-            )
-            total_row = cur.fetchone() or {}
-            cur.execute(
-                """
-                SELECT trade_id, created_at, side, symbol, quantity, price, notional, realized_pnl_on_trade, cash_after
-                FROM demo_trades
-                WHERE session_id = %(session_id)s
-                  AND (%(history_side)s IS NULL OR side = %(history_side)s)
-                ORDER BY created_at DESC
-                LIMIT %(limit)s OFFSET %(offset)s
-                """,
-                {"session_id": session_id, "history_side": side_filter, "limit": safe_limit, "offset": safe_offset},
-            )
-            trade_rows = cur.fetchall()
         conn.commit()
 
     opened_at_by_symbol = {str(row["symbol"]).strip().upper(): row["opened_at"] for row in position_opened_rows}
@@ -1422,15 +1438,12 @@ def get_demo_account_snapshot(
     marks_used = {s: marks[s] for s in marks if s in present_symbols}
     cash = _get_demo_cash_balance_from_core(session_id)
     realized = float((session_row or {}).get("realized_pnl", 0.0))
-    trade_history_out = [dict(item) for item in trade_rows]
-    trade_history_total = int(total_row.get("c", 0))
-    if not trade_history_out and trade_history_total == 0:
-        trade_history_out, trade_history_total = _get_demo_trade_history_from_core(
-            session_id,
-            limit=safe_limit,
-            offset=safe_offset,
-            history_side=side_filter,
-        )
+    trade_history_out, trade_history_total = _get_demo_trade_history(
+        session_id,
+        limit=safe_limit,
+        offset=safe_offset,
+        history_side=side_filter,
+    )
     equity = cash + market_value
     return {
         "session_id": session_id,

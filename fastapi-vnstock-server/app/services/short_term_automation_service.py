@@ -25,6 +25,12 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 from app.core.config import get_vn_market_holiday_dates, settings
+from app.services.ai_decision_event_service import (
+    build_prompt_hash,
+    get_symbol_ai_memory,
+    record_ai_decision_event,
+    summarize_reusable_ai_lessons,
+)
 from app.services.gpt_service import GptService
 from app.services.experience_service import create_experience_from_trade, ensure_experience_table
 from app.services.price_unit_service import normalize_vn_price_to_vnd
@@ -99,7 +105,12 @@ def _extract_json_object(raw_text: str) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def _refine_buy_levels_with_gpt(sig: dict[str, Any]) -> dict[str, Any] | None:
+def _refine_buy_levels_with_gpt(
+    sig: dict[str, Any],
+    *,
+    account_mode: str | None = None,
+    demo_session_id: str | None = None,
+) -> dict[str, Any] | None:
     if not settings.use_gpt:
         return None
     symbol = str(sig.get("symbol") or "").strip().upper()
@@ -108,6 +119,15 @@ def _refine_buy_levels_with_gpt(sig: dict[str, Any]) -> dict[str, Any] | None:
     sl = float(sig.get("stoploss_price") or 0.0)
     if not symbol or entry <= 0 or sl <= 0:
         return None
+    metadata = sig.get("metadata") if isinstance(sig.get("metadata"), dict) else {}
+    strategy_type = str(metadata.get("strategy_type") or sig.get("strategy_type") or "SHORT_TERM").strip().upper()
+    reusable_memory: list[dict[str, Any]] = []
+    try:
+        reusable_memory = summarize_reusable_ai_lessons(
+            get_symbol_ai_memory(symbol=symbol, strategy_type=strategy_type, limit=4)
+        )
+    except Exception:
+        reusable_memory = []
     prompt = (
         "You are a VN equity short-term trading assistant.\n"
         "Return ONLY valid JSON (no markdown) with keys:\n"
@@ -116,8 +136,10 @@ def _refine_buy_levels_with_gpt(sig: dict[str, Any]) -> dict[str, Any] | None:
         "- stoploss_price < entry_price\n"
         "- take_profit_price >= entry_price\n"
         "- keep values realistic and close to input levels\n"
-        f"Input signal: symbol={symbol}, entry_price={entry}, take_profit_price={tp}, stoploss_price={sl}, metadata={sig.get('metadata') or {}}"
+        f"Input signal: symbol={symbol}, entry_price={entry}, take_profit_price={tp}, stoploss_price={sl}, metadata={metadata}\n"
+        f"Reusable approved AI memory: {json.dumps(reusable_memory, ensure_ascii=False, separators=(',', ':'))}"
     )
+    prompt_hash = build_prompt_hash(prompt)
     raw = _automation_gpt_service.generate_text_with_resilience(
         prompt=prompt,
         system_prompt="Return strict JSON only. No prose outside JSON.",
@@ -142,12 +164,43 @@ def _refine_buy_levels_with_gpt(sig: dict[str, Any]) -> dict[str, Any] | None:
         return None
     if refined_tp < refined_entry:
         refined_tp = refined_entry
-    return {
+    result = {
         "entry_price": refined_entry,
         "take_profit_price": refined_tp,
         "stoploss_price": refined_sl,
         "rationale": str(parsed.get("rationale") or "").strip(),
     }
+    try:
+        event = record_ai_decision_event(
+            workflow_type="AUTOMATION_LEVEL_REFINEMENT",
+            account_mode=account_mode,
+            symbol=symbol,
+            strategy_type=strategy_type,
+            source_type="signal",
+            source_id=str(sig.get("id") or f"{symbol}:{prompt_hash[:16]}"),
+            session_id=demo_session_id,
+            idempotency_key=f"automation-levels:{account_mode or 'UNKNOWN'}:{demo_session_id or ''}:{sig.get('id') or symbol}:{prompt_hash}",
+            model=settings.gpt_model,
+            schema_version="automation-levels-v1",
+            prompt_hash=prompt_hash,
+            confidence=metadata.get("confidence") or sig.get("confidence"),
+            input_snapshot={
+                "symbol": symbol,
+                "entry_price": entry,
+                "take_profit_price": tp,
+                "stoploss_price": sl,
+                "metadata": metadata,
+                "reusable_memory": reusable_memory,
+            },
+            llm_recommendation=result,
+            final_system_decision={"level_source": "gpt", "accepted_for_risk_check": True},
+            guardrail_result={"status": "PENDING_RISK", "reason": "levels_refined_before_deterministic_risk"},
+        )
+        if event.get("id"):
+            result["ai_decision_event_id"] = str(event["id"])
+    except Exception as exc:
+        logger.debug("automation_levels_ai_decision_event_failed", extra={"symbol": symbol, "error": str(exc)})
+    return result
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -248,12 +301,68 @@ def _experience_allocation_adjustment(sig: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _market_allocation_adjustment(sig: dict[str, Any]) -> dict[str, Any]:
+    meta = _signal_metadata(sig)
+    setup_validation = meta.get("setup_validation") if isinstance(meta.get("setup_validation"), dict) else {}
+    market_regime = meta.get("market_regime") if isinstance(meta.get("market_regime"), dict) else {}
+    relative_strength = meta.get("relative_strength") if isinstance(meta.get("relative_strength"), dict) else {}
+
+    reasons = [str(item) for item in setup_validation.get("reasons") or [] if str(item)]
+    cap_multiplier = _clamp_float(_safe_float(setup_validation.get("position_size_multiplier"), 1.0), 0.0, 1.25)
+    score_adjustment = 0.0
+    cap_reason = "market_neutral"
+
+    if setup_validation and not bool(setup_validation.get("buyable", True)):
+        return {
+            "score_adjustment": -25.0,
+            "symbol_cap_multiplier": 0.0,
+            "cap_reason": "setup_validation_not_buyable",
+            "setup_validation": setup_validation,
+            "market_regime": market_regime,
+        }
+
+    regime_key = str(market_regime.get("regime_key") or market_regime.get("regime") or "").strip().lower()
+    rs_rank = _safe_float(setup_validation.get("relative_strength_rank_pct"), -1.0)
+    if rs_rank < 0:
+        rs_rank = _safe_float(relative_strength.get("relative_strength_rank_pct"), 50.0)
+
+    if regime_key == "risk_off":
+        cap_multiplier = min(cap_multiplier, float(settings.short_term_risk_off_size_multiplier))
+        score_adjustment -= 5.0
+        cap_reason = "risk_off_size_haircut"
+    elif regime_key == "risk_on" and rs_rank >= 70.0:
+        cap_multiplier = min(1.25, max(cap_multiplier, 1.05))
+        score_adjustment += 3.0
+        cap_reason = "risk_on_rs_leader"
+    elif regime_key == "neutral" and rs_rank < 40.0:
+        cap_multiplier = min(cap_multiplier, float(settings.short_term_neutral_weak_rs_size_multiplier))
+        score_adjustment -= 3.0
+        cap_reason = "neutral_weak_rs_haircut"
+    elif cap_multiplier < 1.0:
+        cap_reason = "setup_size_haircut"
+
+    return {
+        "score_adjustment": round(score_adjustment, 4),
+        "symbol_cap_multiplier": round(cap_multiplier, 4),
+        "cap_reason": cap_reason,
+        "relative_strength_rank_pct": round(rs_rank, 4),
+        "reasons": reasons,
+        "setup_validation": setup_validation,
+        "market_regime": market_regime,
+    }
+
+
 def _candidate_quality(sig: dict[str, Any]) -> dict[str, Any]:
     reward_risk = _candidate_reward_risk(sig)
     evaluation = _candidate_evaluation_score(sig)
     confidence = _candidate_confidence_score(sig)
     exp = _experience_allocation_adjustment(sig)
-    adjusted_evaluation = _clamp_float(evaluation + float(exp["score_adjustment"]), 0.0, 100.0)
+    market = _market_allocation_adjustment(sig)
+    adjusted_evaluation = _clamp_float(
+        evaluation + float(exp["score_adjustment"]) + float(market["score_adjustment"]),
+        0.0,
+        100.0,
+    )
     rr_score = _rr_allocation_score(float(reward_risk or 0.0))
     quality = (
         _ALLOCATION_EVALUATION_WEIGHT * adjusted_evaluation
@@ -268,6 +377,7 @@ def _candidate_quality(sig: dict[str, Any]) -> dict[str, Any]:
         "rr_score": round(rr_score, 4),
         "quality_score": round(_clamp_float(quality, 0.0, 100.0), 4),
         "experience_adjustment": exp,
+        "market_adjustment": market,
     }
 
 
@@ -330,13 +440,21 @@ def _build_score_weighted_allocation_plan(
             continue
 
         exp_adj = quality["experience_adjustment"]
-        cap_multiplier = float(exp_adj.get("symbol_cap_multiplier") or 0.0)
+        market_adj = quality["market_adjustment"]
+        exp_cap_multiplier = float(exp_adj.get("symbol_cap_multiplier") or 0.0)
+        market_cap_multiplier = float(market_adj.get("symbol_cap_multiplier") or 0.0)
+        cap_multiplier = exp_cap_multiplier * market_cap_multiplier
         if cap_multiplier <= 0:
+            cap_reason = (
+                exp_adj.get("cap_reason")
+                if exp_cap_multiplier <= 0
+                else market_adj.get("cap_reason") or exp_adj.get("cap_reason")
+            )
             skipped.append(
                 {
                     "signal_id": sid,
                     "symbol": symbol,
-                    "reason": exp_adj.get("cap_reason") or "symbol_cap_zero",
+                    "reason": cap_reason or "symbol_cap_zero",
                     **quality,
                 }
             )
@@ -416,7 +534,8 @@ def _build_score_weighted_allocation_plan(
             "planned_quantity": qty,
             "planned_notional": round(notional, 4),
             "cap_limited": bool(cap_limited),
-            "cap_reason": cand["experience_adjustment"].get("cap_reason"),
+            "cap_reason": cand["market_adjustment"].get("cap_reason")
+            or cand["experience_adjustment"].get("cap_reason"),
         }
         allocation_rows.append(row_meta)
         if qty >= lot:
@@ -853,8 +972,9 @@ def _handle_one_buy_signal(
     tp = normalize_vn_price_to_vnd(sig.get("take_profit_price"))
     stoploss = normalize_vn_price_to_vnd(sig.get("stoploss_price"))
     level_source = "signal"
+    ai_decision_event_id = ""
     try:
-        refined = _refine_buy_levels_with_gpt(sig)
+        refined = _refine_buy_levels_with_gpt(sig, account_mode=account_mode, demo_session_id=demo_session_id)
     except Exception as exc:
         logger.warning("short_term_gpt_levels_failed", extra={"symbol": symbol, "error": str(exc)})
         refined = None
@@ -863,6 +983,7 @@ def _handle_one_buy_signal(
         tp = normalize_vn_price_to_vnd(refined.get("take_profit_price") or tp)
         stoploss = normalize_vn_price_to_vnd(refined.get("stoploss_price") or stoploss)
         level_source = "gpt"
+        ai_decision_event_id = str(refined.get("ai_decision_event_id") or "")
     if entry <= 0 or stoploss <= 0:
         return {
             "risk_rejected": 0,
@@ -1062,6 +1183,8 @@ def _handle_one_buy_signal(
         "stoploss_price": stoploss,
         "level_source": level_source,
     }
+    if ai_decision_event_id:
+        order_metadata["ai_decision_event_id"] = ai_decision_event_id
     if account_mode == "DEMO" and session_id:
         order_metadata["demo_session_id"] = session_id
     order_row = place_order(
@@ -1101,6 +1224,7 @@ def _handle_one_buy_signal(
                 "planned_quantity": planned_lot_qty,
                 "risk_cap_quantity": risk_cap_lot_qty,
                 "cash_spent": cash_spent,
+                **({"ai_decision_event_id": ai_decision_event_id} if ai_decision_event_id else {}),
             },
         }
     if status == "REJECTED":
@@ -1122,6 +1246,7 @@ def _handle_one_buy_signal(
                 "level_source": level_source,
                 "planned_quantity": planned_lot_qty,
                 "risk_cap_quantity": risk_cap_lot_qty,
+                **({"ai_decision_event_id": ai_decision_event_id} if ai_decision_event_id else {}),
             },
         }
     return {
@@ -1143,6 +1268,7 @@ def _handle_one_buy_signal(
             "level_source": level_source,
             "planned_quantity": planned_lot_qty,
             "risk_cap_quantity": risk_cap_lot_qty,
+            **({"ai_decision_event_id": ai_decision_event_id} if ai_decision_event_id else {}),
         },
     }
 
@@ -2414,11 +2540,30 @@ def run_short_term_production_cycle(
                 float(planned_spent_total) - float(actual_buy_cash_spent),
                 2,
             )
+            ai_decision_event_ids: list[str] = []
+            for sig in list(batch.get("signals") or []):
+                meta = sig.get("metadata") if isinstance(sig, dict) else None
+                if isinstance(meta, dict):
+                    for value in (
+                        meta.get("ai_decision_event_id"),
+                        (meta.get("gpt_scoring_analysis") or {}).get("ai_decision_event_id")
+                        if isinstance(meta.get("gpt_scoring_analysis"), dict)
+                        else None,
+                    ):
+                        text = str(value or "").strip()
+                        if text and text not in ai_decision_event_ids:
+                            ai_decision_event_ids.append(text)
+            for detail_row in executions_detail:
+                if isinstance(detail_row, dict):
+                    text = str(detail_row.get("ai_decision_event_id") or "").strip()
+                    if text and text not in ai_decision_event_ids:
+                        ai_decision_event_ids.append(text)
             detail = {
                 **base_detail,
                 "skipped_insufficient_data": int(batch.get("skipped_insufficient_data") or 0),
                 "scan_mode": str(batch.get("scan_mode") or "full"),
                 "executions": executions_detail,
+                "ai_decision_event_ids": ai_decision_event_ids,
                 "allocation_method": "score_weighted_deterministic",
                 "allocation_nav_total": float(nav),
                 "remaining_cash_after_cycle": round(float(remaining_cash_runtime), 6),

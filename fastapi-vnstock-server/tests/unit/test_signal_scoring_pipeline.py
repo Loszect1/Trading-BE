@@ -165,6 +165,8 @@ def test_short_term_technical_score_bounds():
     assert 0 <= tech["score_0_100"] <= 100
     assert "rsi14" in tech["detail"]
     assert "stretch_penalty" in tech["detail"]
+    assert "relative_strength_component" in tech["detail"]
+    assert "volatility_risk_component" in tech["detail"]
 
 
 def test_short_term_technical_penalizes_overstretched_chase():
