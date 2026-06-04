@@ -5,7 +5,7 @@ approval_policy = "never"
 
 [model_providers.cliproxyapi]
 name = "cliproxyapi"
-base_url = "http://host.docker.internal:18317/v1"
+base_url = "http://host.docker.internal:18319/v1"
 wire_api = "responses"
 
 [profiles.cliproxyapi]

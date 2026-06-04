@@ -55,6 +55,23 @@ class AppSettings(BaseSettings):
             "AI_CLAUDE_SIGNAL_SCORING_CACHE_TTL_SECONDS",
         ),
     )
+    #: Max tokens for GPT macro/news/economics research responses.
+    ai_gpt_macro_analysis_max_tokens: int = Field(
+        default=1400,
+        ge=400,
+        le=4096,
+        validation_alias=AliasChoices("AI_GPT_MACRO_ANALYSIS_MAX_TOKENS", "AI_CLAUDE_MACRO_ANALYSIS_MAX_TOKENS"),
+    )
+    #: Redis cache TTL (seconds) for GPT macro/news/economics research responses.
+    ai_gpt_macro_analysis_cache_ttl_seconds: int = Field(
+        default=1800,
+        ge=30,
+        le=86_400,
+        validation_alias=AliasChoices(
+            "AI_GPT_MACRO_ANALYSIS_CACHE_TTL_SECONDS",
+            "AI_CLAUDE_MACRO_ANALYSIS_CACHE_TTL_SECONDS",
+        ),
+    )
     #: Max tokens for GPT experience analysis responses.
     ai_gpt_experience_max_tokens: int = Field(
         default=400,

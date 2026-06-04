@@ -8,12 +8,15 @@ from app.routers.automation import router as automation_router
 from app.routers.dnse_trade import router as dnse_trade_router
 from app.routers.experience import router as experience_router
 from app.routers.health import router as health_router
+from app.routers.long_term_strategy import router as long_term_strategy_router
+from app.routers.macro import router as macro_router
 from app.routers.monitoring import router as monitoring_router
 from app.routers.market import router as market_router
 from app.routers.gmail import router as gmail_router
 from app.routers.news import router as news_router
 from app.routers.scanner import router as scanner_router
 from app.routers.signal_engine import router as signal_engine_router
+from app.routers.stocks import router as stocks_router
 from app.routers.trading_core import router as trading_core_router
 from app.routers.vnstock_api import router as vnstock_api_router
 from app.routers.watchlist import router as watchlist_router
@@ -46,6 +49,7 @@ app.add_middleware(
 app.include_router(health_router)
 app.include_router(ai_router)
 app.include_router(market_router)
+app.include_router(macro_router)
 app.include_router(gmail_router)
 app.include_router(news_router)
 app.include_router(vnstock_api_router)
@@ -58,6 +62,8 @@ app.include_router(trading_core_router)
 app.include_router(monitoring_router)
 app.include_router(signal_engine_router)
 app.include_router(watchlist_router)
+app.include_router(long_term_strategy_router)
+app.include_router(stocks_router)
 
 
 @app.on_event("startup")

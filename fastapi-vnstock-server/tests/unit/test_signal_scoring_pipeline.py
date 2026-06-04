@@ -281,7 +281,7 @@ def test_macro_proxy_dual_horizon_when_history_long_enough(monkeypatch):
     assert "relative_strength_vs_benchmark_pct_60d" in out["detail"]
 
 
-def test_macro_proxy_income_statement_revenue_growth():
+def test_macro_proxy_income_statement_revenue_growth(monkeypatch):
     def quote(method: str, **kwargs):
         return []
 
@@ -301,6 +301,11 @@ def test_macro_proxy_income_statement_revenue_growth():
                 {"operating_cash_flow": 48.0},
             ]
         return []
+
+    monkeypatch.setattr(
+        "app.services.signal_scoring_pipeline.fetch_symbol_daily_closes",
+        lambda _quote, _sym, _bars: [10.0, 10.2, 10.4],
+    )
 
     out = score_macro_fundamental_proxy("X", quote, None, financial, benchmark_closes=[100.0, 101.0])
     st = out["detail"].get("statements") or {}
@@ -442,7 +447,7 @@ def test_score_news_phrase_patterns_add_weighted_units():
     assert (out.get("explainability") or {}).get("phrase_risk_weighted_units", 0) >= 1.5
 
 
-def test_macro_proxy_trading_snapshot_rs_adjustment():
+def test_macro_proxy_trading_snapshot_rs_adjustment(monkeypatch):
     def quote(method: str, **kwargs):
         if kwargs.get("symbol") == "SYM":
             return [{"close": 10.0 + i * 0.12, "volume": 1.0} for i in range(25)]
@@ -459,6 +464,11 @@ def test_macro_proxy_trading_snapshot_rs_adjustment():
                 {"label": "Foreign sell volume (session)", "value": 100.0},
             ]
         return None
+
+    monkeypatch.setattr(
+        "app.services.signal_scoring_pipeline.fetch_symbol_daily_closes",
+        lambda _quote, _sym, _bars: [10.0 + i * 0.12 for i in range(25)],
+    )
 
     out = score_macro_fundamental_proxy(
         "SYM",

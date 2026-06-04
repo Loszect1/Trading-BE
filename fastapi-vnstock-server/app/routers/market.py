@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from app.core.config import settings
 from app.services.gpt_service import GptService
+from app.services.macro_service import get_macro_regime
 from app.services.news_mail_service import get_morning_brief
 from app.services.redis_cache import RedisCacheService
 from app.services.vnstock_api_service import VNStockApiService
@@ -51,6 +52,14 @@ def market_morning_brief(limit: int = Query(10, ge=1, le=50)) -> Dict[str, Any]:
         return get_morning_brief(limit=limit)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to read morning brief: {exc}") from exc
+
+
+@router.get("/macro-regime")
+def market_macro_regime() -> Dict[str, Any]:
+    try:
+        return get_macro_regime()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to compute macro regime: {exc}") from exc
 
 
 @router.get("/history")
