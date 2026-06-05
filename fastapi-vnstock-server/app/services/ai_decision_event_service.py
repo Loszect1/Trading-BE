@@ -345,6 +345,43 @@ def get_symbol_ai_memory(
     return [_row_to_dict(row) for row in rows]
 
 
+def get_global_ai_memory(
+    *,
+    workflow_type: str | None = "MACRO_STRATEGY_MEMORY",
+    strategy_type: str | None = "LONG_TERM",
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    ensure_ai_decision_events_table()
+    filters = [
+        "symbol IS NULL",
+        "reuse_status = 'APPROVED'",
+    ]
+    params: dict[str, Any] = {"limit": max(1, min(int(limit), 20))}
+    if workflow_type:
+        filters.append("workflow_type = %(workflow_type)s")
+        params["workflow_type"] = str(workflow_type).strip().upper()
+    if strategy_type:
+        filters.append("(strategy_type = %(strategy_type)s OR strategy_type IS NULL)")
+        params["strategy_type"] = str(strategy_type).strip().upper()
+    where_clause = " AND ".join(filters)
+    with connect(settings.database_url, row_factory=dict_row, connect_timeout=_CONNECT_TIMEOUT_SECONDS) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id::text AS id, created_at, workflow_type, account_mode, symbol,
+                       strategy_type, source_type, source_id, model, confidence,
+                       reuse_status, llm_recommendation, final_system_decision, guardrail_result
+                FROM ai_decision_events
+                WHERE {where_clause}
+                ORDER BY created_at DESC
+                LIMIT %(limit)s
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+    return [_row_to_dict(row) for row in rows]
+
+
 def summarize_reusable_ai_lessons(rows: list[dict[str, Any]], *, max_items: int = 5) -> list[dict[str, Any]]:
     lessons: list[dict[str, Any]] = []
     for row in rows[: max(1, max_items)]:
@@ -376,6 +413,38 @@ def summarize_reusable_ai_lessons(rows: list[dict[str, Any]], *, max_items: int 
             }
         )
     return lessons
+
+
+def summarize_global_ai_memory(rows: list[dict[str, Any]], *, max_items: int = 3) -> list[dict[str, Any]]:
+    memories: list[dict[str, Any]] = []
+    for row in rows[: max(1, max_items)]:
+        recommendation = row.get("llm_recommendation") if isinstance(row.get("llm_recommendation"), dict) else {}
+        final_decision = row.get("final_system_decision") if isinstance(row.get("final_system_decision"), dict) else {}
+        memories.append(
+            {
+                "workflow_type": row.get("workflow_type"),
+                "strategy_type": row.get("strategy_type"),
+                "source_type": row.get("source_type"),
+                "source_id": row.get("source_id"),
+                "confidence": row.get("confidence"),
+                "reuse_status": row.get("reuse_status"),
+                "memory": {
+                    key: recommendation.get(key)
+                    for key in (
+                        "title",
+                        "summary",
+                        "allocation",
+                        "rules",
+                        "monitoring_metrics",
+                        "invalidation_triggers",
+                        "assumptions",
+                    )
+                    if key in recommendation
+                },
+                "scope": final_decision.get("scope"),
+            }
+        )
+    return memories
 
 
 def update_ai_decision_reuse_status(*, event_id: str | UUID, reuse_status: str) -> dict[str, Any] | None:

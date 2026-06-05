@@ -53,6 +53,7 @@ def test_macro_gpt_analysis_uses_container_gpt(monkeypatch: pytest.MonkeyPatch) 
         "_load_research_context",
         lambda **_kwargs: {
             "macro_regime": {"regime": "Recovery", "regime_score": 55},
+            "approved_global_strategy_memory": [{"memory": {"title": "Balanced strategy", "allocation": {"cash": "25-30"}}}],
             "macro_observations": [{"metric_key": "gdp_growth_yoy", "value": 6.2}],
             "top_news_impacts": [{"title": "Credit growth improves", "impact_score": 80}],
             "morning_brief_counts": {"article_count": 1, "impact_count": 1},
@@ -78,7 +79,10 @@ def test_macro_gpt_analysis_uses_container_gpt(monkeypatch: pytest.MonkeyPatch) 
     assert calls[0]["output_schema"] == service.MACRO_GPT_ANALYSIS_SCHEMA
     assert calls[0]["cache_ttl_seconds"] == fake_cache.writes[0][2]
     assert "Viết toàn bộ nội dung phân tích bằng tiếng Việt" in calls[0]["prompt"]
+    assert "approved_global_strategy_memory" in calls[0]["prompt"]
+    assert "not an execution signal" in calls[0]["prompt"]
     assert "Research context JSON" in calls[0]["prompt"]
+    assert out["context_summary"]["approved_global_strategy_memory_count"] == 1
     assert fake_cache.writes
 
 

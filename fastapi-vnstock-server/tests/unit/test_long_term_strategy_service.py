@@ -53,6 +53,28 @@ def test_normalizes_vci_financial_statement_rows() -> None:
     ]
 
 
+def test_read_macro_context_attaches_global_strategy_memory(monkeypatch) -> None:
+    memory = [{"memory": {"title": "Balanced strategy"}, "scope": ["long_term_research"]}]
+    monkeypatch.setattr(
+        service,
+        "get_macro_regime",
+        lambda persist_snapshot=False: {
+            "regime": "Recovery",
+            "regime_score": 55,
+            "components": {"growth": 60},
+            "warnings": [],
+            "data_gaps": [],
+            "as_of": "2026-06-05",
+        },
+    )
+    monkeypatch.setattr(service, "_read_global_strategy_memory", lambda: memory)
+
+    out = service._read_macro_context()
+
+    assert out["regime"] == "Recovery"
+    assert out["strategy_memory"] == memory
+
+
 def test_gpt_financial_parser_returns_scorer_rows(monkeypatch) -> None:
     class FakeGpt:
         def generate_text_with_resilience(self, **kwargs):  # noqa: ANN003

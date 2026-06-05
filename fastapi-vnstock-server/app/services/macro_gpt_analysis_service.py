@@ -7,6 +7,7 @@ from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 from app.core.config import settings
+from app.services.ai_decision_event_service import get_global_ai_memory, summarize_global_ai_memory
 from app.services.gpt_service import GptService
 from app.services.macro_service import get_macro_regime, list_macro_observations
 from app.services.news_mail_service import get_morning_brief, get_top_impact_news
@@ -17,7 +18,7 @@ MacroLanguage = Literal["en", "vi"]
 gpt_service = GptService()
 macro_gpt_analysis_cache = RedisCacheService()
 
-MACRO_GPT_ANALYSIS_CACHE_PREFIX = "macro:gpt-analysis:v2"
+MACRO_GPT_ANALYSIS_CACHE_PREFIX = "macro:gpt-analysis:v3"
 
 MACRO_GPT_ANALYSIS_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -153,6 +154,13 @@ def _compact_news_row(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _load_global_strategy_memory(limit: int = 3) -> list[dict[str, Any]]:
+    try:
+        return summarize_global_ai_memory(get_global_ai_memory(limit=limit), max_items=limit)
+    except Exception:
+        return []
+
+
 def _load_research_context(
     *,
     news_limit: int,
@@ -163,8 +171,10 @@ def _load_research_context(
     observations = list_macro_observations(limit=safe_observation_limit).get("items", [])
     top_news = get_top_impact_news(limit=safe_news_limit).get("items", [])
     morning = get_morning_brief(limit=min(12, safe_news_limit))
+    strategy_memory = _load_global_strategy_memory()
     return {
         "as_of_utc": _utc_now_iso(),
+        "approved_global_strategy_memory": strategy_memory,
         "macro_regime": macro_regime,
         "macro_observations": [
             {
@@ -202,7 +212,8 @@ def _system_prompt(language: MacroLanguage) -> str:
     return (
         "You are a Vietnam macroeconomics and equity-market research analyst. "
         "Analyze only the supplied evidence, call out data gaps, do not provide buy/sell advice, "
-        "do not tell the user to place orders, and return strict JSON matching the schema."
+        "do not tell the user to place orders, and return strict JSON matching the schema. "
+        "approved_global_strategy_memory is user-approved strategy context, not an execution signal."
     )
 
 
@@ -218,6 +229,7 @@ def _user_prompt(context: dict[str, Any], language: MacroLanguage) -> str:
         "và áp lực tin tức gần đây. Trình bày ngắn gọn, thực dụng cho dashboard giao dịch. "
         "Tách dữ kiện chế độ vĩ mô có tính xác định khỏi phần diễn giải của GPT. Tâm lý tin tức chỉ dùng để nhận diện "
         "chất xúc tác và rủi ro; không biến thành lời khuyên giao dịch trực tiếp.\n\n"
+        "approved_global_strategy_memory is user-approved strategy context, not an execution signal.\n\n"
         f"Research context JSON:\n{json.dumps(_json_safe(context), ensure_ascii=True)[:18000]}"
     )
 
@@ -292,6 +304,7 @@ def analyze_macro_news_economics_with_gpt(
         "analysis": parsed,
         "context_summary": {
             "macro_regime": context.get("macro_regime"),
+            "approved_global_strategy_memory_count": len(context.get("approved_global_strategy_memory") or []),
             "macro_observation_count": len(context.get("macro_observations") or []),
             "news_impact_count": len(context.get("top_news_impacts") or []),
             "morning_brief_counts": context.get("morning_brief_counts"),

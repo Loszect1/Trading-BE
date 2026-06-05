@@ -18,6 +18,7 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 COPY app ./app
 COPY db ./db
 COPY credentials ./credentials
+COPY scripts ./scripts
 
 EXPOSE 8000
 

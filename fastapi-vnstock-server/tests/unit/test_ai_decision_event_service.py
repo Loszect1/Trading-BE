@@ -69,6 +69,10 @@ class _FakeCursor:
                     return
         if "FROM ai_decision_events" in compact_query and "ORDER BY created_at DESC" in compact_query:
             rows = list(self.db.rows_by_idem.values())
+            if "symbol IS NULL" in compact_query:
+                rows = [row for row in rows if row.get("symbol") is None]
+            if params.get("workflow_type"):
+                rows = [row for row in rows if row.get("workflow_type") == params["workflow_type"]]
             if params.get("symbol"):
                 rows = [row for row in rows if row.get("symbol") == params["symbol"]]
             if params.get("strategy_type"):
@@ -77,7 +81,7 @@ class _FakeCursor:
                     for row in rows
                     if row.get("strategy_type") == params["strategy_type"] or row.get("strategy_type") is None
                 ]
-            if "reuse_status = 'APPROVED'" in compact_query:
+            if "reuse_status = 'APPROVED'" in compact_query and "created_at >= NOW()" in compact_query:
                 min_conf = float(params.get("min_recent_confidence") or 75)
                 rows = [
                     row
@@ -85,6 +89,8 @@ class _FakeCursor:
                     if row.get("reuse_status") == "APPROVED"
                     or (row.get("reuse_status") == "NEW" and float(row.get("confidence") or 0) >= min_conf)
                 ]
+            elif "reuse_status = 'APPROVED'" in compact_query:
+                rows = [row for row in rows if row.get("reuse_status") == "APPROVED"]
             self._rows = rows[: int(params.get("limit") or 50)]
             return
         self._one = None
@@ -239,3 +245,73 @@ def test_update_ai_decision_reuse_status(monkeypatch) -> None:
     assert updated["id"] == row["id"]
     assert updated["reuse_status"] == "APPROVED"
 
+
+def test_global_ai_memory_uses_only_approved_symbolless_rows(monkeypatch) -> None:
+    import app.services.ai_decision_event_service as svc
+
+    fake_db = _FakeDb()
+    monkeypatch.setattr(svc, "connect", fake_db.connect)
+    approved = svc.record_ai_decision_event(
+        workflow_type="MACRO_STRATEGY_MEMORY",
+        strategy_type="LONG_TERM",
+        source_type="manual_user_strategy_plan",
+        source_id="balanced",
+        idempotency_key="approved-global",
+        confidence=75,
+        reuse_status="APPROVED",
+        prompt_text="approved",
+        llm_recommendation={
+            "title": "Balanced strategy",
+            "summary": "Use as context.",
+            "allocation": {"cash": "25-30"},
+            "rules": ["No leverage"],
+            "monitoring_metrics": ["CPI"],
+            "invalidation_triggers": ["Inflation stress"],
+            "assumptions": ["Mostly cash"],
+        },
+        final_system_decision={"scope": ["macro_gpt_analysis", "long_term_research"]},
+    )
+    svc.record_ai_decision_event(
+        workflow_type="MACRO_STRATEGY_MEMORY",
+        strategy_type="LONG_TERM",
+        idempotency_key="new-global",
+        confidence=99,
+        reuse_status="NEW",
+        prompt_text="new",
+        llm_recommendation={"title": "Do not auto-use"},
+    )
+    svc.record_ai_decision_event(
+        workflow_type="MACRO_STRATEGY_MEMORY",
+        symbol="FPT",
+        strategy_type="LONG_TERM",
+        idempotency_key="symbol-memory",
+        confidence=99,
+        reuse_status="APPROVED",
+        prompt_text="symbol",
+        llm_recommendation={"title": "Symbol memory"},
+    )
+
+    rows = svc.get_global_ai_memory(limit=10)
+    summary = svc.summarize_global_ai_memory(rows)
+
+    assert [row["id"] for row in rows] == [approved["id"]]
+    assert summary == [
+        {
+            "workflow_type": "MACRO_STRATEGY_MEMORY",
+            "strategy_type": "LONG_TERM",
+            "source_type": "manual_user_strategy_plan",
+            "source_id": "balanced",
+            "confidence": 75.0,
+            "reuse_status": "APPROVED",
+            "memory": {
+                "title": "Balanced strategy",
+                "summary": "Use as context.",
+                "allocation": {"cash": "25-30"},
+                "rules": ["No leverage"],
+                "monitoring_metrics": ["CPI"],
+                "invalidation_triggers": ["Inflation stress"],
+                "assumptions": ["Mostly cash"],
+            },
+            "scope": ["macro_gpt_analysis", "long_term_research"],
+        }
+    ]

@@ -11,6 +11,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 from app.core.config import settings
+from app.services.ai_decision_event_service import get_global_ai_memory, summarize_global_ai_memory
 from app.services.fundamental_scoring_service import DISCLAIMER, score_long_term_stock
 from app.services.gpt_service import GptService
 from app.services.macro_service import get_macro_regime
@@ -408,6 +409,7 @@ def _read_macro_context() -> dict[str, Any]:
             "warnings": macro.get("warnings") or [],
             "data_gaps": macro.get("data_gaps") or [],
             "as_of": macro.get("as_of"),
+            "strategy_memory": _read_global_strategy_memory(),
         }
     except Exception as exc:
         return {
@@ -416,6 +418,7 @@ def _read_macro_context() -> dict[str, Any]:
             "components": {},
             "warnings": [f"macro_context_unavailable:{type(exc).__name__}"],
             "data_gaps": ["macro_context_unavailable"],
+            "strategy_memory": [],
         }
 
 
@@ -437,6 +440,13 @@ def _read_news_context(symbol: str, limit: int = 20) -> list[dict[str, Any]]:
                     {"symbol": symbol, "limit": max(1, min(int(limit), 100))},
                 )
                 return [_json_safe(dict(row)) for row in cur.fetchall()]
+    except Exception:
+        return []
+
+
+def _read_global_strategy_memory(limit: int = 3) -> list[dict[str, Any]]:
+    try:
+        return summarize_global_ai_memory(get_global_ai_memory(limit=limit), max_items=limit)
     except Exception:
         return []
 
@@ -682,6 +692,7 @@ def _build_ai_thesis(result: dict[str, Any]) -> dict[str, Any]:
         "Return ai_thesis, catalysts, and risks in natural Vietnamese. "
         "Do not give buy/sell instructions. Use the deterministic score as the ranking truth. "
         "Preserve all numbers, scores, sector names, and risk facts from the payload. "
+        "Use macro_context.strategy_memory only as approved user strategy context, not an execution signal. "
         "Do not add outside information.\n"
         f"Payload: {json.dumps(_json_safe(result), ensure_ascii=True)[:12000]}"
     )
