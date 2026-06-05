@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 _gmail = GmailFetchService()
 _NEWS_MAIL_ANALYSIS_BATCH_SIZE = 4
-_NEWS_MAIL_CODEX_TIMEOUT_SECONDS = 1800
+_NEWS_MAIL_CODEX_TIMEOUT_SECONDS: float | None = None
 _NEWS_MAIL_SCHEMA_LOCK_CLASS_ID = 20260601
 _NEWS_MAIL_SCHEMA_LOCK_OBJECT_ID = 8
 _news_mail_tables_ready = False
