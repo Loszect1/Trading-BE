@@ -67,12 +67,13 @@ def test_read_macro_context_attaches_global_strategy_memory(monkeypatch) -> None
             "as_of": "2026-06-05",
         },
     )
-    monkeypatch.setattr(service, "_read_global_strategy_memory", lambda: memory)
+    monkeypatch.setattr(service, "_read_global_strategy_memory", lambda: (memory, {"MACRO_STRATEGY_MEMORY": memory}))
 
     out = service._read_macro_context()
 
     assert out["regime"] == "Recovery"
     assert out["strategy_memory"] == memory
+    assert out["strategy_memory_by_category"] == {"MACRO_STRATEGY_MEMORY": memory}
 
 
 def test_gpt_financial_parser_returns_scorer_rows(monkeypatch) -> None:

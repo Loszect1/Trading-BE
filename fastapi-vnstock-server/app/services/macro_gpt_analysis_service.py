@@ -7,7 +7,11 @@ from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 from app.core.config import settings
-from app.services.ai_decision_event_service import get_global_ai_memory, summarize_global_ai_memory
+from app.services.ai_memory_service import (
+    build_approved_global_memory_version,
+    get_approved_global_long_term_memory,
+    summarize_grouped_global_ai_memory,
+)
 from app.services.gpt_service import GptService
 from app.services.macro_service import get_macro_regime, list_macro_observations
 from app.services.news_mail_service import get_morning_brief, get_top_impact_news
@@ -109,6 +113,7 @@ def _daily_response_cache_key(
     news_limit: int,
     observation_limit: int,
     language: MacroLanguage,
+    memory_version: str = "none",
     now: datetime | None = None,
 ) -> str:
     safe_news_limit, safe_observation_limit = _normalized_limits(news_limit, observation_limit)
@@ -116,7 +121,7 @@ def _daily_response_cache_key(
     model_hash = sha256((settings.gpt_model or "").strip().encode("utf-8")).hexdigest()[:12]
     return (
         f"{MACRO_GPT_ANALYSIS_CACHE_PREFIX}:"
-        f"{local_date}:{language}:{safe_news_limit}:{safe_observation_limit}:{model_hash}"
+        f"{local_date}:{language}:{safe_news_limit}:{safe_observation_limit}:{model_hash}:{memory_version}"
     )
 
 
@@ -154,11 +159,21 @@ def _compact_news_row(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _load_global_strategy_memory(limit: int = 3) -> list[dict[str, Any]]:
+def _load_global_strategy_memory(limit: int = 20) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
     try:
-        return summarize_global_ai_memory(get_global_ai_memory(limit=limit), max_items=limit)
+        rows = get_approved_global_long_term_memory(limit=limit)
+        grouped = summarize_grouped_global_ai_memory(rows, max_items_per_category=5)
+        flat = [item for items in grouped.values() for item in items]
+        return flat, grouped
     except Exception:
-        return []
+        return [], {}
+
+
+def _approved_memory_version() -> str:
+    try:
+        return build_approved_global_memory_version()
+    except Exception:
+        return "none"
 
 
 def _load_research_context(
@@ -171,10 +186,11 @@ def _load_research_context(
     observations = list_macro_observations(limit=safe_observation_limit).get("items", [])
     top_news = get_top_impact_news(limit=safe_news_limit).get("items", [])
     morning = get_morning_brief(limit=min(12, safe_news_limit))
-    strategy_memory = _load_global_strategy_memory()
+    strategy_memory, strategy_memory_by_category = _load_global_strategy_memory()
     return {
         "as_of_utc": _utc_now_iso(),
         "approved_global_strategy_memory": strategy_memory,
+        "approved_global_strategy_memory_by_category": strategy_memory_by_category,
         "macro_regime": macro_regime,
         "macro_observations": [
             {
@@ -213,7 +229,7 @@ def _system_prompt(language: MacroLanguage) -> str:
         "You are a Vietnam macroeconomics and equity-market research analyst. "
         "Analyze only the supplied evidence, call out data gaps, do not provide buy/sell advice, "
         "do not tell the user to place orders, and return strict JSON matching the schema. "
-        "approved_global_strategy_memory is user-approved strategy context, not an execution signal."
+        "approved_global_strategy_memory_by_category is user-approved strategy context, not an execution signal."
     )
 
 
@@ -229,7 +245,7 @@ def _user_prompt(context: dict[str, Any], language: MacroLanguage) -> str:
         "và áp lực tin tức gần đây. Trình bày ngắn gọn, thực dụng cho dashboard giao dịch. "
         "Tách dữ kiện chế độ vĩ mô có tính xác định khỏi phần diễn giải của GPT. Tâm lý tin tức chỉ dùng để nhận diện "
         "chất xúc tác và rủi ro; không biến thành lời khuyên giao dịch trực tiếp.\n\n"
-        "approved_global_strategy_memory is user-approved strategy context, not an execution signal.\n\n"
+        "approved_global_strategy_memory_by_category is user-approved strategy context grouped by category, not an execution signal.\n\n"
         f"Research context JSON:\n{json.dumps(_json_safe(context), ensure_ascii=True)[:18000]}"
     )
 
@@ -258,10 +274,12 @@ def analyze_macro_news_economics_with_gpt(
     language = "vi"
     safe_news_limit, safe_observation_limit = _normalized_limits(news_limit, observation_limit)
     now_local = _local_now()
+    memory_version = _approved_memory_version()
     cache_key = _daily_response_cache_key(
         news_limit=safe_news_limit,
         observation_limit=safe_observation_limit,
         language=language,
+        memory_version=memory_version,
         now=now_local,
     )
     cache_expires_at = _next_local_midnight(now_local)
@@ -305,6 +323,10 @@ def analyze_macro_news_economics_with_gpt(
         "context_summary": {
             "macro_regime": context.get("macro_regime"),
             "approved_global_strategy_memory_count": len(context.get("approved_global_strategy_memory") or []),
+            "approved_global_strategy_memory_categories": sorted(
+                (context.get("approved_global_strategy_memory_by_category") or {}).keys()
+            ),
+            "approved_global_strategy_memory_version": memory_version,
             "macro_observation_count": len(context.get("macro_observations") or []),
             "news_impact_count": len(context.get("top_news_impacts") or []),
             "morning_brief_counts": context.get("morning_brief_counts"),

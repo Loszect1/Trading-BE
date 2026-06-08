@@ -145,6 +145,21 @@ class DemoPortfolioReviewRunRow(BaseModel):
     detail: dict[str, Any] = Field(default_factory=dict)
 
 
+class AiMemoryEvidenceSourceRow(BaseModel):
+    id: str
+    event_id: str
+    created_at: datetime
+    filename: str
+    content_type: str
+    file_sha256: str
+    file_size_bytes: int
+    extraction_method: str
+    extracted_text: str = ""
+    excerpt: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    warnings: list[Any] = Field(default_factory=list)
+
+
 class AiDecisionEventRow(BaseModel):
     id: str
     created_at: datetime
@@ -166,6 +181,9 @@ class AiDecisionEventRow(BaseModel):
     llm_recommendation: dict[str, Any] = Field(default_factory=dict)
     final_system_decision: dict[str, Any] = Field(default_factory=dict)
     guardrail_result: dict[str, Any] = Field(default_factory=dict)
+    evidence_count: int = 0
+    evidence_sources: list[AiMemoryEvidenceSourceRow] = Field(default_factory=list)
+    review_notes: str | None = None
 
 
 class DemoPortfolioReviewSchedulerStatusResponse(BaseModel):
@@ -217,3 +235,19 @@ class RealRecommendationBuyRequest(BaseModel):
     setup: dict[str, Any] | None = None
     freshness: dict[str, Any] | None = None
     metadata: dict[str, Any] | None = None
+
+
+class AiDecisionStatusUpdateRequest(BaseModel):
+    """Request body for approving/rejecting a memory candidate or other AI decision event."""
+    reuse_status: Literal["NEW", "APPROVED", "REJECTED", "EXPIRED"]
+
+
+class AiMemoryReviewRequest(BaseModel):
+    """Edited review payload for a long-term memory candidate."""
+
+    reuse_status: Literal["NEW", "APPROVED", "REJECTED", "EXPIRED"]
+    workflow_type: str = Field(min_length=1, max_length=64)
+    llm_recommendation: dict[str, Any] = Field(default_factory=dict)
+    final_system_decision: dict[str, Any] = Field(default_factory=dict)
+    guardrail_result: dict[str, Any] = Field(default_factory=dict)
+    review_notes: str | None = Field(default=None, max_length=2000)

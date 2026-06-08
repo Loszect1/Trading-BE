@@ -4,13 +4,15 @@ import logging
 from typing import cast
 from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from psycopg import connect
 from psycopg.rows import dict_row
 
 from app.core.config import settings
 from app.schemas.automation import (
     AiDecisionEventRow,
+    AiDecisionStatusUpdateRequest,
+    AiMemoryReviewRequest,
     DemoPortfolioReviewRunRequest,
     DemoPortfolioReviewRunRow,
     DemoPortfolioReviewSchedulerStatusResponse,
@@ -29,7 +31,18 @@ from app.schemas.automation import (
     TechnicalCycleRunRequest,
     TechnicalCycleRunResponse,
 )
-from app.services.ai_decision_event_service import list_recent_ai_decision_events
+from app.services.ai_decision_event_service import (
+    list_recent_ai_decision_events,
+    update_ai_decision_reuse_status,
+)
+from app.services.ai_memory_service import (
+    extract_memory_evidence_source,
+    get_ai_memory_event,
+    list_ai_memory_events,
+    review_ai_memory_event,
+    validate_memory_upload_budget,
+)
+from app.services.strategy_memory_contribution_service import analyze_and_propose_memory_contribution
 from app.services.real_recommendation_service import preflight_real_recommendations
 from app.services.real_recommendation_scan_service import (
     get_latest_real_recommendations_payload,
@@ -229,6 +242,139 @@ def get_ai_decisions(
     except Exception as exc:
         logger.exception("automation.ai_decisions_failed")
         raise HTTPException(status_code=500, detail=f"Failed to read AI decision events: {exc}") from exc
+
+
+@router.post("/ai-decisions/{event_id}/status")
+def post_update_ai_decision_status(
+    event_id: str,
+    body: AiDecisionStatusUpdateRequest,
+) -> dict[str, Any]:
+    """Approve, reject, or change reuse status of an AI decision / memory candidate (e.g. user-contributed long-term memory)."""
+    try:
+        updated = update_ai_decision_reuse_status(event_id=event_id, reuse_status=body.reuse_status)
+        if updated is None:
+            raise HTTPException(status_code=404, detail="AI decision event not found")
+        data = AiDecisionEventRow.model_validate(updated).model_dump(mode="json")
+        return {"success": True, "data": data}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("automation.update_ai_decision_status_failed")
+        raise HTTPException(status_code=500, detail=f"Failed to update AI decision status: {exc}") from exc
+
+
+@router.post("/ai-memory/contribute")
+async def post_memory_contribute(
+    user_text: str = Form(default="", description="Raw information, thesis, observation, claim, or excerpt to analyze."),
+    category: str | None = Form(None, description="Optional soft hint for category (GPT will decide the best one)"),
+    notes: str | None = Form(None, description="Optional extra context or source notes"),
+    files: list[UploadFile] = File(default=[], description="Optional supporting images, PDFs, text files, etc."),
+) -> dict[str, Any]:
+    """
+    User contribution endpoint for long-term Approved GPT Memory.
+    Sends content + attachments to GPT in the BE container for deep research + fact-check (true/wrong/missing/gaps)
+    and proposes a categorized structured memory entry (recorded with reuse_status=NEW for review).
+    """
+    try:
+        evidence_sources: list[dict[str, Any]] = []
+        for upload in files or []:
+            raw = await upload.read()
+            evidence_sources.append(
+                extract_memory_evidence_source(
+                    filename=upload.filename or "unnamed",
+                    content_type=upload.content_type or "application/octet-stream",
+                    raw=raw,
+                )
+            )
+        validate_memory_upload_budget(evidence_sources)
+
+        result = analyze_and_propose_memory_contribution(
+            user_text=user_text,
+            evidence_sources=evidence_sources,
+            category_hint=category,
+            notes=notes or "",
+        )
+        return {"success": True, "data": result}
+    except HTTPException:
+        raise
+    except RuntimeError as exc:
+        if str(exc) == "gpt_disabled":
+            raise HTTPException(status_code=503, detail="GPT is disabled in the backend container. Set USE_GPT=true.") from exc
+        raise HTTPException(status_code=500, detail=f"Memory contribution analysis failed: {exc}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("automation.memory_contribute_failed")
+        raise HTTPException(status_code=500, detail=f"Memory contribution failed: {exc}") from exc
+
+
+@router.get("/ai-memory")
+def get_ai_memory(
+    limit: int = Query(default=30, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    workflow_type: str | None = Query(default=None, max_length=64),
+    reuse_status: Literal["NEW", "APPROVED", "REJECTED", "EXPIRED"] | None = Query(default=None),
+) -> dict[str, Any]:
+    """List global long-term GPT memory entries for curation."""
+    try:
+        rows = list_ai_memory_events(
+            workflow_type=workflow_type,
+            reuse_status=reuse_status,
+            limit=limit,
+            offset=offset,
+        )
+        data = [AiDecisionEventRow.model_validate(row).model_dump(mode="json") for row in rows]
+        return {
+            "success": True,
+            "data": data,
+            "limit": limit,
+            "offset": offset,
+            "workflow_type": workflow_type,
+            "reuse_status": reuse_status,
+        }
+    except Exception as exc:
+        logger.exception("automation.ai_memory_failed")
+        raise HTTPException(status_code=500, detail=f"Failed to read AI memory: {exc}") from exc
+
+
+@router.get("/ai-memory/{event_id}")
+def get_ai_memory_detail(event_id: str) -> dict[str, Any]:
+    """Read one memory entry including extracted evidence sources."""
+    try:
+        row = get_ai_memory_event(event_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="AI memory event not found")
+        data = AiDecisionEventRow.model_validate(row).model_dump(mode="json")
+        return {"success": True, "data": data}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("automation.ai_memory_detail_failed")
+        raise HTTPException(status_code=500, detail=f"Failed to read AI memory detail: {exc}") from exc
+
+
+@router.post("/ai-memory/{event_id}/review")
+def post_ai_memory_review(event_id: str, body: AiMemoryReviewRequest) -> dict[str, Any]:
+    """Apply human edits and update final reuse status for a long-term memory candidate."""
+    try:
+        updated = review_ai_memory_event(
+            event_id=event_id,
+            reuse_status=body.reuse_status,
+            workflow_type=body.workflow_type,
+            llm_recommendation=body.llm_recommendation,
+            final_system_decision=body.final_system_decision,
+            guardrail_result=body.guardrail_result,
+            review_notes=body.review_notes,
+        )
+        if updated is None:
+            raise HTTPException(status_code=404, detail="AI memory event not found")
+        data = AiDecisionEventRow.model_validate(updated).model_dump(mode="json")
+        return {"success": True, "data": data}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("automation.ai_memory_review_failed")
+        raise HTTPException(status_code=500, detail=f"Failed to review AI memory: {exc}") from exc
 
 
 @router.post("/technical/run-cycle", response_model=TechnicalCycleRunResponse)

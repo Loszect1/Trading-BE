@@ -11,7 +11,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 from app.core.config import settings
-from app.services.ai_decision_event_service import get_global_ai_memory, summarize_global_ai_memory
+from app.services.ai_memory_service import get_approved_global_long_term_memory, summarize_grouped_global_ai_memory
 from app.services.fundamental_scoring_service import DISCLAIMER, score_long_term_stock
 from app.services.gpt_service import GptService
 from app.services.macro_service import get_macro_regime
@@ -402,6 +402,7 @@ def build_hose_universe(*, universe_size: int = 100, candidate_limit: int = 400)
 def _read_macro_context() -> dict[str, Any]:
     try:
         macro = get_macro_regime(persist_snapshot=False)
+        flat_memory, grouped_memory = _read_global_strategy_memory()
         return {
             "regime": macro.get("regime"),
             "regime_score": macro.get("regime_score"),
@@ -409,7 +410,8 @@ def _read_macro_context() -> dict[str, Any]:
             "warnings": macro.get("warnings") or [],
             "data_gaps": macro.get("data_gaps") or [],
             "as_of": macro.get("as_of"),
-            "strategy_memory": _read_global_strategy_memory(),
+            "strategy_memory": flat_memory,
+            "strategy_memory_by_category": grouped_memory,
         }
     except Exception as exc:
         return {
@@ -419,6 +421,7 @@ def _read_macro_context() -> dict[str, Any]:
             "warnings": [f"macro_context_unavailable:{type(exc).__name__}"],
             "data_gaps": ["macro_context_unavailable"],
             "strategy_memory": [],
+            "strategy_memory_by_category": {},
         }
 
 
@@ -444,11 +447,14 @@ def _read_news_context(symbol: str, limit: int = 20) -> list[dict[str, Any]]:
         return []
 
 
-def _read_global_strategy_memory(limit: int = 3) -> list[dict[str, Any]]:
+def _read_global_strategy_memory(limit: int = 20) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
     try:
-        return summarize_global_ai_memory(get_global_ai_memory(limit=limit), max_items=limit)
+        rows = get_approved_global_long_term_memory(limit=limit)
+        grouped = summarize_grouped_global_ai_memory(rows, max_items_per_category=5)
+        flat = [item for items in grouped.values() for item in items]
+        return flat, grouped
     except Exception:
-        return []
+        return [], {}
 
 
 _GPT_FINANCIAL_PARSE_SCHEMA: dict[str, Any] = {
@@ -692,7 +698,7 @@ def _build_ai_thesis(result: dict[str, Any]) -> dict[str, Any]:
         "Return ai_thesis, catalysts, and risks in natural Vietnamese. "
         "Do not give buy/sell instructions. Use the deterministic score as the ranking truth. "
         "Preserve all numbers, scores, sector names, and risk facts from the payload. "
-        "Use macro_context.strategy_memory only as approved user strategy context, not an execution signal. "
+        "Use macro_context.strategy_memory_by_category only as approved user strategy context, not an execution signal. "
         "Do not add outside information.\n"
         f"Payload: {json.dumps(_json_safe(result), ensure_ascii=True)[:12000]}"
     )

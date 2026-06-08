@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends nodejs npm ca-certificates \
+    && apt-get install -y --no-install-recommends nodejs npm ca-certificates tesseract-ocr tesseract-ocr-eng tesseract-ocr-vie \
     && npm install -g @openai/codex@0.135.0 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*

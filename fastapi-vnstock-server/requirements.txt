@@ -1,4 +1,8 @@
 fastapi
+python-multipart   # Required for FastAPI Form(...) / UploadFile / multipart endpoints (e.g. POST /automation/ai-memory/contribute)
+pypdf
+Pillow
+pytesseract
 uvicorn[standard]
 python-dotenv
 pydantic-settings
